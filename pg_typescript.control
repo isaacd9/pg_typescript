@@ -1,0 +1,6 @@
+comment = 'pg_typescript: TypeScript/JavaScript procedural language for PostgreSQL'
+default_version = '@CARGO_VERSION@'
+module_pathname = 'pg_typescript'
+relocatable = false
+superuser = true
+trusted = true
