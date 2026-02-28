@@ -307,115 +307,81 @@ fn try_transform_import_line(line: &str) -> Option<String> {
 // Plain Rust unit tests — run with `cargo test`, no postgres needed.
 #[cfg(test)]
 mod unit_tests {
-    /// Seed used in tests: deserializes any V8 value into `(serde_json::Value, bool)`.
+    use serde_json::{Value, json};
+
+    /// Seed used in tests: deserializes any V8 value into `(Value, bool)`.
     struct JsonSeed;
 
     impl<'de> serde::de::DeserializeSeed<'de> for JsonSeed {
-        type Value = (serde_json::Value, bool);
+        type Value = (Value, bool);
 
         fn deserialize<D: serde::Deserializer<'de>>(
             self,
             deserializer: D,
         ) -> Result<Self::Value, D::Error> {
             use serde::de::Deserialize;
-            let v = serde_json::Value::deserialize(deserializer)?;
+            let v = Value::deserialize(deserializer)?;
             let is_null = v.is_null();
             Ok((v, is_null))
         }
     }
 
-    fn run(source: &str, params: &[&str], args: &[serde_json::Value]) -> (serde_json::Value, bool) {
-        let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
-        super::execute_typescript_fn(source, &param_names, args, JsonSeed)
+    /// Generate a named `#[test]` for a single TypeScript function body.
+    ///
+    /// Syntax:
+    /// ```
+    /// ts_test!(test_name, "js source", ["param", ...], [json!(...), ...], Some(json!(...)));
+    /// ts_test!(test_name, "js source", [], [], None);  // NULL return
+    /// ```
+    macro_rules! ts_test {
+        ($name:ident, $src:expr, [$($p:literal),*], [$($a:expr),*], $expected:expr) => {
+            #[test]
+            fn $name() {
+                let params: Vec<String> = vec![$($p.to_string()),*];
+                let args: Vec<Value> = vec![$($a),*];
+                let (val, is_null) =
+                    super::execute_typescript_fn($src, &params, &args, JsonSeed);
+                let expected: Option<Value> = $expected;
+                match expected {
+                    Some(exp) => assert_eq!(val, exp),
+                    None => assert!(is_null),
+                }
+            }
+        };
     }
 
-    #[test]
-    fn test_call_number() {
-        let (val, is_null) =
-            run("return a + b;", &["a", "b"], &[serde_json::json!(1), serde_json::json!(2)]);
-        assert!(!is_null);
-        assert_eq!(val, serde_json::json!(3));
-    }
-
-    #[test]
-    fn test_call_string() {
-        let (val, is_null) =
-            run("return `Hello, ${name}!`;", &["name"], &[serde_json::json!("world")]);
-        assert!(!is_null);
-        assert_eq!(val, serde_json::json!("Hello, world!"));
-    }
-
-    #[test]
-    fn test_call_bool() {
-        let (val, is_null) =
-            run("return a > b;", &["a", "b"], &[serde_json::json!(3.0), serde_json::json!(1.5)]);
-        assert!(!is_null);
-        assert_eq!(val, serde_json::json!(true));
-    }
-
-    #[test]
-    fn test_call_null_return() {
-        let (_val, is_null) = run("return null;", &[], &[]);
-        assert!(is_null);
-    }
-
-    #[test]
-    fn test_call_object() {
-        let (val, is_null) = run("return { x: n * 2 };", &["n"], &[serde_json::json!(21)]);
-        assert!(!is_null);
-        assert_eq!(val, serde_json::json!({ "x": 42 }));
-    }
-
-    #[test]
-    fn test_async_number() {
-        let (val, is_null) =
-            run("return await Promise.resolve(n * 2);", &["n"], &[serde_json::json!(21)]);
-        assert!(!is_null);
-        assert_eq!(val, serde_json::json!(42));
-    }
-
-    #[test]
-    fn test_async_string() {
-        let (val, is_null) = run(
-            "const greeting = await Promise.resolve(`Hello, ${name}!`);
-             return greeting;",
-            &["name"],
-            &[serde_json::json!("world")],
-        );
-        assert!(!is_null);
-        assert_eq!(val, serde_json::json!("Hello, world!"));
-    }
-
-    #[test]
-    fn test_async_chained_awaits() {
-        let (val, is_null) = run(
-            "const a = await Promise.resolve(x + 1);
-             const b = await Promise.resolve(a * 2);
-             return b;",
-            &["x"],
-            &[serde_json::json!(4)],
-        );
-        assert!(!is_null);
-        assert_eq!(val, serde_json::json!(10));
-    }
-
-    #[test]
-    fn test_async_null_return() {
-        let (_val, is_null) = run("return await Promise.resolve(null);", &[], &[]);
-        assert!(is_null);
-    }
-
-    #[test]
-    fn test_async_object() {
-        let (val, is_null) = run(
-            "const doubled = await Promise.resolve(n * 2);
-             return { original: n, doubled };",
-            &["n"],
-            &[serde_json::json!(7)],
-        );
-        assert!(!is_null);
-        assert_eq!(val, serde_json::json!({ "original": 7, "doubled": 14 }));
-    }
+    ts_test!(sync_add, "return a + b;", ["a", "b"], [json!(1), json!(2)], Some(json!(3)));
+    ts_test!(sync_string_template, "return `Hello, ${name}!`;", ["name"], [json!("world")], Some(json!("Hello, world!")));
+    ts_test!(sync_bool_comparison, "return a > b;", ["a", "b"], [json!(3.0), json!(1.5)], Some(json!(true)));
+    ts_test!(sync_null_return, "return null;", [], [], None);
+    ts_test!(sync_object_return, "return { x: n * 2 };", ["n"], [json!(21)], Some(json!({ "x": 42 })));
+    ts_test!(async_number, "return await Promise.resolve(n * 2);", ["n"], [json!(21)], Some(json!(42)));
+    ts_test!(
+        async_string,
+        "const greeting = await Promise.resolve(`Hello, ${name}!`);
+         return greeting;",
+        ["name"],
+        [json!("world")],
+        Some(json!("Hello, world!"))
+    );
+    ts_test!(
+        async_chained_awaits,
+        "const a = await Promise.resolve(x + 1);
+         const b = await Promise.resolve(a * 2);
+         return b;",
+        ["x"],
+        [json!(4)],
+        Some(json!(10))
+    );
+    ts_test!(async_null_return, "return await Promise.resolve(null);", [], [], None);
+    ts_test!(
+        async_object,
+        "const doubled = await Promise.resolve(n * 2);
+         return { original: n, doubled };",
+        ["n"],
+        [json!(7)],
+        Some(json!({ "original": 7, "doubled": 14 }))
+    );
 }
 
 // SQL-level integration tests — run with `cargo pgrx test pg18`.
