@@ -53,15 +53,11 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
 
     let (result_json, is_null) = execute_typescript_fn(&source, &param_names, args_array);
 
-    if is_null {
-        unsafe { fcinfo::pg_return_null(fcinfo) }
+    let (datum, null) = json_to_datum(&result_json, ret_type);
+    if is_null || null {
+        return unsafe { fcinfo::pg_return_null(fcinfo) };
     } else {
-        let (datum, null) = json_to_datum(&result_json, ret_type);
-        if null {
-            unsafe { fcinfo::pg_return_null(fcinfo) }
-        } else {
-            datum
-        }
+        datum
     }
 }
 
@@ -83,7 +79,8 @@ pub unsafe extern "C-unwind" fn typescript_validator(fn_oid: pg_sys::Oid) {
     let params = param_names.join(", ");
 
     let transformed = transform_imports(&source);
-    let check_js = format!("(() => {{ function __check({params}) {{ {transformed} }} }})();");
+    // async function so that `await` inside transformed bodies is valid syntax.
+    let check_js = format!("(() => {{ async function __check({params}) {{ {transformed} }} }})();");
 
     with_runtime(|rt| {
         if let Err(e) = rt.execute_script("<typescript:validator>", check_js) {
@@ -131,122 +128,66 @@ fn execute_typescript_fn(
 ) -> (serde_json::Value, bool) {
     let args_json_str = serde_json::to_string(&args).unwrap_or_else(|_| "[]".to_string());
     let transformed = transform_imports(source);
-    let has_async = transformed.contains("await ") || transformed.contains("import(");
+    let params = param_names.join(", ");
 
     with_runtime(|rt| {
-        if has_async {
-            call_async(rt, &transformed, param_names, &args_json_str)
-        } else {
-            call_sync(rt, &transformed, param_names, &args_json_str)
-        }
+        // Always async so `await` is valid in the body. The result is always a
+        // Promise; run_event_loop below settles it before we resolve the value.
+        let call_js = format!("(async function({params}) {{ {transformed} }})(...{args_json_str})");
+
+        let result_global = rt
+            .execute_script("<typescript:call>", call_js)
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+
+        // Drain the event loop so any async work (await, microtasks) completes.
+        // After this, result_global is either a plain value or an already-settled Promise.
+        block_on(rt.run_event_loop(Default::default()))
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+
+        // resolve() on an already-settled Promise (or plain value) returns immediately.
+        let resolve_fut = rt.resolve(result_global);
+        let resolved = block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+
+        global_to_json(rt, resolved)
     })
-}
-
-/// Define and call an async function body, then drain the event loop.
-fn call_async(
-    rt: &mut deno_core::JsRuntime,
-    transformed: &str,
-    param_names: &[String],
-    args_json_str: &str,
-) -> (serde_json::Value, bool) {
-    let params = param_names.join(", ");
-    let call_js = format!(
-        r#"
-        globalThis.__pg_result = undefined;
-        globalThis.__pg_error  = undefined;
-        (async function({params}) {{ {transformed} }})(...{args_json_str})
-            .then(r  => {{ globalThis.__pg_result = JSON.stringify(r); }})
-            .catch(e => {{ globalThis.__pg_error  = String(e);         }});
-        "#
-    );
-    if let Err(e) = rt.execute_script("<typescript:call_schedule>", call_js) {
-        pgrx::error!("pg_typescript: call error: {e}");
-    }
-
-    if let Err(e) = block_on(rt.run_event_loop(Default::default())) {
-        pgrx::error!("pg_typescript: event loop error: {e}");
-    }
-
-    if let Ok(err_global) =
-        rt.execute_script("<typescript:check_error>", "globalThis.__pg_error")
-    {
-        deno_core::scope!(scope, rt);
-        let err_local = v8::Local::new(scope, err_global);
-        if !err_local.is_undefined() && !err_local.is_null() {
-            pgrx::error!("pg_typescript: {}", err_local.to_rust_string_lossy(scope));
-        }
-    }
-
-    let result_global = rt
-        .execute_script("<typescript:get_result>", "globalThis.__pg_result")
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_result failed: {e}"));
-
-    deno_core::scope!(scope, rt);
-    let local = v8::Local::new(scope, result_global);
-    json_from_v8(scope, local)
-}
-
-/// Define and call a synchronous function body, returning the result directly.
-fn call_sync(
-    rt: &mut deno_core::JsRuntime,
-    transformed: &str,
-    param_names: &[String],
-    args_json_str: &str,
-) -> (serde_json::Value, bool) {
-    let params = param_names.join(", ");
-    let call_js = format!(
-        r#"
-        (() => {{
-            const __r = (function({params}) {{ {transformed} }})(...{args_json_str});
-            return __r === undefined || __r === null ? null : JSON.stringify(__r);
-        }})()
-        "#
-    );
-
-    let result_global = rt
-        .execute_script("<typescript:call>", call_js)
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
-
-    deno_core::scope!(scope, rt);
-    let local = v8::Local::new(scope, result_global);
-    json_from_v8(scope, local)
-}
-
-/// Extract a JSON-serialised value from a V8 local (the result of `JSON.stringify`).
-fn json_from_v8(
-    scope: &mut deno_core::v8::ContextScope<'_, '_, deno_core::v8::HandleScope<'_>>,
-    local: v8::Local<'_, v8::Value>,
-) -> (serde_json::Value, bool) {
-    if local.is_null_or_undefined() {
-        return (serde_json::Value::Null, true);
-    }
-    let json_str = local.to_rust_string_lossy(scope);
-    let value = serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
-    (value, false)
 }
 
 /// Execute a DO block (anonymous JavaScript).
 fn execute_inline_block(source: &str) {
     let transformed = transform_imports(source);
-    let has_async = transformed.contains("await ") || transformed.contains("import(");
-
     with_runtime(|rt| {
-        let js = if has_async {
-            format!("(async () => {{ {transformed} }})();")
-        } else {
-            format!("(() => {{ {transformed} }})();")
-        };
+        // Always wrap in an async IIFE so `await` works and we get a Promise back.
+        let js = format!("(async () => {{ {transformed} }})()");
+        let result_global = rt
+            .execute_script("<typescript:inline>", js)
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
 
-        if let Err(e) = rt.execute_script("<typescript:inline>", js) {
-            pgrx::error!("pg_typescript: {e}");
-        }
-
-        if has_async {
-            if let Err(e) = block_on(rt.run_event_loop(Default::default())) {
-                pgrx::error!("pg_typescript: event loop error in DO block: {e}");
-            }
-        }
+        let resolve_fut = rt.resolve(result_global);
+        block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: event loop error in DO block: {e}"));
     });
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a resolved V8 global into a `serde_json::Value`.
+///
+/// Follows the pattern from deno_core's `eval_js_value` example: create the
+/// scope inside a plain function (not a closure) and pass the global by move.
+fn global_to_json(
+    rt: &mut deno_core::JsRuntime,
+    global: v8::Global<v8::Value>,
+) -> (serde_json::Value, bool) {
+    deno_core::scope!(scope, rt);
+    let local = v8::Local::new(scope, global);
+    if local.is_null_or_undefined() {
+        return (serde_json::Value::Null, true);
+    }
+    let value = deno_core::serde_v8::from_v8(scope, local).unwrap_or(serde_json::Value::Null);
+    (value, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -320,9 +261,117 @@ fn try_transform_import_line(line: &str) -> Option<String> {
         ));
     }
 
-    Some(format!(r#"const {bindings} = (await import("{url}")).default;"#))
+    Some(format!(
+        r#"const {bindings} = (await import("{url}")).default;"#
+    ))
 }
 
+// Plain Rust unit tests — run with `cargo test`, no postgres needed.
+#[cfg(test)]
+mod unit_tests {
+    fn run(source: &str, params: &[&str], args: serde_json::Value) -> (serde_json::Value, bool) {
+        let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
+        super::execute_typescript_fn(source, &param_names, args)
+    }
+
+    #[test]
+    fn test_call_number() {
+        let (val, is_null) = run("return a + b;", &["a", "b"], serde_json::json!([1, 2]));
+        assert!(!is_null);
+        assert_eq!(val, serde_json::json!(3));
+    }
+
+    #[test]
+    fn test_call_string() {
+        let (val, is_null) = run(
+            "return `Hello, ${name}!`;",
+            &["name"],
+            serde_json::json!(["world"]),
+        );
+        assert!(!is_null);
+        assert_eq!(val, serde_json::json!("Hello, world!"));
+    }
+
+    #[test]
+    fn test_call_bool() {
+        let (val, is_null) = run("return a > b;", &["a", "b"], serde_json::json!([3.0, 1.5]));
+        assert!(!is_null);
+        assert_eq!(val, serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_call_null_return() {
+        let (_val, is_null) = run("return null;", &[], serde_json::json!([]));
+        assert!(is_null);
+    }
+
+    #[test]
+    fn test_call_object() {
+        let (val, is_null) = run("return { x: n * 2 };", &["n"], serde_json::json!([21]));
+        assert!(!is_null);
+        assert_eq!(val, serde_json::json!({ "x": 42 }));
+    }
+
+    #[test]
+    fn test_async_number() {
+        let (val, is_null) = run(
+            "return await Promise.resolve(n * 2);",
+            &["n"],
+            serde_json::json!([21]),
+        );
+        assert!(!is_null);
+        assert_eq!(val, serde_json::json!(42));
+    }
+
+    #[test]
+    fn test_async_string() {
+        let (val, is_null) = run(
+            "const greeting = await Promise.resolve(`Hello, ${name}!`);
+             return greeting;",
+            &["name"],
+            serde_json::json!(["world"]),
+        );
+        assert!(!is_null);
+        assert_eq!(val, serde_json::json!("Hello, world!"));
+    }
+
+    #[test]
+    fn test_async_chained_awaits() {
+        let (val, is_null) = run(
+            "const a = await Promise.resolve(x + 1);
+             const b = await Promise.resolve(a * 2);
+             return b;",
+            &["x"],
+            serde_json::json!([4]),
+        );
+        assert!(!is_null);
+        assert_eq!(val, serde_json::json!(10));
+    }
+
+    #[test]
+    fn test_async_null_return() {
+        let (_val, is_null) = run(
+            "return await Promise.resolve(null);",
+            &[],
+            serde_json::json!([]),
+        );
+        assert!(is_null);
+    }
+
+    #[test]
+    fn test_async_object() {
+        let (val, is_null) = run(
+            "const doubled = await Promise.resolve(n * 2);
+             return { original: n, doubled };",
+            &["n"],
+            serde_json::json!([7]),
+        );
+        assert!(!is_null);
+        assert_eq!(val, serde_json::json!({ "original": 7, "doubled": 14 }));
+    }
+}
+
+// SQL-level integration tests — run with `cargo pgrx test pg18`.
 #[cfg(any(test, feature = "pg_test"))]
 #[pg_schema]
 mod tests {
