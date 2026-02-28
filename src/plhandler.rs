@@ -5,7 +5,7 @@ use pgrx::pg_catalog::pg_proc::PgProc;
 use pgrx::prelude::*;
 use pgrx::{fcinfo, pg_sys};
 
-use crate::convert::{datum_to_json, json_to_datum};
+use crate::convert::{datum_to_json, PgDatumSeed};
 use crate::runtime::{block_on, with_runtime};
 
 // ---------------------------------------------------------------------------
@@ -51,10 +51,10 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
 
     let args_array = serde_json::Value::Array(args_json);
 
-    let (result_json, is_null) = execute_typescript_fn(&source, &param_names, args_array);
+    let (datum, is_null) =
+        execute_typescript_fn(&source, &param_names, args_array, PgDatumSeed { oid: ret_type });
 
-    let (datum, null) = json_to_datum(&result_json, ret_type);
-    if is_null || null {
+    if is_null {
         return unsafe { fcinfo::pg_return_null(fcinfo) };
     } else {
         datum
@@ -120,12 +120,18 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
 // ---------------------------------------------------------------------------
 
 /// Execute a TypeScript function body with pre-converted JSON arguments.
-/// Returns `(result_json, is_null)`.
-fn execute_typescript_fn(
+///
+/// `seed` drives how the resolved V8 value is converted to `S::Value`.
+/// Pass [`PgDatumSeed`] in production and a JSON seed in unit tests.
+fn execute_typescript_fn<S, R>(
     source: &str,
     param_names: &[String],
     args: serde_json::Value,
-) -> (serde_json::Value, bool) {
+    seed: S,
+) -> R
+where
+    S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
+{
     let args_json_str = serde_json::to_string(&args).unwrap_or_else(|_| "[]".to_string());
     let transformed = transform_imports(source);
     let params = param_names.join(", ");
@@ -149,7 +155,7 @@ fn execute_typescript_fn(
         let resolved = block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
 
-        global_to_json(rt, resolved)
+        global_to(rt, resolved, seed)
     })
 }
 
@@ -173,21 +179,23 @@ fn execute_inline_block(source: &str) {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a resolved V8 global into a `serde_json::Value`.
+/// Deserialize a resolved V8 global using `seed`.
 ///
-/// Follows the pattern from deno_core's `eval_js_value` example: create the
-/// scope inside a plain function (not a closure) and pass the global by move.
-fn global_to_json(
+/// Must be a plain `fn` (not a closure) so that `deno_core::scope!` temporaries
+/// live long enough — see the `eval_js_value` pattern in deno_core's examples.
+fn global_to<S, R>(
     rt: &mut deno_core::JsRuntime,
     global: v8::Global<v8::Value>,
-) -> (serde_json::Value, bool) {
+    seed: S,
+) -> R
+where
+    S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
+{
     deno_core::scope!(scope, rt);
     let local = v8::Local::new(scope, global);
-    if local.is_null_or_undefined() {
-        return (serde_json::Value::Null, true);
-    }
-    let value = deno_core::serde_v8::from_v8(scope, local).unwrap_or(serde_json::Value::Null);
-    (value, false)
+    let mut de = deno_core::serde_v8::Deserializer::new(scope, local, None);
+    seed.deserialize(&mut de)
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: deserialize: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -269,9 +277,26 @@ fn try_transform_import_line(line: &str) -> Option<String> {
 // Plain Rust unit tests — run with `cargo test`, no postgres needed.
 #[cfg(test)]
 mod unit_tests {
+    /// Seed used in tests: deserializes any V8 value into `(serde_json::Value, bool)`.
+    struct JsonSeed;
+
+    impl<'de> serde::de::DeserializeSeed<'de> for JsonSeed {
+        type Value = (serde_json::Value, bool);
+
+        fn deserialize<D: serde::Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            use serde::de::Deserialize;
+            let v = serde_json::Value::deserialize(deserializer)?;
+            let is_null = v.is_null();
+            Ok((v, is_null))
+        }
+    }
+
     fn run(source: &str, params: &[&str], args: serde_json::Value) -> (serde_json::Value, bool) {
         let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
-        super::execute_typescript_fn(source, &param_names, args)
+        super::execute_typescript_fn(source, &param_names, args, JsonSeed)
     }
 
     #[test]

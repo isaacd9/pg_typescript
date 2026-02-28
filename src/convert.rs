@@ -1,4 +1,5 @@
 use pgrx::{FromDatum, IntoDatum, pg_sys};
+use serde::de::{Deserialize, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 /// Convert a Postgres datum to a `serde_json::Value` for passing into JS.
@@ -157,6 +158,80 @@ pub fn json_to_datum(value: &Value, type_oid: pg_sys::Oid) -> (pg_sys::Datum, bo
                 (input_fn_call(&s, type_oid), false)
             }
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DeserializeSeed for direct V8 → Datum conversion (no JSON intermediary)
+// ---------------------------------------------------------------------------
+
+/// A [`DeserializeSeed`] that converts a deserialized V8 value directly into a
+/// Postgres [`pg_sys::Datum`], using the supplied OID for type dispatch.
+///
+/// Returns `(Datum, isnull)`.  Delegates to [`json_to_datum`] for all cases so
+/// the OID dispatch logic lives in exactly one place.
+pub struct PgDatumSeed {
+    pub oid: pg_sys::Oid,
+}
+
+impl<'de> DeserializeSeed<'de> for PgDatumSeed {
+    type Value = (pg_sys::Datum, bool);
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(PgDatumVisitor { oid: self.oid })
+    }
+}
+
+struct PgDatumVisitor {
+    oid: pg_sys::Oid,
+}
+
+impl<'de> Visitor<'de> for PgDatumVisitor {
+    type Value = (pg_sys::Datum, bool);
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "a value convertible to Postgres datum (OID {:?})", self.oid)
+    }
+
+    // JS null / undefined
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok((pg_sys::Datum::from(0usize), true))
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok((pg_sys::Datum::from(0usize), true))
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(json_to_datum(&Value::Bool(v), self.oid))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(json_to_datum(&Value::Number(v.into()), self.oid))
+    }
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(json_to_datum(&Value::Number(serde_json::Number::from(v)), self.oid))
+    }
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        let n = serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0));
+        Ok(json_to_datum(&Value::Number(n), self.oid))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(json_to_datum(&Value::String(v.to_owned()), self.oid))
+    }
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(json_to_datum(&Value::String(v), self.oid))
+    }
+
+    // Objects (e.g. JSONB return type) — collect into a serde_json::Value then convert.
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        let value = Value::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+        Ok(json_to_datum(&value, self.oid))
+    }
+    // Arrays / JSONB arrays.
+    fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+        let value = Value::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
+        Ok(json_to_datum(&value, self.oid))
     }
 }
 
