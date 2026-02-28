@@ -5,7 +5,7 @@ use pgrx::pg_catalog::pg_proc::PgProc;
 use pgrx::prelude::*;
 use pgrx::{fcinfo, pg_sys};
 
-use crate::convert::{datum_to_json, PgDatumSeed};
+use crate::convert::{PgDatum, PgDatumSeed};
 use crate::runtime::{block_on, with_runtime};
 
 // ---------------------------------------------------------------------------
@@ -41,18 +41,16 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
         })
         .collect();
 
-    // Collect argument datums → JSON.
-    let args_json: Vec<serde_json::Value> = (0..nargs)
+    // Collect argument datums for direct V8 serialization.
+    let args: Vec<PgDatum> = (0..nargs)
         .map(|i| unsafe {
             let nd = fcinfo::pg_get_nullable_datum(fcinfo, i);
-            datum_to_json(nd.value, nd.isnull, arg_types[i])
+            PgDatum { datum: nd.value, isnull: nd.isnull, oid: arg_types[i] }
         })
         .collect();
 
-    let args_array = serde_json::Value::Array(args_json);
-
     let (datum, is_null) =
-        execute_typescript_fn(&source, &param_names, args_array, PgDatumSeed { oid: ret_type });
+        execute_typescript_fn(&source, &param_names, &args, PgDatumSeed { oid: ret_type });
 
     if is_null {
         return unsafe { fcinfo::pg_return_null(fcinfo) };
@@ -119,39 +117,40 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
 // Core execution logic
 // ---------------------------------------------------------------------------
 
-/// Execute a TypeScript function body with pre-converted JSON arguments.
+/// Execute a TypeScript function body.
 ///
-/// `seed` drives how the resolved V8 value is converted to `S::Value`.
-/// Pass [`PgDatumSeed`] in production and a JSON seed in unit tests.
-fn execute_typescript_fn<S, R>(
+/// `args` is serialized directly into V8 values — no JSON string round-trip.
+/// `seed` drives how the resolved return value is converted to `R`.
+fn execute_typescript_fn<A, S, R>(
     source: &str,
     param_names: &[String],
-    args: serde_json::Value,
+    args: &[A],
     seed: S,
 ) -> R
 where
+    A: serde::Serialize,
     S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
 {
-    let args_json_str = serde_json::to_string(&args).unwrap_or_else(|_| "[]".to_string());
     let transformed = transform_imports(source);
     let params = param_names.join(", ");
 
     with_runtime(|rt| {
-        // Always async so `await` is valid in the body. The result is always a
-        // Promise; run_event_loop below settles it before we resolve the value.
-        let call_js = format!("(async function({params}) {{ {transformed} }})(...{args_json_str})");
-
-        let result_global = rt
-            .execute_script("<typescript:call>", call_js)
+        // Define the async function (expression, not an IIFE — we call it
+        // separately via the V8 API so we can pass args as native V8 values).
+        let fn_js = format!("(async function({params}) {{ {transformed} }})");
+        let fn_global = rt
+            .execute_script("<typescript:def>", fn_js)
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
 
+        // Call the function with directly serialized args → returns a Promise global.
+        let promise_global = call_fn_with_args(rt, fn_global, args);
+
         // Drain the event loop so any async work (await, microtasks) completes.
-        // After this, result_global is either a plain value or an already-settled Promise.
         block_on(rt.run_event_loop(Default::default()))
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
 
-        // resolve() on an already-settled Promise (or plain value) returns immediately.
-        let resolve_fut = rt.resolve(result_global);
+        // Resolve the now-settled Promise.
+        let resolve_fut = rt.resolve(promise_global);
         let resolved = block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
 
@@ -178,6 +177,37 @@ fn execute_inline_block(source: &str) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Call a V8 function with args serialized directly from Rust values.
+///
+/// Must be a plain `fn` (not a closure) for the same `deno_core::scope!`
+/// lifetime reason as `global_to`.  Returns a Global holding the Promise
+/// produced by the async function call.
+fn call_fn_with_args<A: serde::Serialize>(
+    rt: &mut deno_core::JsRuntime,
+    fn_global: v8::Global<v8::Value>,
+    args: &[A],
+) -> v8::Global<v8::Value> {
+    deno_core::scope!(scope, rt);
+    let fn_local = v8::Local::new(scope, fn_global);
+    let fn_obj = v8::Local::<v8::Function>::try_from(fn_local)
+        .unwrap_or_else(|_| pgrx::error!("pg_typescript: script did not return a function"));
+
+    let v8_args: Vec<v8::Local<v8::Value>> = args
+        .iter()
+        .map(|arg| {
+            deno_core::serde_v8::to_v8(scope, arg)
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: arg serialize: {e}"))
+        })
+        .collect();
+
+    let recv = v8::undefined(scope).into();
+    let result = fn_obj
+        .call(scope, recv, &v8_args)
+        .unwrap_or_else(|| pgrx::error!("pg_typescript: function call returned None"));
+
+    v8::Global::new(scope, result)
+}
 
 /// Deserialize a resolved V8 global using `seed`.
 ///
@@ -294,56 +324,52 @@ mod unit_tests {
         }
     }
 
-    fn run(source: &str, params: &[&str], args: serde_json::Value) -> (serde_json::Value, bool) {
+    fn run(source: &str, params: &[&str], args: &[serde_json::Value]) -> (serde_json::Value, bool) {
         let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
         super::execute_typescript_fn(source, &param_names, args, JsonSeed)
     }
 
     #[test]
     fn test_call_number() {
-        let (val, is_null) = run("return a + b;", &["a", "b"], serde_json::json!([1, 2]));
+        let (val, is_null) =
+            run("return a + b;", &["a", "b"], &[serde_json::json!(1), serde_json::json!(2)]);
         assert!(!is_null);
         assert_eq!(val, serde_json::json!(3));
     }
 
     #[test]
     fn test_call_string() {
-        let (val, is_null) = run(
-            "return `Hello, ${name}!`;",
-            &["name"],
-            serde_json::json!(["world"]),
-        );
+        let (val, is_null) =
+            run("return `Hello, ${name}!`;", &["name"], &[serde_json::json!("world")]);
         assert!(!is_null);
         assert_eq!(val, serde_json::json!("Hello, world!"));
     }
 
     #[test]
     fn test_call_bool() {
-        let (val, is_null) = run("return a > b;", &["a", "b"], serde_json::json!([3.0, 1.5]));
+        let (val, is_null) =
+            run("return a > b;", &["a", "b"], &[serde_json::json!(3.0), serde_json::json!(1.5)]);
         assert!(!is_null);
         assert_eq!(val, serde_json::json!(true));
     }
 
     #[test]
     fn test_call_null_return() {
-        let (_val, is_null) = run("return null;", &[], serde_json::json!([]));
+        let (_val, is_null) = run("return null;", &[], &[]);
         assert!(is_null);
     }
 
     #[test]
     fn test_call_object() {
-        let (val, is_null) = run("return { x: n * 2 };", &["n"], serde_json::json!([21]));
+        let (val, is_null) = run("return { x: n * 2 };", &["n"], &[serde_json::json!(21)]);
         assert!(!is_null);
         assert_eq!(val, serde_json::json!({ "x": 42 }));
     }
 
     #[test]
     fn test_async_number() {
-        let (val, is_null) = run(
-            "return await Promise.resolve(n * 2);",
-            &["n"],
-            serde_json::json!([21]),
-        );
+        let (val, is_null) =
+            run("return await Promise.resolve(n * 2);", &["n"], &[serde_json::json!(21)]);
         assert!(!is_null);
         assert_eq!(val, serde_json::json!(42));
     }
@@ -354,7 +380,7 @@ mod unit_tests {
             "const greeting = await Promise.resolve(`Hello, ${name}!`);
              return greeting;",
             &["name"],
-            serde_json::json!(["world"]),
+            &[serde_json::json!("world")],
         );
         assert!(!is_null);
         assert_eq!(val, serde_json::json!("Hello, world!"));
@@ -367,7 +393,7 @@ mod unit_tests {
              const b = await Promise.resolve(a * 2);
              return b;",
             &["x"],
-            serde_json::json!([4]),
+            &[serde_json::json!(4)],
         );
         assert!(!is_null);
         assert_eq!(val, serde_json::json!(10));
@@ -375,11 +401,7 @@ mod unit_tests {
 
     #[test]
     fn test_async_null_return() {
-        let (_val, is_null) = run(
-            "return await Promise.resolve(null);",
-            &[],
-            serde_json::json!([]),
-        );
+        let (_val, is_null) = run("return await Promise.resolve(null);", &[], &[]);
         assert!(is_null);
     }
 
@@ -389,7 +411,7 @@ mod unit_tests {
             "const doubled = await Promise.resolve(n * 2);
              return { original: n, doubled };",
             &["n"],
-            serde_json::json!([7]),
+            &[serde_json::json!(7)],
         );
         assert!(!is_null);
         assert_eq!(val, serde_json::json!({ "original": 7, "doubled": 14 }));

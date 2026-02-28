@@ -1,163 +1,65 @@
 use pgrx::{FromDatum, IntoDatum, pg_sys};
 use serde::de::{Deserialize, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::Serialize;
 use serde_json::Value;
 
-/// Convert a Postgres datum to a `serde_json::Value` for passing into JS.
-///
-/// # Safety
-/// `datum` must be a valid datum for the given `type_oid`, or the call
-/// must have `isnull == true`.
-pub unsafe fn datum_to_json(
-    datum: pg_sys::Datum,
-    isnull: bool,
-    type_oid: pg_sys::Oid,
-) -> Value {
-    if isnull {
-        return Value::Null;
-    }
+// ---------------------------------------------------------------------------
+// Serialize: direct Datum → V8 value (no JSON intermediary)
+// ---------------------------------------------------------------------------
 
-    unsafe {
-        match type_oid {
-            pg_sys::INT2OID => {
-                let v = i16::from_datum(datum, false).unwrap_or(0);
-                Value::Number(v.into())
-            }
-            pg_sys::INT4OID => {
-                let v = i32::from_datum(datum, false).unwrap_or(0);
-                Value::Number(v.into())
-            }
-            pg_sys::INT8OID => {
-                let v = i64::from_datum(datum, false).unwrap_or(0);
-                Value::Number(v.into())
-            }
-            pg_sys::FLOAT4OID => {
-                let v = f32::from_datum(datum, false).unwrap_or(0.0);
-                serde_json::Number::from_f64(v as f64)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
-            }
-            pg_sys::FLOAT8OID => {
-                let v = f64::from_datum(datum, false).unwrap_or(0.0);
-                serde_json::Number::from_f64(v)
-                    .map(Value::Number)
-                    .unwrap_or(Value::Null)
-            }
-            pg_sys::BOOLOID => {
-                let v = bool::from_datum(datum, false).unwrap_or(false);
-                Value::Bool(v)
-            }
-            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID => {
-                let v = String::from_datum(datum, false).unwrap_or_default();
-                Value::String(v)
-            }
-            pg_sys::JSONOID | pg_sys::JSONBOID => {
-                // pgrx::JsonB implements FromDatum and contains a serde_json::Value.
-                let v: Option<pgrx::JsonB> = pgrx::JsonB::from_datum(datum, false);
-                v.map(|j| j.0).unwrap_or(Value::Null)
-            }
-            _ => {
-                // Fall back: try to cast to text via PostgreSQL's output function.
-                let cstr = output_fn_call(datum, type_oid);
-                Value::String(cstr)
-            }
-        }
-    }
+/// A wrapper that serializes a Postgres datum directly into a V8 value via
+/// `serde_v8::to_v8`, bypassing any `serde_json::Value` intermediary.
+pub struct PgDatum {
+    pub datum: pg_sys::Datum,
+    pub isnull: bool,
+    pub oid: pg_sys::Oid,
 }
 
-/// Convert a `serde_json::Value` back to a Postgres Datum.
-///
-/// Returns `(Datum, isnull)`.  The caller must set `fcinfo.isnull` if isnull is true.
-pub fn json_to_datum(value: &Value, type_oid: pg_sys::Oid) -> (pg_sys::Datum, bool) {
-    match value {
-        Value::Null => (pg_sys::Datum::from(0usize), true),
-
-        Value::Bool(b) => match type_oid {
-            pg_sys::BOOLOID => ((*b).into_datum().unwrap(), false),
-            pg_sys::TEXTOID | pg_sys::VARCHAROID => {
-                (b.to_string().into_datum().unwrap(), false)
+impl Serialize for PgDatum {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        if self.isnull {
+            return s.serialize_none();
+        }
+        // SAFETY: caller guarantees datum is valid for this oid.
+        unsafe {
+            match self.oid {
+                pg_sys::INT2OID => {
+                    s.serialize_i16(i16::from_datum(self.datum, false).unwrap_or(0))
+                }
+                pg_sys::INT4OID => {
+                    s.serialize_i32(i32::from_datum(self.datum, false).unwrap_or(0))
+                }
+                pg_sys::INT8OID => {
+                    s.serialize_i64(i64::from_datum(self.datum, false).unwrap_or(0))
+                }
+                pg_sys::FLOAT4OID => {
+                    s.serialize_f32(f32::from_datum(self.datum, false).unwrap_or(0.0))
+                }
+                pg_sys::FLOAT8OID => {
+                    s.serialize_f64(f64::from_datum(self.datum, false).unwrap_or(0.0))
+                }
+                pg_sys::BOOLOID => {
+                    s.serialize_bool(bool::from_datum(self.datum, false).unwrap_or(false))
+                }
+                pg_sys::TEXTOID
+                | pg_sys::VARCHAROID
+                | pg_sys::BPCHAROID
+                | pg_sys::NAMEOID => {
+                    let v = String::from_datum(self.datum, false).unwrap_or_default();
+                    s.serialize_str(&v)
+                }
+                pg_sys::JSONOID | pg_sys::JSONBOID => {
+                    let v = pgrx::JsonB::from_datum(self.datum, false)
+                        .map(|j| j.0)
+                        .unwrap_or(Value::Null);
+                    v.serialize(s)
+                }
+                _ => {
+                    let text = output_fn_call(self.datum, self.oid);
+                    s.serialize_str(&text)
+                }
             }
-            _ => ((*b as i32).into_datum().unwrap(), false),
-        },
-
-        Value::Number(n) => match type_oid {
-            pg_sys::INT2OID => {
-                let v = n.as_i64().unwrap_or(0) as i16;
-                (v.into_datum().unwrap(), false)
-            }
-            pg_sys::INT4OID => {
-                let v = n.as_i64().unwrap_or(0) as i32;
-                (v.into_datum().unwrap(), false)
-            }
-            pg_sys::INT8OID => {
-                let v = n.as_i64().unwrap_or(0);
-                (v.into_datum().unwrap(), false)
-            }
-            pg_sys::FLOAT4OID => {
-                let v = n.as_f64().unwrap_or(0.0) as f32;
-                (v.into_datum().unwrap(), false)
-            }
-            pg_sys::FLOAT8OID => {
-                let v = n.as_f64().unwrap_or(0.0);
-                (v.into_datum().unwrap(), false)
-            }
-            pg_sys::TEXTOID | pg_sys::VARCHAROID => {
-                (n.to_string().into_datum().unwrap(), false)
-            }
-            pg_sys::BOOLOID => {
-                let v = n.as_f64().unwrap_or(0.0) != 0.0;
-                (v.into_datum().unwrap(), false)
-            }
-            _ => {
-                // Generic: stringify and input via Postgres.
-                let s = n.to_string();
-                (input_fn_call(&s, type_oid), false)
-            }
-        },
-
-        Value::String(s) => match type_oid {
-            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID => {
-                (s.as_str().into_datum().unwrap(), false)
-            }
-            pg_sys::INT4OID => {
-                let v: i32 = s.parse().unwrap_or(0);
-                (v.into_datum().unwrap(), false)
-            }
-            pg_sys::INT8OID => {
-                let v: i64 = s.parse().unwrap_or(0);
-                (v.into_datum().unwrap(), false)
-            }
-            pg_sys::FLOAT8OID => {
-                let v: f64 = s.parse().unwrap_or(0.0);
-                (v.into_datum().unwrap(), false)
-            }
-            pg_sys::BOOLOID => {
-                let v = matches!(s.to_lowercase().as_str(), "true" | "1" | "yes" | "on");
-                (v.into_datum().unwrap(), false)
-            }
-            pg_sys::JSONOID | pg_sys::JSONBOID => {
-                // Assume the string is already valid JSON.
-                let jb = pgrx::JsonB(
-                    serde_json::from_str(s).unwrap_or(Value::String(s.clone())),
-                );
-                (jb.into_datum().unwrap(), false)
-            }
-            _ => (input_fn_call(s, type_oid), false),
-        },
-
-        Value::Array(_) | Value::Object(_) => match type_oid {
-            pg_sys::JSONOID | pg_sys::JSONBOID => {
-                let jb = pgrx::JsonB(value.clone());
-                (jb.into_datum().unwrap(), false)
-            }
-            pg_sys::TEXTOID | pg_sys::VARCHAROID => {
-                let s = value.to_string();
-                (s.into_datum().unwrap(), false)
-            }
-            _ => {
-                let s = value.to_string();
-                (input_fn_call(&s, type_oid), false)
-            }
-        },
+        }
     }
 }
 
@@ -168,8 +70,7 @@ pub fn json_to_datum(value: &Value, type_oid: pg_sys::Oid) -> (pg_sys::Datum, bo
 /// A [`DeserializeSeed`] that converts a deserialized V8 value directly into a
 /// Postgres [`pg_sys::Datum`], using the supplied OID for type dispatch.
 ///
-/// Returns `(Datum, isnull)`.  Delegates to [`json_to_datum`] for all cases so
-/// the OID dispatch logic lives in exactly one place.
+/// Returns `(Datum, isnull)`.
 pub struct PgDatumSeed {
     pub oid: pg_sys::Oid,
 }
@@ -202,36 +103,99 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
     }
 
     fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
-        Ok(json_to_datum(&Value::Bool(v), self.oid))
+        let datum = match self.oid {
+            pg_sys::BOOLOID => v.into_datum().unwrap(),
+            pg_sys::TEXTOID | pg_sys::VARCHAROID => v.to_string().into_datum().unwrap(),
+            _ => (v as i32).into_datum().unwrap(),
+        };
+        Ok((datum, false))
     }
 
     fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
-        Ok(json_to_datum(&Value::Number(v.into()), self.oid))
+        let datum = match self.oid {
+            pg_sys::INT2OID => (v as i16).into_datum().unwrap(),
+            pg_sys::INT4OID => (v as i32).into_datum().unwrap(),
+            pg_sys::INT8OID => v.into_datum().unwrap(),
+            pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
+            pg_sys::FLOAT8OID => (v as f64).into_datum().unwrap(),
+            pg_sys::TEXTOID | pg_sys::VARCHAROID => v.to_string().into_datum().unwrap(),
+            pg_sys::BOOLOID => (v != 0).into_datum().unwrap(),
+            _ => input_fn_call(&v.to_string(), self.oid),
+        };
+        Ok((datum, false))
     }
     fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
-        Ok(json_to_datum(&Value::Number(serde_json::Number::from(v)), self.oid))
+        let datum = match self.oid {
+            pg_sys::INT2OID => (v as i16).into_datum().unwrap(),
+            pg_sys::INT4OID => (v as i32).into_datum().unwrap(),
+            pg_sys::INT8OID => (v as i64).into_datum().unwrap(),
+            pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
+            pg_sys::FLOAT8OID => (v as f64).into_datum().unwrap(),
+            pg_sys::TEXTOID | pg_sys::VARCHAROID => v.to_string().into_datum().unwrap(),
+            pg_sys::BOOLOID => (v != 0).into_datum().unwrap(),
+            _ => input_fn_call(&v.to_string(), self.oid),
+        };
+        Ok((datum, false))
     }
     fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
-        let n = serde_json::Number::from_f64(v).unwrap_or_else(|| serde_json::Number::from(0));
-        Ok(json_to_datum(&Value::Number(n), self.oid))
+        let datum = match self.oid {
+            pg_sys::INT2OID => (v as i16).into_datum().unwrap(),
+            pg_sys::INT4OID => (v as i32).into_datum().unwrap(),
+            pg_sys::INT8OID => (v as i64).into_datum().unwrap(),
+            pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
+            pg_sys::FLOAT8OID => v.into_datum().unwrap(),
+            pg_sys::TEXTOID | pg_sys::VARCHAROID => v.to_string().into_datum().unwrap(),
+            pg_sys::BOOLOID => (v != 0.0).into_datum().unwrap(),
+            _ => input_fn_call(&v.to_string(), self.oid),
+        };
+        Ok((datum, false))
     }
 
     fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-        Ok(json_to_datum(&Value::String(v.to_owned()), self.oid))
+        let datum = match self.oid {
+            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID => {
+                v.into_datum().unwrap()
+            }
+            pg_sys::INT4OID => v.parse::<i32>().unwrap_or(0).into_datum().unwrap(),
+            pg_sys::INT8OID => v.parse::<i64>().unwrap_or(0).into_datum().unwrap(),
+            pg_sys::FLOAT8OID => v.parse::<f64>().unwrap_or(0.0).into_datum().unwrap(),
+            pg_sys::BOOLOID => {
+                matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+                    .into_datum()
+                    .unwrap()
+            }
+            pg_sys::JSONOID | pg_sys::JSONBOID => {
+                let jb = pgrx::JsonB(
+                    serde_json::from_str(v).unwrap_or_else(|_| Value::String(v.to_owned())),
+                );
+                jb.into_datum().unwrap()
+            }
+            _ => input_fn_call(v, self.oid),
+        };
+        Ok((datum, false))
     }
     fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
-        Ok(json_to_datum(&Value::String(v), self.oid))
+        self.visit_str(&v)
     }
 
-    // Objects (e.g. JSONB return type) — collect into a serde_json::Value then convert.
+    // Objects — collect the recursive structure into a Value (unavoidable), then convert.
     fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
         let value = Value::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
-        Ok(json_to_datum(&value, self.oid))
+        let datum = match self.oid {
+            pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(value).into_datum().unwrap(),
+            pg_sys::TEXTOID | pg_sys::VARCHAROID => value.to_string().into_datum().unwrap(),
+            _ => input_fn_call(&value.to_string(), self.oid),
+        };
+        Ok((datum, false))
     }
-    // Arrays / JSONB arrays.
     fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
         let value = Value::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
-        Ok(json_to_datum(&value, self.oid))
+        let datum = match self.oid {
+            pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(value).into_datum().unwrap(),
+            pg_sys::TEXTOID | pg_sys::VARCHAROID => value.to_string().into_datum().unwrap(),
+            _ => input_fn_call(&value.to_string(), self.oid),
+        };
+        Ok((datum, false))
     }
 }
 
