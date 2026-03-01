@@ -1,6 +1,8 @@
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::CStr;
+use std::hash::{Hash, Hasher};
 
 use deno_core::v8;
 use pgrx::pg_catalog::pg_proc::PgProc;
@@ -149,7 +151,15 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             .unwrap_or("")
             .to_string();
 
-        execute_inline_block(&source);
+        let import_map = read_inline_import_map();
+
+        // Fetch and cache all dependencies before execution — network access
+        // happens here, never during the execute step.
+        if !import_map.is_empty() {
+            fetch::fetch_and_cache(0u32, &import_map);
+        }
+
+        execute_inline_block(&source, &import_map);
         fcinfo::pg_return_void()
     }
 }
@@ -158,17 +168,18 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
 // Core execution
 // ---------------------------------------------------------------------------
 
-// Thread-local counter used to generate unique ES module specifiers.
+// Per-connection cache: (fn_oid, source_hash) → compiled default-export function.
+// Keying on source_hash means ALTER FUNCTION (which changes the source) automatically
+// gets a fresh entry, while repeated calls reuse the already-compiled module.
 thread_local! {
-    static MODULE_COUNTER: Cell<u64> = Cell::new(0);
+    static FN_CACHE: RefCell<HashMap<(u32, u64), v8::Global<v8::Value>>> =
+        RefCell::new(HashMap::new());
 }
 
-fn next_module_id() -> u64 {
-    MODULE_COUNTER.with(|c| {
-        let id = c.get();
-        c.set(id + 1);
-        id
-    })
+fn hash_str(s: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
 }
 
 /// Execute a TypeScript function body as an ES module.
@@ -191,55 +202,99 @@ where
 {
     let params = param_names.join(", ");
     let module_source = assemble_module(source, import_map, &params);
-
-    // Unique specifier per call so V8 doesn't serve a cached version.
-    let call_id = next_module_id();
-    let specifier_str = format!("file:///pg_typescript/fn_{fn_oid}_{call_id}.mjs");
-    let specifier = deno_core::resolve_url(&specifier_str)
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
+    let source_hash = hash_str(&module_source);
+    let oid_raw = u32::from(fn_oid);
 
     // Set loader context; the guard clears it when this function returns or panics.
-    let _ctx = loader::set_loader_context(u32::from(fn_oid), import_map.clone());
+    let _ctx = loader::set_loader_context(oid_raw, import_map.clone());
 
     with_runtime(|rt| {
-        // Load and link the module (triggers loader for each imported package).
-        let module_id = block_on(rt.load_main_es_module_from_code(&specifier, module_source))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
+        // Look up (oid, source_hash) in the per-connection cache.
+        // Cache hit: skip module loading and compilation entirely.
+        let fn_global = FN_CACHE.with(|c| c.borrow().get(&(oid_raw, source_hash)).cloned());
 
-        // Evaluate the module, driving the event loop until evaluation is complete.
-        // The future must be awaited (not dropped) so top-level errors are not silently lost.
-        let evaluate = rt.mod_evaluate(module_id);
-        block_on(rt.with_event_loop_promise(evaluate, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+        let fn_global = match fn_global {
+            Some(f) => f,
+            None => {
+                // Specifier is stable per (function, source version): ALTER FUNCTION changes
+                // the source, which changes the hash and therefore triggers a fresh load.
+                let specifier_str =
+                    format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.mjs");
+                let specifier = deno_core::resolve_url(&specifier_str)
+                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
-        // Extract the default export — the user's async function.
-        let namespace = rt
-            .get_module_namespace(module_id)
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
-        let fn_global = extract_default_export(rt, namespace);
+                let module_id =
+                    block_on(rt.load_main_es_module_from_code(&specifier, module_source))
+                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
 
-        // Call it with the serialized argument values.
+                // Evaluate the module; future must be awaited so errors are not silently lost.
+                let evaluate = rt.mod_evaluate(module_id);
+                block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+                    .unwrap_or_else(|e| {
+                        pgrx::error!("pg_typescript: module evaluation failed: {e}")
+                    });
+
+                let namespace = rt
+                    .get_module_namespace(module_id)
+                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+                let f = extract_default_export(rt, namespace);
+
+                FN_CACHE.with(|c| c.borrow_mut().insert((oid_raw, source_hash), f.clone()));
+                f
+            }
+        };
+
         let promise_global = call_fn_with_args(rt, fn_global, args);
-
-        // Resolve the returned Promise, driving the event loop until it settles.
         let resolve_fut = rt.resolve(promise_global);
-        let resolved =
-            block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
-                .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+        let resolved = block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
 
         global_to(rt, resolved, seed)
     })
 }
 
-/// Execute a DO block (no return value, no imports).
-fn execute_inline_block(source: &str) {
-    with_runtime(|rt| {
-        let js = format!("(async () => {{ {source} }})()");
-        let result_global = rt
-            .execute_script("<typescript:inline>", js)
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+/// Execute a DO block as an ES module. Follows the same load/cache/call path
+/// as regular functions, using OID 0 as the synthetic key in FN_CACHE.
+fn execute_inline_block(source: &str, import_map: &HashMap<String, String>) {
+    let module_source = assemble_module(source, import_map, "");
+    let source_hash = hash_str(&module_source);
 
-        let resolve_fut = rt.resolve(result_global);
+    let _ctx = loader::set_loader_context(0u32, import_map.clone());
+
+    with_runtime(|rt| {
+        let fn_global = FN_CACHE.with(|c| c.borrow().get(&(0u32, source_hash)).cloned());
+
+        let fn_global = match fn_global {
+            Some(f) => f,
+            None => {
+                let specifier_str =
+                    format!("file:///pg_typescript/do_{source_hash:016x}.mjs");
+                let specifier = deno_core::resolve_url(&specifier_str)
+                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
+
+                let module_id =
+                    block_on(rt.load_main_es_module_from_code(&specifier, module_source))
+                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
+
+                let evaluate = rt.mod_evaluate(module_id);
+                block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+                    .unwrap_or_else(|e| {
+                        pgrx::error!("pg_typescript: module evaluation failed: {e}")
+                    });
+
+                let namespace = rt
+                    .get_module_namespace(module_id)
+                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+                let f = extract_default_export(rt, namespace);
+
+                FN_CACHE.with(|c| c.borrow_mut().insert((0u32, source_hash), f.clone()));
+                f
+            }
+        };
+
+        let no_args: &[serde_json::Value] = &[];
+        let promise_global = call_fn_with_args(rt, fn_global, no_args);
+        let resolve_fut = rt.resolve(promise_global);
         block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: event loop error in DO block: {e}"));
     });
@@ -336,7 +391,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// proconfig helper
+// Import map helpers
 // ---------------------------------------------------------------------------
 
 /// Read the `typescript.import_map` value from a function's proconfig and
@@ -352,6 +407,19 @@ fn read_import_map(proc: &PgProc) -> HashMap<String, String> {
         Some(ref j) => fetch::parse_import_map(j)
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}")),
         None => HashMap::new(),
+    }
+}
+
+/// Read the `typescript.import_map` GUC (set via `SET LOCAL typescript.import_map = '...'`)
+/// and parse it for use by DO blocks.
+fn read_inline_import_map() -> HashMap<String, String> {
+    let json = crate::IMPORT_MAP_GUC
+        .get()
+        .and_then(|cstr| cstr.to_str().ok().map(|s| s.to_string()));
+    match json.as_deref() {
+        Some(j) if !j.is_empty() => fetch::parse_import_map(j)
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}")),
+        _ => HashMap::new(),
     }
 }
 

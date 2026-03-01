@@ -74,87 +74,11 @@ impl ModuleLoader for PgModuleLoader {
             return ModuleSpecifier::parse(specifier).map_err(JsErrorBox::from_err);
         }
 
-        // Determine whether this resolution originates from the main module
-        // (file:// referrer) or from a transitive dependency (http/https referrer).
-        // The two cases have different trust levels.
+        // Dispatch based on the trust level of the referrer.
         if referrer.starts_with("file://") {
-            // ---------------------------------------------------------------
-            // Imports from the main module body.
-            // Everything must be explicitly declared in the import map.
-            // ---------------------------------------------------------------
-
-            // Relative imports are not allowed in the function body.
-            if specifier.starts_with('/')
-                || specifier.starts_with("./")
-                || specifier.starts_with("../")
-            {
-                return Err(JsErrorBox::generic(format!(
-                    "pg_typescript: relative imports are not allowed in function body: '{specifier}'"
-                )));
-            }
-
-            let url = LOADER_CTX.with(|c| {
-                let ctx = c.borrow();
-                let (_, import_map) = ctx
-                    .as_ref()
-                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: no loader context set"))?;
-
-                // Bare specifier → direct key lookup.
-                if let Some(url) = import_map.get(specifier) {
-                    return Ok(url.clone());
-                }
-
-                // Absolute URL → must appear as a declared value in the import map.
-                if specifier.starts_with("http://") || specifier.starts_with("https://") {
-                    if import_map.values().any(|v| v == specifier) {
-                        return Ok(specifier.to_string());
-                    }
-                    return Err(JsErrorBox::generic(format!(
-                        "pg_typescript: '{specifier}' is not declared in the import map"
-                    )));
-                }
-
-                Err(JsErrorBox::generic(format!(
-                    "pg_typescript: '{specifier}' not found in import map"
-                )))
-            })?;
-
-            ModuleSpecifier::parse(&url).map_err(JsErrorBox::from_err)
+            resolve_from_main(specifier)
         } else {
-            // ---------------------------------------------------------------
-            // Imports from a transitive dependency (http/https referrer).
-            // Absolute URLs pass through; relative ones resolve against the referrer.
-            // ---------------------------------------------------------------
-            if specifier.starts_with("http://") || specifier.starts_with("https://") {
-                return ModuleSpecifier::parse(specifier).map_err(JsErrorBox::from_err);
-            }
-
-            if specifier.starts_with('/')
-                || specifier.starts_with("./")
-                || specifier.starts_with("../")
-            {
-                let base = ModuleSpecifier::parse(referrer)
-                    .unwrap_or_else(|_| ModuleSpecifier::parse("file:///").unwrap());
-                return base.join(specifier).map_err(JsErrorBox::from_err);
-            }
-
-            // Bare specifier from a transitive dep — fall back to the import map.
-            let url = LOADER_CTX.with(|c| {
-                let ctx = c.borrow();
-                let (_, import_map) = ctx
-                    .as_ref()
-                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: no loader context set"))?;
-                import_map
-                    .get(specifier)
-                    .cloned()
-                    .ok_or_else(|| {
-                        JsErrorBox::generic(format!(
-                            "pg_typescript: '{specifier}' not found in import map"
-                        ))
-                    })
-            })?;
-
-            ModuleSpecifier::parse(&url).map_err(JsErrorBox::from_err)
+            resolve_from_dep(specifier, referrer)
         }
     }
 
@@ -191,6 +115,88 @@ impl ModuleLoader for PgModuleLoader {
     fn get_source_map(&self, _specifier: &str) -> Option<Cow<'_, [u8]>> {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Resolution helpers
+// ---------------------------------------------------------------------------
+
+/// Resolve an import that originates from the main module body.
+///
+/// Everything must be explicitly declared in the import map — relative imports
+/// are rejected outright, bare specifiers are looked up by key, and absolute
+/// http/https URLs must appear as a declared value.
+fn resolve_from_main(specifier: &str) -> Result<ModuleSpecifier, ModuleLoaderError> {
+    if specifier.starts_with('/')
+        || specifier.starts_with("./")
+        || specifier.starts_with("../")
+    {
+        return Err(JsErrorBox::generic(format!(
+            "pg_typescript: relative imports are not allowed in function body: '{specifier}'"
+        )));
+    }
+
+    let url = LOADER_CTX.with(|c| {
+        let ctx = c.borrow();
+        let (_, import_map) = ctx
+            .as_ref()
+            .ok_or_else(|| JsErrorBox::generic("pg_typescript: no loader context set"))?;
+
+        // Bare specifier → direct key lookup.
+        if let Some(url) = import_map.get(specifier) {
+            return Ok(url.clone());
+        }
+
+        // Absolute URL → must appear as a declared value in the import map.
+        if specifier.starts_with("http://") || specifier.starts_with("https://") {
+            if import_map.values().any(|v| v == specifier) {
+                return Ok(specifier.to_string());
+            }
+            return Err(JsErrorBox::generic(format!(
+                "pg_typescript: '{specifier}' is not declared in the import map"
+            )));
+        }
+
+        Err(JsErrorBox::generic(format!(
+            "pg_typescript: '{specifier}' not found in import map"
+        )))
+    })?;
+
+    ModuleSpecifier::parse(&url).map_err(JsErrorBox::from_err)
+}
+
+/// Resolve an import that originates from a transitive dependency.
+///
+/// Absolute http/https URLs pass through freely; relative specifiers are
+/// resolved against the referrer. Bare specifiers fall back to the import map.
+fn resolve_from_dep(specifier: &str, referrer: &str) -> Result<ModuleSpecifier, ModuleLoaderError> {
+    if specifier.starts_with("http://") || specifier.starts_with("https://") {
+        return ModuleSpecifier::parse(specifier).map_err(JsErrorBox::from_err);
+    }
+
+    if specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../") {
+        let base = ModuleSpecifier::parse(referrer)
+            .unwrap_or_else(|_| ModuleSpecifier::parse("file:///").unwrap());
+        return base.join(specifier).map_err(JsErrorBox::from_err);
+    }
+
+    // Bare specifier — fall back to the import map.
+    let url = LOADER_CTX.with(|c| {
+        let ctx = c.borrow();
+        let (_, import_map) = ctx
+            .as_ref()
+            .ok_or_else(|| JsErrorBox::generic("pg_typescript: no loader context set"))?;
+        import_map
+            .get(specifier)
+            .cloned()
+            .ok_or_else(|| {
+                JsErrorBox::generic(format!(
+                    "pg_typescript: '{specifier}' not found in import map"
+                ))
+            })
+    })?;
+
+    ModuleSpecifier::parse(&url).map_err(JsErrorBox::from_err)
 }
 
 // ---------------------------------------------------------------------------

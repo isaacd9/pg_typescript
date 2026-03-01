@@ -1,4 +1,5 @@
 use pgrx::prelude::*;
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 pgrx::pg_module_magic!(name, version);
 
@@ -8,14 +9,15 @@ mod loader;
 mod plhandler;
 mod runtime;
 
+/// GUC for DO-block import maps. Use `SET LOCAL typescript.import_map = '{"imports": {...}}'`
+/// before a DO block so the setting reverts automatically at transaction end.
+/// Per-function import maps are stored in proconfig via `CREATE FUNCTION … SET`.
+pub(crate) static IMPORT_MAP_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+
 // Register the GUC for per-function import maps.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
-    use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
-
-    static IMPORT_MAP_GUC: GucSetting<Option<std::ffi::CString>> =
-        GucSetting::<Option<std::ffi::CString>>::new(None);
-
     GucRegistry::define_string_guc(
         c"typescript.import_map",
         c"Deno-style import map JSON for pg_typescript functions, e.g. {\"imports\":{\"lodash\":\"https://esm.sh/lodash@4.17.23\"}}",
