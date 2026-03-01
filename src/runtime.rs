@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use deno_core::{JsRuntime, RuntimeOptions};
 
-use crate::resolve::EsmModuleLoader;
+use crate::loader::PgModuleLoader;
 
 thread_local! {
     static JS_RT: RefCell<Option<JsRuntime>> = RefCell::new(None);
@@ -27,7 +27,6 @@ where
 /// Block the current thread on an async future, using a per-connection
 /// single-threaded Tokio runtime.
 pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    // Initialise if needed.
     TOKIO_RT.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if borrow.is_none() {
@@ -40,15 +39,12 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
         }
     });
 
-    TOKIO_RT.with(|cell| {
-        // `block_on` takes `&self`, so an immutable borrow is enough.
-        cell.borrow().as_ref().unwrap().block_on(future)
-    })
+    TOKIO_RT.with(|cell| cell.borrow().as_ref().unwrap().block_on(future))
 }
 
 fn create_runtime() -> JsRuntime {
     JsRuntime::new(RuntimeOptions {
-        module_loader: Some(Rc::new(EsmModuleLoader::new())),
+        module_loader: Some(Rc::new(PgModuleLoader)),
         ..Default::default()
     })
 }
