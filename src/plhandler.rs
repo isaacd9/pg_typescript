@@ -349,7 +349,8 @@ fn read_import_map(proc: &PgProc) -> HashMap<String, String> {
         .find_map(|kv| kv.strip_prefix("typescript.import_map=").map(|v| v.to_string()));
 
     match json {
-        Some(ref j) => fetch::parse_import_map(j),
+        Some(ref j) => fetch::parse_import_map(j)
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}")),
         None => HashMap::new(),
     }
 }

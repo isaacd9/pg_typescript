@@ -6,23 +6,65 @@ use serde_json::Value;
 // Import map parsing (pure Rust, no Postgres)
 // ---------------------------------------------------------------------------
 
-/// Parse a Deno-style import map JSON string into a `{specifier -> url}` map.
+/// Parse and validate a Deno-style import map JSON string into a `{specifier -> url}` map.
 ///
 /// Expected format: `{"imports": {"lodash": "https://esm.sh/lodash@4.17.23"}}`
-pub fn parse_import_map(json: &str) -> HashMap<String, String> {
-    let v: Value = match serde_json::from_str(json) {
-        Ok(v) => v,
-        Err(_) => return HashMap::new(),
+///
+/// Returns an error if the JSON is malformed, if any key is not a valid JS
+/// identifier, or if any URL is not an http/https URL.
+pub fn parse_import_map(json: &str) -> Result<HashMap<String, String>, String> {
+    let v: Value = serde_json::from_str(json)
+        .map_err(|e| format!("invalid import_map JSON: {e}"))?;
+
+    let imports = match v.get("imports").and_then(|i| i.as_object()) {
+        Some(obj) => obj,
+        None => return Ok(HashMap::new()),
     };
+
     let mut map = HashMap::new();
-    if let Some(imports) = v.get("imports").and_then(|i| i.as_object()) {
-        for (key, val) in imports {
-            if let Some(url) = val.as_str() {
-                map.insert(key.clone(), url.to_string());
-            }
+    for (key, val) in imports {
+        validate_js_identifier(key)?;
+        let url = val
+            .as_str()
+            .ok_or_else(|| format!("import_map: value for '{key}' is not a string"))?;
+        validate_http_url(url)?;
+        map.insert(key.clone(), url.to_string());
+    }
+    Ok(map)
+}
+
+fn validate_js_identifier(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let first = chars
+        .next()
+        .ok_or_else(|| "import_map key is empty".to_string())?;
+    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
+        return Err(format!(
+            "import_map key '{name}' is not a valid JS identifier \
+             (must start with a letter, '_', or '$')"
+        ));
+    }
+    for ch in chars {
+        if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$') {
+            return Err(format!(
+                "import_map key '{name}' is not a valid JS identifier \
+                 (invalid character '{ch}')"
+            ));
         }
     }
-    map
+    Ok(())
+}
+
+fn validate_http_url(url: &str) -> Result<(), String> {
+    use deno_core::ModuleSpecifier;
+    let parsed = ModuleSpecifier::parse(url)
+        .map_err(|e| format!("import_map URL '{url}' is invalid: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(()),
+        scheme => Err(format!(
+            "import_map URL '{url}' has unsupported scheme '{scheme}' (only http/https allowed)"
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -39,9 +81,18 @@ pub fn parse_import_map(json: &str) -> HashMap<String, String> {
 #[cfg(not(test))]
 pub fn fetch_and_cache(fn_oid_raw: u32, import_map: &HashMap<String, String>) {
     use std::collections::HashSet;
-    use pgrx::pg_sys;
+    use pgrx::{Spi, pg_sys};
 
     let fn_oid = pg_sys::Oid::from(fn_oid_raw);
+
+    // Delete all previously cached modules for this function so that stale
+    // entries from a prior definition (with a different import map) are removed.
+    Spi::run_with_args(
+        "DELETE FROM deno_internal.deno_package_modules WHERE function_oid = $1",
+        &[fn_oid.into()],
+    )
+    .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to clear module cache: {e:?}"));
+
     let mut visited: HashSet<String> = HashSet::new();
     for url in import_map.values() {
         fetch_recursive(fn_oid, url, &mut visited);
