@@ -116,9 +116,12 @@ pub unsafe extern "C-unwind" fn typescript_validator(fn_oid: pg_sys::Oid) {
     let params = param_names.join(", ");
 
     // If the function declares an import map, fetch all dependencies now.
-    let import_map = read_import_map(&proc);
-    if !import_map.is_empty() {
-        fetch::fetch_and_cache(u32::from(fn_oid), &import_map);
+    #[cfg(not(test))]
+    {
+        let import_map = read_import_map(&proc);
+        if !import_map.is_empty() {
+            fetch::fetch_and_cache(u32::from(fn_oid), &import_map, &mut fetch::PgModuleStore, &fetch::UreqFetcher);
+        }
     }
 
     // Syntax-check the function body using execute_script (no module system needed).
@@ -155,8 +158,9 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
 
         // Fetch and cache all dependencies before execution — network access
         // happens here, never during the execute step.
+        #[cfg(not(test))]
         if !import_map.is_empty() {
-            fetch::fetch_and_cache(0u32, &import_map);
+            fetch::fetch_and_cache(0u32, &import_map, &mut fetch::PgModuleStore, &fetch::UreqFetcher);
         }
 
         execute_inline_block(&source, &import_map);
@@ -205,17 +209,22 @@ where
     let source_hash = hash_str(&module_source);
     let oid_raw = u32::from(fn_oid);
 
-    // Set loader context; the guard clears it when this function returns or panics.
-    let _ctx = loader::set_loader_context(oid_raw, import_map.clone());
-
     with_runtime(|rt| {
         // Look up (oid, source_hash) in the per-connection cache.
-        // Cache hit: skip module loading and compilation entirely.
+        // Cache hit: skip module loading, compilation, and loader context setup entirely.
         let fn_global = FN_CACHE.with(|c| c.borrow().get(&(oid_raw, source_hash)).cloned());
 
         let fn_global = match fn_global {
             Some(f) => f,
             None => {
+                // Set loader context only on cache miss — the module loader is
+                // only called during initial load, never when calling a cached function.
+                #[cfg(not(test))]
+                let store: Box<dyn fetch::ModuleStore> = Box::new(fetch::PgModuleStore);
+                #[cfg(test)]
+                let store: Box<dyn fetch::ModuleStore> = Box::new(fetch::HashMapModuleStore::new());
+                let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), store);
+
                 // Specifier is stable per (function, source version): ALTER FUNCTION changes
                 // the source, which changes the hash and therefore triggers a fresh load.
                 let specifier_str =
@@ -259,14 +268,19 @@ fn execute_inline_block(source: &str, import_map: &HashMap<String, String>) {
     let module_source = assemble_module(source, import_map, "");
     let source_hash = hash_str(&module_source);
 
-    let _ctx = loader::set_loader_context(0u32, import_map.clone());
-
     with_runtime(|rt| {
         let fn_global = FN_CACHE.with(|c| c.borrow().get(&(0u32, source_hash)).cloned());
 
         let fn_global = match fn_global {
             Some(f) => f,
             None => {
+                // Set loader context only on cache miss.
+                #[cfg(not(test))]
+                let store: Box<dyn fetch::ModuleStore> = Box::new(fetch::PgModuleStore);
+                #[cfg(test)]
+                let store: Box<dyn fetch::ModuleStore> = Box::new(fetch::HashMapModuleStore::new());
+                let _ctx = loader::set_loader_context(0u32, import_map.clone(), store);
+
                 let specifier_str =
                     format!("file:///pg_typescript/do_{source_hash:016x}.mjs");
                 let specifier = deno_core::resolve_url(&specifier_str)

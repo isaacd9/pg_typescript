@@ -3,6 +3,158 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 // ---------------------------------------------------------------------------
+// ModuleStore trait
+// ---------------------------------------------------------------------------
+
+pub trait ModuleStore {
+    fn load(&self, fn_oid: u32, url: &str) -> Result<Option<String>, String>;
+    fn write(&mut self, fn_oid: u32, url: &str, source: &str);
+    fn clear_for_fn(&mut self, fn_oid: u32);
+}
+
+// ---------------------------------------------------------------------------
+// HashMapModuleStore — in-memory store, used in tests
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub struct HashMapModuleStore(HashMap<(u32, String), String>);
+
+impl HashMapModuleStore {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+}
+
+impl ModuleStore for HashMapModuleStore {
+    fn load(&self, fn_oid: u32, url: &str) -> Result<Option<String>, String> {
+        Ok(self.0.get(&(fn_oid, url.to_string())).cloned())
+    }
+
+    fn write(&mut self, fn_oid: u32, url: &str, source: &str) {
+        self.0.insert((fn_oid, url.to_string()), source.to_string());
+    }
+
+    fn clear_for_fn(&mut self, fn_oid: u32) {
+        self.0.retain(|(oid, _), _| *oid != fn_oid);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PgModuleStore — Postgres-backed store.
+//
+// Excluded from test builds: pgrx::Spi links against _CacheMemoryContext and
+// other PostgreSQL globals that are not present in the unit-test binary.
+// ---------------------------------------------------------------------------
+
+#[cfg(not(test))]
+pub struct PgModuleStore;
+
+#[cfg(not(test))]
+impl ModuleStore for PgModuleStore {
+    fn load(&self, fn_oid: u32, url: &str) -> Result<Option<String>, String> {
+        use pgrx::spi::SpiError;
+        use pgrx::{Spi, pg_sys};
+
+        let pg_oid = pg_sys::Oid::from(fn_oid);
+        Spi::connect(|client| {
+            let rows = client.select(
+                "SELECT source \
+                 FROM deno_internal.deno_package_modules \
+                 WHERE function_oid = $1 AND url = $2",
+                None,
+                &[pg_oid.into(), url.to_string().into()],
+            )?;
+            for row in rows {
+                let src: Option<String> = row["source"].value()?;
+                return Ok(src);
+            }
+            Ok::<Option<String>, SpiError>(None)
+        })
+        .map_err(|e| format!("{e:?}"))
+    }
+
+    fn write(&mut self, fn_oid: u32, url: &str, source: &str) {
+        use pgrx::{Spi, pg_sys};
+
+        let pg_oid = pg_sys::Oid::from(fn_oid);
+        Spi::run_with_args(
+            "INSERT INTO deno_internal.deno_package_modules (function_oid, url, source) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (function_oid, url) DO UPDATE SET source = EXCLUDED.source",
+            &[pg_oid.into(), url.to_string().into(), source.to_string().into()],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to cache module {url}: {e:?}"));
+    }
+
+    fn clear_for_fn(&mut self, fn_oid: u32) {
+        use pgrx::{Spi, pg_sys};
+
+        let pg_oid = pg_sys::Oid::from(fn_oid);
+        Spi::run_with_args(
+            "DELETE FROM deno_internal.deno_package_modules WHERE function_oid = $1",
+            &[pg_oid.into()],
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to clear module cache: {e:?}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fetcher trait
+// ---------------------------------------------------------------------------
+
+pub trait Fetcher {
+    fn fetch(&self, url: &str) -> String;
+}
+
+// ---------------------------------------------------------------------------
+// HashMapFetcher — pre-canned responses for tests
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub struct HashMapFetcher(HashMap<String, String>);
+
+impl HashMapFetcher {
+    #[allow(dead_code)]
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    #[allow(dead_code)]
+    pub fn insert(&mut self, url: impl Into<String>, source: impl Into<String>) {
+        self.0.insert(url.into(), source.into());
+    }
+}
+
+impl Fetcher for HashMapFetcher {
+    fn fetch(&self, url: &str) -> String {
+        self.0
+            .get(url)
+            .cloned()
+            .unwrap_or_else(|| panic!("HashMapFetcher: no entry for '{url}'"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UreqFetcher — real HTTP client
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub struct UreqFetcher;
+
+impl Fetcher for UreqFetcher {
+    fn fetch(&self, url: &str) -> String {
+        match ureq::get(url).call() {
+            Ok(resp) => match resp.into_string() {
+                Ok(s) => s,
+                Err(e) => pgrx::error!("pg_typescript: failed to read response from {url}: {e}"),
+            },
+            Err(e) => pgrx::error!("pg_typescript: failed to fetch {url}: {e}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Import map parsing (pure Rust, no Postgres)
 // ---------------------------------------------------------------------------
 
@@ -68,100 +220,57 @@ fn validate_http_url(url: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// Fetching and caching — Postgres / pgrx only in non-test builds.
-// Unit test binaries do not link against Postgres shared libraries, so any
-// direct reference to Postgres C symbols causes a dyld abort at load time.
+// Fetching and caching
 // ---------------------------------------------------------------------------
 
 /// Fetch all modules in the import map (and transitive dependencies) and
-/// write the sources into `deno_internal.deno_package_modules`.
-///
-/// `fn_oid_raw` is the function OID as a plain `u32` to avoid pulling
-/// `pgrx::pg_sys::Oid` into the public interface.
-#[cfg(not(test))]
-pub fn fetch_and_cache(fn_oid_raw: u32, import_map: &HashMap<String, String>) {
+/// write them into the provided store using the provided fetcher.
+pub fn fetch_and_cache<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
+    fn_oid_raw: u32,
+    import_map: &HashMap<String, String>,
+    store: &mut S,
+    fetcher: &F,
+) {
     use std::collections::HashSet;
-    use pgrx::{Spi, pg_sys};
 
-    let fn_oid = pg_sys::Oid::from(fn_oid_raw);
-
-    // Delete all previously cached modules for this function so that stale
-    // entries from a prior definition (with a different import map) are removed.
-    Spi::run_with_args(
-        "DELETE FROM deno_internal.deno_package_modules WHERE function_oid = $1",
-        &[fn_oid.into()],
-    )
-    .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to clear module cache: {e:?}"));
+    store.clear_for_fn(fn_oid_raw);
 
     let mut visited: HashSet<String> = HashSet::new();
     for url in import_map.values() {
-        fetch_recursive(fn_oid, url, &mut visited);
+        fetch_recursive(fn_oid_raw, url, &mut visited, store, fetcher);
     }
 }
 
-#[cfg(test)]
-pub fn fetch_and_cache(_fn_oid_raw: u32, _import_map: &HashMap<String, String>) {
-    // No-op in unit tests: there is no Postgres database to write to.
-}
-
-// ---------------------------------------------------------------------------
-// Implementation (non-test only)
-// ---------------------------------------------------------------------------
-
-#[cfg(not(test))]
-fn fetch_recursive(
-    fn_oid: pgrx::pg_sys::Oid,
+fn fetch_recursive<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
+    fn_oid_raw: u32,
     url: &str,
     visited: &mut std::collections::HashSet<String>,
+    store: &mut S,
+    fetcher: &F,
 ) {
     if visited.contains(url) {
         return;
     }
     visited.insert(url.to_string());
 
-    let source = fetch_url(url);
-    write_module(fn_oid, url, &source);
+    let source = fetcher.fetch(url);
+    store.write(fn_oid_raw, url, &source);
 
     for dep_specifier in extract_imports(&source) {
         if let Some(dep_url) = resolve_specifier(&dep_specifier, url) {
-            fetch_recursive(fn_oid, &dep_url, visited);
+            fetch_recursive(fn_oid_raw, &dep_url, visited, store, fetcher);
         }
     }
 }
 
-#[cfg(not(test))]
-fn fetch_url(url: &str) -> String {
-    match ureq::get(url).call() {
-        Ok(resp) => match resp.into_string() {
-            Ok(s) => s,
-            Err(e) => pgrx::error!("pg_typescript: failed to read response from {url}: {e}"),
-        },
-        Err(e) => pgrx::error!("pg_typescript: failed to fetch {url}: {e}"),
-    }
-}
-
-#[cfg(not(test))]
-fn write_module(fn_oid: pgrx::pg_sys::Oid, url: &str, source: &str) {
-    use pgrx::Spi;
-    Spi::run_with_args(
-        "INSERT INTO deno_internal.deno_package_modules (function_oid, url, source) \
-         VALUES ($1, $2, $3) \
-         ON CONFLICT (function_oid, url) DO UPDATE SET source = EXCLUDED.source",
-        &[fn_oid.into(), url.to_string().into(), source.to_string().into()],
-    )
-    .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to cache module {url}: {e:?}"));
-}
-
 // ---------------------------------------------------------------------------
-// Import extraction (pure Rust, used only in non-test builds)
+// Import extraction (pure Rust)
 // ---------------------------------------------------------------------------
 
-#[cfg(not(test))]
 fn extract_imports(source: &str) -> Vec<String> {
     source.lines().filter_map(extract_from_specifier).collect()
 }
 
-#[cfg(not(test))]
 fn extract_from_specifier(line: &str) -> Option<String> {
     let from_idx = line.rfind(" from ")?;
     let after = line[from_idx + 6..].trim();
@@ -171,7 +280,6 @@ fn extract_from_specifier(line: &str) -> Option<String> {
     Some(inner[..end].to_string())
 }
 
-#[cfg(not(test))]
 fn resolve_specifier(specifier: &str, referrer: &str) -> Option<String> {
     use deno_core::ModuleSpecifier;
     if specifier.starts_with("http://") || specifier.starts_with("https://") {
@@ -187,4 +295,193 @@ fn resolve_specifier(specifier: &str, referrer: &str) -> Option<String> {
         return Some(format!("{origin}{specifier}"));
     }
     base.join(specifier).ok().map(|u| u.to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Test utilities
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn make_import_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+    entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    macro_rules! make_fetcher {
+        ($( $url:expr => $src:expr ),* $(,)?) => {{
+            let mut f = HashMapFetcher::new();
+            $( f.insert($url, $src); )*
+            f
+        }};
+    }
+
+    // --- fetch_and_cache ----------------------------------------------------
+
+    #[test]
+    fn fetch_single_module() {
+        let fetcher = make_fetcher!["https://esm.sh/lodash@4" => "export const add = (a, b) => a + b;"];
+        let mut store = HashMapModuleStore::new();
+
+        fetch_and_cache(
+            42,
+            &make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
+            &mut store,
+            &fetcher,
+        );
+
+        assert_eq!(
+            store.load(42, "https://esm.sh/lodash@4"),
+            Ok(Some("export const add = (a, b) => a + b;".to_string()))
+        );
+    }
+
+    #[test]
+    fn fetch_clears_stale_entries() {
+        let fetcher = make_fetcher!["https://esm.sh/lodash@4" => "new source"];
+        let mut store = HashMapModuleStore::new();
+        store.write(42, "https://esm.sh/stale", "old");
+
+        fetch_and_cache(
+            42,
+            &make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
+            &mut store,
+            &fetcher,
+        );
+
+        assert_eq!(store.load(42, "https://esm.sh/stale"), Ok(None));
+        assert!(store.load(42, "https://esm.sh/lodash@4").unwrap().is_some());
+    }
+
+    #[test]
+    fn fetch_does_not_clear_other_oid() {
+        let fetcher = make_fetcher!["https://esm.sh/lodash@4" => "source"];
+        let mut store = HashMapModuleStore::new();
+        store.write(99, "https://esm.sh/other", "keep me");
+
+        fetch_and_cache(
+            42,
+            &make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
+            &mut store,
+            &fetcher,
+        );
+
+        assert_eq!(
+            store.load(99, "https://esm.sh/other"),
+            Ok(Some("keep me".to_string()))
+        );
+    }
+
+    #[test]
+    fn fetch_transitive_dep() {
+        // pkg@1 imports ./utils.js, which resolves to https://esm.sh/utils.js
+        let fetcher = make_fetcher![
+            "https://esm.sh/pkg@1" => "export { x } from './utils.js';",
+            "https://esm.sh/utils.js" => "export const x = 1;",
+        ];
+        let mut store = HashMapModuleStore::new();
+
+        fetch_and_cache(
+            0,
+            &make_import_map(&[("pkg", "https://esm.sh/pkg@1")]),
+            &mut store,
+            &fetcher,
+        );
+
+        assert!(store.load(0, "https://esm.sh/pkg@1").unwrap().is_some());
+        assert!(store.load(0, "https://esm.sh/utils.js").unwrap().is_some());
+    }
+
+    #[test]
+    fn fetch_deduplicates_urls() {
+        // Two import map entries pointing to the same URL — fetched only once.
+        let fetcher = make_fetcher!["https://esm.sh/shared@1" => "export const s = 1;"];
+        let mut store = HashMapModuleStore::new();
+
+        fetch_and_cache(
+            0,
+            &make_import_map(&[
+                ("a", "https://esm.sh/shared@1"),
+                ("b", "https://esm.sh/shared@1"),
+            ]),
+            &mut store,
+            &fetcher,
+        );
+
+        // Would panic inside HashMapFetcher if fetched more than once and we
+        // hadn't inserted it — but the visited set prevents duplicate fetches.
+        assert!(store.load(0, "https://esm.sh/shared@1").unwrap().is_some());
+    }
+
+    // --- extract_from_specifier ---------------------------------------------
+
+    #[test]
+    fn extract_double_quote() {
+        assert_eq!(
+            extract_from_specifier(r#"import { foo } from "lodash""#),
+            Some("lodash".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_single_quote() {
+        assert_eq!(
+            extract_from_specifier("export { bar } from 'https://esm.sh/x'"),
+            Some("https://esm.sh/x".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_no_from_clause() {
+        assert_eq!(extract_from_specifier("const x = 1;"), None);
+    }
+
+    #[test]
+    fn extract_uses_last_from() {
+        // rfind means we pick the last " from " on the line.
+        assert_eq!(
+            extract_from_specifier(r#"export { from } from "mod""#),
+            Some("mod".to_string())
+        );
+    }
+
+    // --- resolve_specifier --------------------------------------------------
+
+    #[test]
+    fn resolve_absolute_passthrough() {
+        assert_eq!(
+            resolve_specifier("https://esm.sh/other", "https://esm.sh/pkg"),
+            Some("https://esm.sh/other".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_relative() {
+        assert_eq!(
+            resolve_specifier("./utils.js", "https://esm.sh/pkg/index.js"),
+            Some("https://esm.sh/pkg/utils.js".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_parent_relative() {
+        assert_eq!(
+            resolve_specifier("../shared.js", "https://esm.sh/pkg/sub/index.js"),
+            Some("https://esm.sh/pkg/shared.js".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_root_relative() {
+        assert_eq!(
+            resolve_specifier("/v135/lodash@4/index.js", "https://esm.sh/pkg"),
+            Some("https://esm.sh/v135/lodash@4/index.js".to_string())
+        );
+    }
 }
