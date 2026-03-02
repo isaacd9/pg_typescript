@@ -110,34 +110,80 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
 
 #[pg_guard]
 #[no_mangle]
-pub unsafe extern "C-unwind" fn typescript_validator(fn_oid: pg_sys::Oid) {
+pub unsafe extern "C-unwind" fn typescript_validator(
+    fcinfo: pg_sys::FunctionCallInfo,
+) -> pg_sys::Datum {
+    // Postgres passes the to-be-validated function's OID as arg 0.
+    let fn_oid: pg_sys::Oid = unsafe {
+        pg_sys::Oid::from(fcinfo::pg_get_nullable_datum(fcinfo, 0).value.value() as u32)
+    };
+
     let proc: PgProc = match PgProc::new(fn_oid) {
         Some(p) => p,
-        None => return,
+        None => return fcinfo::pg_return_void(),
     };
 
     let source = proc.prosrc();
     let nargs = proc.pronargs();
-    let param_names: Vec<String> = (0..nargs).map(|i| format!("_{i}")).collect();
+    let arg_names = proc.proargnames();
+    let param_names: Vec<String> = (0..nargs)
+        .map(|i| {
+            arg_names
+                .get(i)
+                .and_then(|opt: &Option<String>| opt.as_deref())
+                .filter(|s: &&str| !s.is_empty())
+                .map(|s: &str| s.to_string())
+                .unwrap_or_else(|| format!("_{i}"))
+        })
+        .collect();
     let params = param_names.join(", ");
+    let import_map = read_import_map(&proc);
 
     // If the function declares an import map, fetch all dependencies now.
     #[cfg(not(test))]
-    {
-        let import_map = read_import_map(&proc);
-        if !import_map.is_empty() {
-            fetch::fetch_and_cache(u32::from(fn_oid), &import_map, &mut fetch::PgModuleStore, &fetch::UreqFetcher);
-        }
+    if !import_map.is_empty() {
+        fetch::fetch_and_cache(u32::from(fn_oid), &import_map, &mut fetch::PgModuleStore, &fetch::UreqFetcher);
     }
 
-    // Syntax-check the function body using execute_script (no module system needed).
-    let check_js =
-        format!("(() => {{ async function __check({params}) {{ {source} }} }})();");
+    // Assemble the same module source the call handler will use so that the
+    // specifier and hash match and we can pre-warm FN_CACHE.
+    let module_source = assemble_module(&source, &import_map, &params);
+    let source_hash = hash_str(&module_source);
+    let oid_raw = u32::from(fn_oid);
+
+    #[cfg(not(test))]
+    let store = fetch::PgModuleStore;
+    #[cfg(test)]
+    let store = fetch::HashMapModuleStore::new();
+
+    // Use the same fn_ specifier as the call handler. Loading as a side module
+    // (not main) lets multiple functions coexist in the same long-lived runtime.
+    // V8 always eagerly parses ES module bodies, so syntax errors are caught here.
+    // Pre-warming FN_CACHE means the first SELECT call skips module loading entirely.
+    let specifier_str = format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.mjs");
+    let specifier = deno_core::resolve_url(&specifier_str)
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
+
     with_runtime(|rt| {
-        if let Err(e) = rt.execute_script("<typescript:validator>", check_js) {
-            pgrx::error!("pg_typescript: syntax error: {e}");
-        }
+        let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), Box::new(store));
+
+        let module_id =
+            block_on(rt.load_side_es_module_from_code(&specifier, module_source))
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: syntax error: {e}"));
+
+        let evaluate = rt.mod_evaluate(module_id);
+        block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+
+        let namespace = rt
+            .get_module_namespace(module_id)
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+        let f = extract_default_export(rt, namespace);
+
+        FN_CACHE.with(|c| c.borrow_mut().insert((oid_raw, source_hash), f));
     });
+
+    fcinfo::pg_return_void()
 }
 
 // ---------------------------------------------------------------------------
@@ -242,7 +288,7 @@ where
                     .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
                 let module_id =
-                    block_on(rt.load_main_es_module_from_code(&specifier, module_source))
+                    block_on(rt.load_side_es_module_from_code(&specifier, module_source))
                         .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
 
                 // Evaluate the module; future must be awaited so errors are not silently lost.
@@ -296,7 +342,7 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
                     .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
                 let module_id =
-                    block_on(rt.load_main_es_module_from_code(&specifier, module_source))
+                    block_on(rt.load_side_es_module_from_code(&specifier, module_source))
                         .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
 
                 let evaluate = rt.mod_evaluate(module_id);
@@ -523,6 +569,28 @@ mod unit_tests {
         };
     }
 
+    // --- module load error on syntax errors ---------------------------------
+
+    #[test]
+    fn syntax_error_detected_at_module_load() {
+        use crate::runtime::{block_on, with_runtime};
+        let module_source = super::assemble_module("const x = ;", &Default::default(), "");
+        let hash = super::hash_str(&module_source);
+        let specifier = deno_core::resolve_url(
+            &format!("file:///pg_typescript/test_syntax_{hash:016x}.mjs"),
+        )
+        .unwrap();
+        let result = with_runtime(|rt| {
+            let _ctx = crate::loader::set_loader_context(
+                0,
+                Default::default(),
+                Box::new(crate::fetch::HashMapModuleStore::new()),
+            );
+            block_on(rt.load_side_es_module_from_code(&specifier, module_source))
+        });
+        assert!(result.is_err(), "expected syntax error to cause module load failure");
+    }
+
     // --- assemble_module ----------------------------------------------------
 
     #[test]
@@ -649,6 +717,9 @@ mod unit_tests {
 #[pg_schema]
 mod tests {
     use pgrx::prelude::*;
+    use serde_json::json;
+
+    // --- basic type round-trips ---------------------------------------------
 
     #[pg_test]
     fn test_simple_add() {
@@ -657,9 +728,7 @@ mod tests {
              LANGUAGE typescript AS $$ return a + b; $$",
         )
         .unwrap();
-        let result = Spi::get_one::<i32>("SELECT test_add(1, 2)")
-            .unwrap()
-            .unwrap();
+        let result = Spi::get_one::<i32>("SELECT test_add(1, 2)").unwrap().unwrap();
         assert_eq!(result, 3);
     }
 
@@ -670,9 +739,7 @@ mod tests {
              LANGUAGE typescript AS $$ return `Hello, ${name}!`; $$",
         )
         .unwrap();
-        let result = Spi::get_one::<String>("SELECT test_greet('world')")
-            .unwrap()
-            .unwrap();
+        let result = Spi::get_one::<String>("SELECT test_greet('world')").unwrap().unwrap();
         assert_eq!(result, "Hello, world!");
     }
 
@@ -683,9 +750,145 @@ mod tests {
              LANGUAGE typescript AS $$ return a > b; $$",
         )
         .unwrap();
-        let t = Spi::get_one::<bool>("SELECT test_gt(3.0, 1.5)")
-            .unwrap()
-            .unwrap();
-        assert!(t);
+        assert!(Spi::get_one::<bool>("SELECT test_gt(3.0, 1.5)").unwrap().unwrap());
+        assert!(!Spi::get_one::<bool>("SELECT test_gt(1.5, 3.0)").unwrap().unwrap());
+    }
+
+    #[pg_test]
+    fn test_float8_arithmetic() {
+        Spi::run(
+            "CREATE FUNCTION test_div(a float8, b float8) RETURNS float8 \
+             LANGUAGE typescript AS $$ return a / b; $$",
+        )
+        .unwrap();
+        let result = Spi::get_one::<f64>("SELECT test_div(1.0, 4.0)").unwrap().unwrap();
+        assert!((result - 0.25).abs() < 1e-10);
+    }
+
+    // --- NULL handling ------------------------------------------------------
+
+    #[pg_test]
+    fn test_null_return() {
+        Spi::run(
+            "CREATE FUNCTION test_null_ret() RETURNS int \
+             LANGUAGE typescript AS $$ return null; $$",
+        )
+        .unwrap();
+        let result = Spi::get_one::<i32>("SELECT test_null_ret()").unwrap();
+        assert!(result.is_none(), "expected SQL NULL");
+    }
+
+    #[pg_test]
+    fn test_null_arg() {
+        // Without STRICT, Postgres calls the function even when the arg is NULL.
+        // JS receives null/undefined; nullish-coalescing returns the fallback.
+        Spi::run(
+            "CREATE FUNCTION test_null_arg(x int) RETURNS int \
+             LANGUAGE typescript AS $$ return x ?? -1; $$",
+        )
+        .unwrap();
+        let result = Spi::get_one::<i32>("SELECT test_null_arg(NULL)").unwrap().unwrap();
+        assert_eq!(result, -1);
+        // Non-null arg should pass through normally.
+        let result = Spi::get_one::<i32>("SELECT test_null_arg(42)").unwrap().unwrap();
+        assert_eq!(result, 42);
+    }
+
+    // --- async / await ------------------------------------------------------
+
+    #[pg_test]
+    fn test_async_await() {
+        Spi::run(
+            "CREATE FUNCTION test_async_double(n int) RETURNS int \
+             LANGUAGE typescript AS $$ return await Promise.resolve(n * 2); $$",
+        )
+        .unwrap();
+        let result = Spi::get_one::<i32>("SELECT test_async_double(21)").unwrap().unwrap();
+        assert_eq!(result, 42);
+    }
+
+    // --- JSONB round-trips --------------------------------------------------
+
+    #[pg_test]
+    fn test_jsonb_return() {
+        Spi::run(
+            "CREATE FUNCTION test_jsonb_ret(n int) RETURNS jsonb \
+             LANGUAGE typescript AS $$ return { value: n, doubled: n * 2 }; $$",
+        )
+        .unwrap();
+        let result = Spi::get_one::<pgrx::JsonB>("SELECT test_jsonb_ret(21)").unwrap().unwrap();
+        assert_eq!(result.0["value"], json!(21));
+        assert_eq!(result.0["doubled"], json!(42));
+    }
+
+    #[pg_test]
+    fn test_jsonb_arg() {
+        Spi::run(
+            "CREATE FUNCTION test_jsonb_sum(data jsonb) RETURNS int \
+             LANGUAGE typescript AS $$ return data.x + data.y; $$",
+        )
+        .unwrap();
+        let result = Spi::get_one::<i32>(
+            r#"SELECT test_jsonb_sum('{"x": 10, "y": 32}'::jsonb)"#,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(result, 42);
+    }
+
+    // --- DO blocks ----------------------------------------------------------
+
+    #[pg_test]
+    fn test_do_block() {
+        // Verify the inline handler runs JS and that errors surface correctly.
+        Spi::run(
+            "DO $$ \
+               const x = 40 + 2; \
+               if (x !== 42) throw new Error(`expected 42, got ${x}`); \
+             $$ LANGUAGE typescript",
+        )
+        .unwrap();
+    }
+
+    #[pg_test]
+    fn test_do_block_async() {
+        Spi::run(
+            "DO $$ \
+               const result = await Promise.resolve(21 * 2); \
+               if (result !== 42) throw new Error(`expected 42, got ${result}`); \
+             $$ LANGUAGE typescript",
+        )
+        .unwrap();
+    }
+
+    // --- validator ----------------------------------------------------------
+
+    #[pg_test]
+    fn test_validator_rejects_syntax_error() {
+        // Body-level syntax error: caught because the validator loads the source
+        // as an ES module, which V8 always eagerly parses (no lazy parsing).
+        // pgrx::error! bypasses Spi::run's Result so we use PgTryBuilder to catch it.
+        let caught = PgTryBuilder::new(|| {
+            let _ = Spi::run(
+                "CREATE FUNCTION bad_fn() RETURNS void \
+                 LANGUAGE typescript AS $$ const x = ; $$",
+            );
+            false
+        })
+        .catch_others(|_| true)
+        .execute();
+        assert!(caught, "expected CREATE FUNCTION to fail on syntax error");
+    }
+
+    #[pg_test]
+    fn test_validator_accepts_valid_function() {
+        // Validator should pass and the function should be callable.
+        Spi::run(
+            "CREATE FUNCTION test_identity(x int) RETURNS int \
+             LANGUAGE typescript AS $$ return x; $$",
+        )
+        .unwrap();
+        let result = Spi::get_one::<i32>("SELECT test_identity(99)").unwrap().unwrap();
+        assert_eq!(result, 99);
     }
 }
