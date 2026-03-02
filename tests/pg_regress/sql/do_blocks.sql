@@ -1,0 +1,11 @@
+-- synchronous DO block
+DO $$
+  const x = 40 + 2;
+  if (x !== 42) throw new Error(`expected 42, got ${x}`);
+$$ LANGUAGE typescript;
+
+-- async DO block: event loop is drained before the block returns
+DO $$
+  const result = await Promise.resolve(21 * 2);
+  if (result !== 42) throw new Error(`expected 42, got ${result}`);
+$$ LANGUAGE typescript;

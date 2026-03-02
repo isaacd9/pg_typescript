@@ -1,0 +1,15 @@
+-- JS object returned as JSONB
+CREATE FUNCTION ts_jsonb_ret(n int) RETURNS jsonb
+LANGUAGE typescript AS $$
+  return { value: n, doubled: n * 2 };
+$$;
+
+SELECT ts_jsonb_ret(21);
+
+-- JSONB argument deserialized to JS object
+CREATE FUNCTION ts_jsonb_sum(data jsonb) RETURNS int
+LANGUAGE typescript AS $$
+  return data.x + data.y;
+$$;
+
+SELECT ts_jsonb_sum('{"x": 10, "y": 32}');

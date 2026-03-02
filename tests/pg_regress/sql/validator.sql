@@ -1,0 +1,13 @@
+-- Validator accepts a syntactically valid function and it is immediately callable
+CREATE FUNCTION ts_identity(x int) RETURNS int
+LANGUAGE typescript AS $$
+  return x;
+$$;
+
+SELECT ts_identity(99);
+
+-- Validator rejects syntax errors at CREATE FUNCTION time
+CREATE FUNCTION ts_bad_syntax() RETURNS void
+LANGUAGE typescript AS $$
+  const x = ;
+$$;

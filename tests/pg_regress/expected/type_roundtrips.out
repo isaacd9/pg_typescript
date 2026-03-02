@@ -1,0 +1,68 @@
+-- integer arithmetic
+CREATE FUNCTION ts_add(a int, b int) RETURNS int
+LANGUAGE typescript AS $$
+  return a + b;
+$$;
+SELECT ts_add(1, 2);
+ ts_add 
+--------
+      3
+(1 row)
+
+SELECT ts_add(-5, 10);
+ ts_add 
+--------
+      5
+(1 row)
+
+-- text
+CREATE FUNCTION ts_greet(name text) RETURNS text
+LANGUAGE typescript AS $$
+  return `Hello, ${name}!`;
+$$;
+SELECT ts_greet('world');
+   ts_greet    
+---------------
+ Hello, world!
+(1 row)
+
+SELECT ts_greet('PostgreSQL');
+      ts_greet      
+--------------------
+ Hello, PostgreSQL!
+(1 row)
+
+-- boolean
+CREATE FUNCTION ts_gt(a float8, b float8) RETURNS bool
+LANGUAGE typescript AS $$
+  return a > b;
+$$;
+SELECT ts_gt(3.0, 1.5);
+ ts_gt 
+-------
+ t
+(1 row)
+
+SELECT ts_gt(1.5, 3.0);
+ ts_gt 
+-------
+ f
+(1 row)
+
+-- float8
+CREATE FUNCTION ts_div(a float8, b float8) RETURNS float8
+LANGUAGE typescript AS $$
+  return a / b;
+$$;
+SELECT ts_div(1.0, 4.0);
+ ts_div 
+--------
+   0.25
+(1 row)
+
+SELECT ts_div(10.0, 5.0);
+ ts_div 
+--------
+      2
+(1 row)
+
