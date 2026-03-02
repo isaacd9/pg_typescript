@@ -82,6 +82,11 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
         })
         .collect();
 
+    #[cfg(not(test))]
+    let store = fetch::PgModuleStore;
+    #[cfg(test)]
+    let store = fetch::HashMapModuleStore::new();
+
     let (datum, is_null) = execute_typescript_fn(
         fn_oid,
         &source,
@@ -89,6 +94,7 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
         &param_names,
         &args,
         PgDatumSeed { oid: ret_type },
+        store,
     );
 
     if is_null {
@@ -163,7 +169,12 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             fetch::fetch_and_cache(0u32, &import_map, &mut fetch::PgModuleStore, &fetch::UreqFetcher);
         }
 
-        execute_inline_block(&source, &import_map);
+        #[cfg(not(test))]
+        let store = fetch::PgModuleStore;
+        #[cfg(test)]
+        let store = fetch::HashMapModuleStore::new();
+
+        execute_inline_block(&source, &import_map, store);
         fcinfo::pg_return_void()
     }
 }
@@ -192,15 +203,17 @@ fn hash_str(s: &str) -> u64 {
 /// 1. Generate `import * as <key> from "<key>"` statements.
 /// 2. Configure the module loader so it can resolve bare specifiers and
 ///    fetch sources from `deno_internal.deno_package_modules`.
-fn execute_typescript_fn<A, S, R>(
+fn execute_typescript_fn<MS, A, S, R>(
     fn_oid: pg_sys::Oid,
     source: &str,
     import_map: &HashMap<String, String>,
     param_names: &[String],
     args: &[A],
     seed: S,
+    store: MS,
 ) -> R
 where
+    MS: fetch::ModuleStore + 'static,
     A: serde::Serialize,
     S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
 {
@@ -219,11 +232,7 @@ where
             None => {
                 // Set loader context only on cache miss — the module loader is
                 // only called during initial load, never when calling a cached function.
-                #[cfg(not(test))]
-                let store: Box<dyn fetch::ModuleStore> = Box::new(fetch::PgModuleStore);
-                #[cfg(test)]
-                let store: Box<dyn fetch::ModuleStore> = Box::new(fetch::HashMapModuleStore::new());
-                let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), store);
+                let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), Box::new(store));
 
                 // Specifier is stable per (function, source version): ALTER FUNCTION changes
                 // the source, which changes the hash and therefore triggers a fresh load.
@@ -264,7 +273,11 @@ where
 
 /// Execute a DO block as an ES module. Follows the same load/cache/call path
 /// as regular functions, using OID 0 as the synthetic key in FN_CACHE.
-fn execute_inline_block(source: &str, import_map: &HashMap<String, String>) {
+fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
+    source: &str,
+    import_map: &HashMap<String, String>,
+    store: MS,
+) {
     let module_source = assemble_module(source, import_map, "");
     let source_hash = hash_str(&module_source);
 
@@ -275,11 +288,7 @@ fn execute_inline_block(source: &str, import_map: &HashMap<String, String>) {
             Some(f) => f,
             None => {
                 // Set loader context only on cache miss.
-                #[cfg(not(test))]
-                let store: Box<dyn fetch::ModuleStore> = Box::new(fetch::PgModuleStore);
-                #[cfg(test)]
-                let store: Box<dyn fetch::ModuleStore> = Box::new(fetch::HashMapModuleStore::new());
-                let _ctx = loader::set_loader_context(0u32, import_map.clone(), store);
+                let _ctx = loader::set_loader_context(0u32, import_map.clone(), Box::new(store));
 
                 let specifier_str =
                     format!("file:///pg_typescript/do_{source_hash:016x}.mjs");
@@ -465,9 +474,11 @@ mod unit_tests {
     fn run(source: &str, params: &[&str], args: &[Value]) -> (Value, bool) {
         let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
         let import_map = std::collections::HashMap::new();
-        // OID 0 is fine for tests with empty import maps — the loader is never called.
         let fn_oid = pgrx::pg_sys::Oid::from(0u32);
-        super::execute_typescript_fn(fn_oid, source, &import_map, &param_names, args, JsonSeed)
+        super::execute_typescript_fn(
+            fn_oid, source, &import_map, &param_names, args, JsonSeed,
+            crate::fetch::HashMapModuleStore::new(),
+        )
     }
 
     macro_rules! ts_test {

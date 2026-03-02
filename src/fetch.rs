@@ -47,14 +47,13 @@ impl ModuleStore for HashMapModuleStore {
 // other PostgreSQL globals that are not present in the unit-test binary.
 // ---------------------------------------------------------------------------
 
-#[cfg(not(test))]
+#[allow(dead_code)]
 pub struct PgModuleStore;
 
-#[cfg(not(test))]
 impl ModuleStore for PgModuleStore {
     fn load(&self, fn_oid: u32, url: &str) -> Result<Option<String>, String> {
         use pgrx::spi::SpiError;
-        use pgrx::{Spi, pg_sys};
+        use pgrx::{pg_sys, Spi};
 
         let pg_oid = pg_sys::Oid::from(fn_oid);
         Spi::connect(|client| {
@@ -75,20 +74,24 @@ impl ModuleStore for PgModuleStore {
     }
 
     fn write(&mut self, fn_oid: u32, url: &str, source: &str) {
-        use pgrx::{Spi, pg_sys};
+        use pgrx::{pg_sys, Spi};
 
         let pg_oid = pg_sys::Oid::from(fn_oid);
         Spi::run_with_args(
             "INSERT INTO deno_internal.deno_package_modules (function_oid, url, source) \
              VALUES ($1, $2, $3) \
              ON CONFLICT (function_oid, url) DO UPDATE SET source = EXCLUDED.source",
-            &[pg_oid.into(), url.to_string().into(), source.to_string().into()],
+            &[
+                pg_oid.into(),
+                url.to_string().into(),
+                source.to_string().into(),
+            ],
         )
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to cache module {url}: {e:?}"));
     }
 
     fn clear_for_fn(&mut self, fn_oid: u32) {
-        use pgrx::{Spi, pg_sys};
+        use pgrx::{pg_sys, Spi};
 
         let pg_oid = pg_sys::Oid::from(fn_oid);
         Spi::run_with_args(
@@ -165,8 +168,8 @@ impl Fetcher for UreqFetcher {
 /// Returns an error if the JSON is malformed, if any key is not a valid JS
 /// identifier, or if any URL is not an http/https URL.
 pub fn parse_import_map(json: &str) -> Result<HashMap<String, String>, String> {
-    let v: Value = serde_json::from_str(json)
-        .map_err(|e| format!("invalid import_map JSON: {e}"))?;
+    let v: Value =
+        serde_json::from_str(json).map_err(|e| format!("invalid import_map JSON: {e}"))?;
 
     let imports = match v.get("imports").and_then(|i| i.as_object()) {
         Some(obj) => obj,
@@ -303,7 +306,10 @@ fn resolve_specifier(specifier: &str, referrer: &str) -> Option<String> {
 
 #[cfg(test)]
 pub(crate) fn make_import_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
-    entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    entries
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -326,7 +332,8 @@ mod tests {
 
     #[test]
     fn fetch_single_module() {
-        let fetcher = make_fetcher!["https://esm.sh/lodash@4" => "export const add = (a, b) => a + b;"];
+        let fetcher =
+            make_fetcher!["https://esm.sh/lodash@4" => "export const add = (a, b) => a + b;"];
         let mut store = HashMapModuleStore::new();
 
         fetch_and_cache(
