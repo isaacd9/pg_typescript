@@ -452,6 +452,7 @@ fn read_inline_import_map() -> HashMap<String, String> {
 
 #[cfg(test)]
 mod unit_tests {
+    use crate::fetch::ModuleStore;
     use serde_json::{Value, json};
 
     struct JsonSeed;
@@ -470,23 +471,49 @@ mod unit_tests {
         }
     }
 
+    fn run_impl(
+        source: &str,
+        params: &[&str],
+        args: &[Value],
+        import_map: std::collections::HashMap<String, String>,
+        store: crate::fetch::HashMapModuleStore,
+    ) -> (Value, bool) {
+        let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
+        let fn_oid = pgrx::pg_sys::Oid::from(0u32);
+        super::execute_typescript_fn(fn_oid, source, &import_map, &param_names, args, JsonSeed, store)
+    }
+
     /// Run a function body with no import map (pure JS, no packages).
     fn run(source: &str, params: &[&str], args: &[Value]) -> (Value, bool) {
-        let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
-        let import_map = std::collections::HashMap::new();
-        let fn_oid = pgrx::pg_sys::Oid::from(0u32);
-        super::execute_typescript_fn(
-            fn_oid, source, &import_map, &param_names, args, JsonSeed,
-            crate::fetch::HashMapModuleStore::new(),
-        )
+        run_impl(source, params, args, Default::default(), crate::fetch::HashMapModuleStore::new())
     }
 
     macro_rules! ts_test {
+        // Plain: no imports, pure JS.
         ($name:ident, $src:expr, [$($p:literal),*], [$($a:expr),*], $expected:expr) => {
             #[test]
             fn $name() {
                 let args: Vec<Value> = vec![$($a),*];
                 let (val, is_null) = run($src, &[$($p),*], &args);
+                let expected: Option<Value> = $expected;
+                match expected {
+                    Some(exp) => assert_eq!(val, exp),
+                    None => assert!(is_null),
+                }
+            }
+        };
+        // With modules: pre-populate the store and import map.
+        // Syntax:  imports { "key" => "url", ... }  modules { "url" => "source", ... }
+        ($name:ident, $src:expr, [$($p:literal),*], [$($a:expr),*], $expected:expr,
+         imports { $($spec:literal => $url:literal),* $(,)? },
+         modules { $($murl:literal => $msrc:literal),* $(,)? }) => {
+            #[test]
+            fn $name() {
+                let args: Vec<Value> = vec![$($a),*];
+                let import_map = crate::fetch::make_import_map(&[$(($spec, $url)),*]);
+                let mut store = crate::fetch::HashMapModuleStore::new();
+                $( store.write(0, $murl, $msrc); )*
+                let (val, is_null) = run_impl($src, &[$($p),*], &args, import_map, store);
                 let expected: Option<Value> = $expected;
                 match expected {
                     Some(exp) => assert_eq!(val, exp),
@@ -527,6 +554,50 @@ mod unit_tests {
         ["n"],
         [json!(7)],
         Some(json!({ "original": 7, "doubled": 14 }))
+    );
+
+    // --- module loading -----------------------------------------------------
+
+    ts_test!(
+        module_named_export,
+        "return math.add(a, b);",
+        ["a", "b"], [json!(3), json!(4)], Some(json!(7)),
+        imports { "math" => "https://esm.sh/math@1" },
+        modules { "https://esm.sh/math@1" => "export function add(a, b) { return a + b; }" }
+    );
+    ts_test!(
+        module_two_imports,
+        "return fmt.greet(str.shout(name));",
+        ["name"], [json!("world")], Some(json!("Hello, WORLD!")),
+        imports {
+            "str" => "https://esm.sh/str@1",
+            "fmt" => "https://esm.sh/fmt@1",
+        },
+        modules {
+            "https://esm.sh/str@1" => "export function shout(s) { return s.toUpperCase(); }",
+            "https://esm.sh/fmt@1" => "export function greet(s) { return `Hello, ${s}!`; }",
+        }
+    );
+    ts_test!(
+        module_async_usage,
+        "return await Promise.resolve(math.multiply(a, b));",
+        ["a", "b"], [json!(6), json!(7)], Some(json!(42)),
+        imports { "math" => "https://esm.sh/math@1" },
+        modules { "https://esm.sh/math@1" => "export function multiply(a, b) { return a * b; }" }
+    );
+    ts_test!(
+        module_transitive_dep,
+        "return utils.double(n);",
+        ["n"], [json!(21)], Some(json!(42)),
+        imports { "utils" => "https://esm.sh/utils@1" },
+        modules {
+            // utils re-exports from math, which is a transitive dep
+            "https://esm.sh/utils@1" =>
+                "import { multiply } from './math.js';
+                 export function double(n) { return multiply(n, 2); }",
+            "https://esm.sh/math.js" =>
+                "export function multiply(a, b) { return a * b; }",
+        }
     );
 }
 
