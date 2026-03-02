@@ -523,6 +523,50 @@ mod unit_tests {
         };
     }
 
+    // --- assemble_module ----------------------------------------------------
+
+    #[test]
+    fn assemble_no_imports_no_params() {
+        let out = super::assemble_module("return 42;", &Default::default(), "");
+        assert_eq!(out, "\nexport default async function() {\nreturn 42;\n}\n");
+    }
+
+    #[test]
+    fn assemble_with_params() {
+        let out = super::assemble_module("return a + b;", &Default::default(), "a, b");
+        assert_eq!(out, "\nexport default async function(a, b) {\nreturn a + b;\n}\n");
+    }
+
+    #[test]
+    fn assemble_with_import() {
+        let map = crate::fetch::make_import_map(&[("math", "https://esm.sh/math@1")]);
+        let out = super::assemble_module("return math.add(1, 2);", &map, "");
+        assert!(out.contains("import * as math from \"math\";"));
+        assert!(out.contains("export default async function()"));
+        assert!(out.contains("return math.add(1, 2);"));
+    }
+
+    // --- execute_inline_block -----------------------------------------------
+
+    #[test]
+    fn inline_block_runs() {
+        super::execute_inline_block(
+            "const x = 1 + 1;",
+            &Default::default(),
+            crate::fetch::HashMapModuleStore::new(),
+        );
+    }
+
+    #[test]
+    fn inline_block_with_module() {
+        let import_map = crate::fetch::make_import_map(&[("math", "https://esm.sh/math@1")]);
+        let mut store = crate::fetch::HashMapModuleStore::new();
+        store.write(0, "https://esm.sh/math@1", "export function add(a, b) { return a + b; }");
+        super::execute_inline_block("const result = math.add(1, 2);", &import_map, store);
+    }
+
+    // --- sync / async execution ---------------------------------------------
+
     ts_test!(sync_add, "return a + b;", ["a", "b"], [json!(1), json!(2)], Some(json!(3)));
     ts_test!(sync_string_template, "return `Hello, ${name}!`;", ["name"], [json!("world")], Some(json!("Hello, world!")));
     ts_test!(sync_bool_comparison, "return a > b;", ["a", "b"], [json!(3.0), json!(1.5)], Some(json!(true)));
