@@ -1,5 +1,5 @@
 -- Validator accepts a syntactically valid function and it is immediately callable
-CREATE FUNCTION ts_identity(x int) RETURNS int
+CREATE OR REPLACE FUNCTION ts_identity(x int) RETURNS int
 LANGUAGE typescript AS $$
   return x;
 $$;
@@ -9,9 +9,22 @@ SELECT ts_identity(99);
           99
 (1 row)
 
+-- Validator accepts TypeScript-only syntax (type aliases and annotations)
+CREATE OR REPLACE FUNCTION ts_types_ok(x int) RETURNS int
+LANGUAGE typescript AS $$
+  type Pair = { left: number; right: number };
+  const pair: Pair = { left: x, right: x + 1 };
+  return pair.right;
+$$;
+SELECT ts_types_ok(41);
+ ts_types_ok 
+-------------
+          42
+(1 row)
+
 -- Validator rejects syntax errors at CREATE FUNCTION time
-CREATE FUNCTION ts_bad_syntax() RETURNS void
+CREATE OR REPLACE FUNCTION ts_bad_syntax() RETURNS void
 LANGUAGE typescript AS $$
   const x = ;
 $$;
-ERROR:  pg_typescript: syntax error: Uncaught SyntaxError: Unexpected token ';'
+ERROR:  pg_typescript: syntax error: Expression expected at file:///pg_typescript/input.ts:4:13

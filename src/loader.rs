@@ -3,9 +3,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use deno_core::{
-    ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse, ModuleLoader, ModuleSource,
-    ModuleSourceCode, ModuleSpecifier, ModuleType, ResolutionKind,
-    error::ModuleLoaderError,
+    error::ModuleLoaderError, ModuleLoadOptions, ModuleLoadReferrer, ModuleLoadResponse,
+    ModuleLoader, ModuleSource, ModuleSourceCode, ModuleSpecifier, ModuleType, ResolutionKind,
 };
 use deno_error::JsErrorBox;
 
@@ -46,7 +45,11 @@ pub fn set_loader_context(
     store: Box<dyn ModuleStore>,
 ) -> LoaderContextGuard {
     LOADER_CTX.with(|c| {
-        *c.borrow_mut() = Some(LoaderContext { fn_oid, import_map, store });
+        *c.borrow_mut() = Some(LoaderContext {
+            fn_oid,
+            import_map,
+            store,
+        });
     });
     LoaderContextGuard
 }
@@ -125,10 +128,7 @@ impl ModuleLoader for PgModuleLoader {
 /// are rejected outright, bare specifiers are looked up by key, and absolute
 /// http/https URLs must appear as a declared value.
 fn resolve_from_main(specifier: &str) -> Result<ModuleSpecifier, ModuleLoaderError> {
-    if specifier.starts_with('/')
-        || specifier.starts_with("./")
-        || specifier.starts_with("../")
-    {
+    if specifier.starts_with('/') || specifier.starts_with("./") || specifier.starts_with("../") {
         return Err(JsErrorBox::generic(format!(
             "pg_typescript: relative imports are not allowed in function body: '{specifier}'"
         )));
@@ -211,7 +211,7 @@ fn load_module_source(url: String) -> Result<Option<String>, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::fetch::{HashMapModuleStore, ModuleStore, make_import_map};
+    use crate::fetch::{make_import_map, HashMapModuleStore, ModuleStore};
 
     /// Set up a loader context with the given import map entries and a
     /// pre-populated store, returning the RAII guard.
@@ -257,7 +257,10 @@ mod tests {
 
     #[test]
     fn resolve_main_bare_in_map() {
-        let _ctx = make_ctx(&[("lodash", "https://esm.sh/lodash@4")], HashMapModuleStore::new());
+        let _ctx = make_ctx(
+            &[("lodash", "https://esm.sh/lodash@4")],
+            HashMapModuleStore::new(),
+        );
 
         let url = super::resolve_from_main("lodash").unwrap();
         assert_eq!(url.as_str(), "https://esm.sh/lodash@4");
@@ -305,9 +308,8 @@ mod tests {
     fn resolve_dep_absolute_passthrough() {
         let _ctx = make_ctx(&[], HashMapModuleStore::new());
 
-        let url =
-            super::resolve_from_dep("https://esm.sh/other@1", "https://esm.sh/pkg/index.js")
-                .unwrap();
+        let url = super::resolve_from_dep("https://esm.sh/other@1", "https://esm.sh/pkg/index.js")
+            .unwrap();
         assert_eq!(url.as_str(), "https://esm.sh/other@1");
     }
 
@@ -315,8 +317,7 @@ mod tests {
     fn resolve_dep_relative() {
         let _ctx = make_ctx(&[], HashMapModuleStore::new());
 
-        let url =
-            super::resolve_from_dep("./utils.js", "https://esm.sh/pkg/index.js").unwrap();
+        let url = super::resolve_from_dep("./utils.js", "https://esm.sh/pkg/index.js").unwrap();
         assert_eq!(url.as_str(), "https://esm.sh/pkg/utils.js");
     }
 

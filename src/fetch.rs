@@ -337,30 +337,64 @@ mod tests {
         // Ok(None)             — parse succeeds, map is empty
         // Err(())              — parse must return Err
         let cases: &[(&str, &str, Result<Option<(&str, &str)>, ()>)] = &[
-            ("single entry",          r#"{"imports":{"lodash":"https://esm.sh/lodash@4"}}"#,         Ok(Some(("lodash", "https://esm.sh/lodash@4")))),
-            ("multiple entries - a",  r#"{"imports":{"a":"https://esm.sh/a","b":"https://esm.sh/b"}}"#, Ok(Some(("a", "https://esm.sh/a")))),
-            ("multiple entries - b",  r#"{"imports":{"a":"https://esm.sh/a","b":"https://esm.sh/b"}}"#, Ok(Some(("b", "https://esm.sh/b")))),
-            ("missing imports key",   r#"{}"#,                                                        Ok(None)),
-            ("empty imports",         r#"{"imports":{}}"#,                                            Ok(None)),
-            ("invalid json",          "not json",                                                     Err(())),
-            ("value not string",      r#"{"imports":{"a":42}}"#,                                      Err(())),
-            ("key starts with digit", r#"{"imports":{"1bad":"https://esm.sh/x"}}"#,                  Err(())),
-            ("key with hyphen",       r#"{"imports":{"my-pkg":"https://esm.sh/x"}}"#,                Err(())),
-            ("empty key",             r#"{"imports":{"":"https://esm.sh/x"}}"#,                      Err(())),
-            ("file url",              r#"{"imports":{"pkg":"file:///local/pkg"}}"#,                   Err(())),
-            ("ftp url",               r#"{"imports":{"pkg":"ftp://example.com/pkg"}}"#,              Err(())),
-            ("invalid url",           r#"{"imports":{"pkg":"://broken"}}"#,                           Err(())),
+            (
+                "single entry",
+                r#"{"imports":{"lodash":"https://esm.sh/lodash@4"}}"#,
+                Ok(Some(("lodash", "https://esm.sh/lodash@4"))),
+            ),
+            (
+                "multiple entries - a",
+                r#"{"imports":{"a":"https://esm.sh/a","b":"https://esm.sh/b"}}"#,
+                Ok(Some(("a", "https://esm.sh/a"))),
+            ),
+            (
+                "multiple entries - b",
+                r#"{"imports":{"a":"https://esm.sh/a","b":"https://esm.sh/b"}}"#,
+                Ok(Some(("b", "https://esm.sh/b"))),
+            ),
+            ("missing imports key", r#"{}"#, Ok(None)),
+            ("empty imports", r#"{"imports":{}}"#, Ok(None)),
+            ("invalid json", "not json", Err(())),
+            ("value not string", r#"{"imports":{"a":42}}"#, Err(())),
+            (
+                "key starts with digit",
+                r#"{"imports":{"1bad":"https://esm.sh/x"}}"#,
+                Err(()),
+            ),
+            (
+                "key with hyphen",
+                r#"{"imports":{"my-pkg":"https://esm.sh/x"}}"#,
+                Err(()),
+            ),
+            (
+                "empty key",
+                r#"{"imports":{"":"https://esm.sh/x"}}"#,
+                Err(()),
+            ),
+            (
+                "file url",
+                r#"{"imports":{"pkg":"file:///local/pkg"}}"#,
+                Err(()),
+            ),
+            (
+                "ftp url",
+                r#"{"imports":{"pkg":"ftp://example.com/pkg"}}"#,
+                Err(()),
+            ),
+            ("invalid url", r#"{"imports":{"pkg":"://broken"}}"#, Err(())),
         ];
 
         for (name, input, expected) in cases {
             let result = parse_import_map(input);
             match expected {
                 Ok(Some((key, url))) => {
-                    let map = result.unwrap_or_else(|e| panic!("[{name}] expected Ok, got Err: {e}"));
+                    let map =
+                        result.unwrap_or_else(|e| panic!("[{name}] expected Ok, got Err: {e}"));
                     assert_eq!(map.get(*key), Some(&url.to_string()), "[{name}]");
                 }
                 Ok(None) => {
-                    let map = result.unwrap_or_else(|e| panic!("[{name}] expected Ok, got Err: {e}"));
+                    let map =
+                        result.unwrap_or_else(|e| panic!("[{name}] expected Ok, got Err: {e}"));
                     assert!(map.is_empty(), "[{name}] expected empty map");
                 }
                 Err(()) => {

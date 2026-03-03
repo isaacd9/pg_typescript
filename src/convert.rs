@@ -1,4 +1,4 @@
-use pgrx::{FromDatum, IntoDatum, pg_sys};
+use pgrx::{pg_sys, FromDatum, IntoDatum};
 use serde::de::{Deserialize, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Serialize;
 use serde_json::Value;
@@ -23,15 +23,9 @@ impl Serialize for PgDatum {
         // SAFETY: caller guarantees datum is valid for this oid.
         unsafe {
             match self.oid {
-                pg_sys::INT2OID => {
-                    s.serialize_i16(i16::from_datum(self.datum, false).unwrap_or(0))
-                }
-                pg_sys::INT4OID => {
-                    s.serialize_i32(i32::from_datum(self.datum, false).unwrap_or(0))
-                }
-                pg_sys::INT8OID => {
-                    s.serialize_i64(i64::from_datum(self.datum, false).unwrap_or(0))
-                }
+                pg_sys::INT2OID => s.serialize_i16(i16::from_datum(self.datum, false).unwrap_or(0)),
+                pg_sys::INT4OID => s.serialize_i32(i32::from_datum(self.datum, false).unwrap_or(0)),
+                pg_sys::INT8OID => s.serialize_i64(i64::from_datum(self.datum, false).unwrap_or(0)),
                 pg_sys::FLOAT4OID => {
                     s.serialize_f32(f32::from_datum(self.datum, false).unwrap_or(0.0))
                 }
@@ -41,10 +35,7 @@ impl Serialize for PgDatum {
                 pg_sys::BOOLOID => {
                     s.serialize_bool(bool::from_datum(self.datum, false).unwrap_or(false))
                 }
-                pg_sys::TEXTOID
-                | pg_sys::VARCHAROID
-                | pg_sys::BPCHAROID
-                | pg_sys::NAMEOID => {
+                pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID => {
                     let v = String::from_datum(self.datum, false).unwrap_or_default();
                     s.serialize_str(&v)
                 }
@@ -91,7 +82,11 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
     type Value = (pg_sys::Datum, bool);
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "a value convertible to Postgres datum (OID {:?})", self.oid)
+        write!(
+            f,
+            "a value convertible to Postgres datum (OID {:?})",
+            self.oid
+        )
     }
 
     // JS null / undefined
@@ -159,11 +154,9 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
             pg_sys::INT4OID => v.parse::<i32>().unwrap_or(0).into_datum().unwrap(),
             pg_sys::INT8OID => v.parse::<i64>().unwrap_or(0).into_datum().unwrap(),
             pg_sys::FLOAT8OID => v.parse::<f64>().unwrap_or(0.0).into_datum().unwrap(),
-            pg_sys::BOOLOID => {
-                matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
-                    .into_datum()
-                    .unwrap()
-            }
+            pg_sys::BOOLOID => matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+                .into_datum()
+                .unwrap(),
             pg_sys::JSONOID | pg_sys::JSONBOID => {
                 let jb = pgrx::JsonB(
                     serde_json::from_str(v).unwrap_or_else(|_| Value::String(v.to_owned())),
@@ -206,9 +199,7 @@ unsafe fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String 
         let mut is_varlena: bool = false;
         pg_sys::getTypeOutputInfo(type_oid, &mut output_fn, &mut is_varlena);
         let cstr = pg_sys::OidOutputFunctionCall(output_fn, datum);
-        let result = std::ffi::CStr::from_ptr(cstr)
-            .to_string_lossy()
-            .to_string();
+        let result = std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string();
         pg_sys::pfree(cstr.cast());
         result
     }

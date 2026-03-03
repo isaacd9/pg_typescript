@@ -1,9 +1,12 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::hash::{Hash, Hasher};
 
+use deno_ast::MediaType;
+use deno_ast::ParseParams;
+use deno_ast::SourceMapOption;
 use deno_core::v8;
 use pgrx::pg_catalog::pg_proc::PgProc;
 use pgrx::prelude::*;
@@ -78,7 +81,11 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
     let args: Vec<PgDatum> = (0..nargs)
         .map(|i| unsafe {
             let nd = fcinfo::pg_get_nullable_datum(fcinfo, i);
-            PgDatum { datum: nd.value, isnull: nd.isnull, oid: arg_types[i] }
+            PgDatum {
+                datum: nd.value,
+                isnull: nd.isnull,
+                oid: arg_types[i],
+            }
         })
         .collect();
 
@@ -114,9 +121,8 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> pg_sys::Datum {
     // Postgres passes the to-be-validated function's OID as arg 0.
-    let fn_oid: pg_sys::Oid = unsafe {
-        pg_sys::Oid::from(fcinfo::pg_get_nullable_datum(fcinfo, 0).value.value() as u32)
-    };
+    let fn_oid: pg_sys::Oid =
+        unsafe { pg_sys::Oid::from(fcinfo::pg_get_nullable_datum(fcinfo, 0).value.value() as u32) };
 
     let proc: PgProc = match PgProc::new(fn_oid) {
         Some(p) => p,
@@ -142,12 +148,18 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     // If the function declares an import map, fetch all dependencies now.
     #[cfg(not(test))]
     if !import_map.is_empty() {
-        fetch::fetch_and_cache(u32::from(fn_oid), &import_map, &mut fetch::PgModuleStore, &fetch::UreqFetcher);
+        fetch::fetch_and_cache(
+            u32::from(fn_oid),
+            &import_map,
+            &mut fetch::PgModuleStore,
+            &fetch::UreqFetcher,
+        );
     }
 
-    // Assemble the same module source the call handler will use so that the
+    // Assemble and transpile the same module source the call handler will use so that the
     // specifier and hash match and we can pre-warm FN_CACHE.
     let module_source = assemble_module(&source, &import_map, &params);
+    let module_source = transpile_module(&module_source);
     let source_hash = hash_str(&module_source);
     let oid_raw = u32::from(fn_oid);
 
@@ -167,15 +179,14 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     with_runtime(|rt| {
         let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), Box::new(store));
 
-        let module_id =
-            block_on(rt.load_side_es_module_from_code(&specifier, module_source))
-                .unwrap_or_else(|e| {
-                    // Only report the first line — the rest is a V8 stack trace that
-                    // contains an unstable OID/hash (e.g. "at file:///pg_typescript/fn_NNNN_...").
-                    let msg = e.to_string();
-                    let first_line = msg.lines().next().unwrap_or(&msg);
-                    pgrx::error!("pg_typescript: syntax error: {first_line}");
-                });
+        let module_id = block_on(rt.load_side_es_module_from_code(&specifier, module_source))
+            .unwrap_or_else(|e| {
+                // Only report the first line — the rest is a V8 stack trace that
+                // contains an unstable OID/hash (e.g. "at file:///pg_typescript/fn_NNNN_...").
+                let msg = e.to_string();
+                let first_line = msg.lines().next().unwrap_or(&msg);
+                pgrx::error!("pg_typescript: syntax error: {first_line}");
+            });
 
         let evaluate = rt.mod_evaluate(module_id);
         block_on(rt.with_event_loop_promise(evaluate, Default::default()))
@@ -218,7 +229,12 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
         // happens here, never during the execute step.
         #[cfg(not(test))]
         if !import_map.is_empty() {
-            fetch::fetch_and_cache(0u32, &import_map, &mut fetch::PgModuleStore, &fetch::UreqFetcher);
+            fetch::fetch_and_cache(
+                0u32,
+                &import_map,
+                &mut fetch::PgModuleStore,
+                &fetch::UreqFetcher,
+            );
         }
 
         #[cfg(not(test))]
@@ -271,6 +287,7 @@ where
 {
     let params = param_names.join(", ");
     let module_source = assemble_module(source, import_map, &params);
+    let module_source = transpile_module(&module_source);
     let source_hash = hash_str(&module_source);
     let oid_raw = u32::from(fn_oid);
 
@@ -299,10 +316,9 @@ where
 
                 // Evaluate the module; future must be awaited so errors are not silently lost.
                 let evaluate = rt.mod_evaluate(module_id);
-                block_on(rt.with_event_loop_promise(evaluate, Default::default()))
-                    .unwrap_or_else(|e| {
-                        pgrx::error!("pg_typescript: module evaluation failed: {e}")
-                    });
+                block_on(rt.with_event_loop_promise(evaluate, Default::default())).unwrap_or_else(
+                    |e| pgrx::error!("pg_typescript: module evaluation failed: {e}"),
+                );
 
                 let namespace = rt
                     .get_module_namespace(module_id)
@@ -331,6 +347,7 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
     store: MS,
 ) {
     let module_source = assemble_module(source, import_map, "");
+    let module_source = transpile_module(&module_source);
     let source_hash = hash_str(&module_source);
 
     with_runtime(|rt| {
@@ -342,8 +359,7 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
                 // Set loader context only on cache miss.
                 let _ctx = loader::set_loader_context(0u32, import_map.clone(), Box::new(store));
 
-                let specifier_str =
-                    format!("file:///pg_typescript/do_{source_hash:016x}.mjs");
+                let specifier_str = format!("file:///pg_typescript/do_{source_hash:016x}.mjs");
                 let specifier = deno_core::resolve_url(&specifier_str)
                     .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
@@ -352,10 +368,9 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
                         .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
 
                 let evaluate = rt.mod_evaluate(module_id);
-                block_on(rt.with_event_loop_promise(evaluate, Default::default()))
-                    .unwrap_or_else(|e| {
-                        pgrx::error!("pg_typescript: module evaluation failed: {e}")
-                    });
+                block_on(rt.with_event_loop_promise(evaluate, Default::default())).unwrap_or_else(
+                    |e| pgrx::error!("pg_typescript: module evaluation failed: {e}"),
+                );
 
                 let namespace = rt
                     .get_module_namespace(module_id)
@@ -390,11 +405,7 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
 ///   return lodash.capitalize(zod.string().parse(input));
 /// }
 /// ```
-fn assemble_module(
-    body: &str,
-    import_map: &HashMap<String, String>,
-    params: &str,
-) -> String {
+fn assemble_module(body: &str, import_map: &HashMap<String, String>, params: &str) -> String {
     let mut module = String::new();
     for key in import_map.keys() {
         module.push_str(&format!("import * as {key} from \"{key}\";\n"));
@@ -403,6 +414,49 @@ fn assemble_module(
         "\nexport default async function({params}) {{\n{body}\n}}\n"
     ));
     module
+}
+
+/// Transpile TypeScript/TSX syntax to JavaScript. This does not type-check.
+fn transpile_module(source: &str) -> String {
+    let specifier = deno_core::resolve_url("file:///pg_typescript/input.ts")
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid transpile specifier: {e}"));
+
+    let parsed = deno_ast::parse_module(ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: false,
+        scope_analysis: false,
+        maybe_syntax: None,
+    })
+    .unwrap_or_else(|e| {
+        let msg = e.to_string();
+        let first_line = msg.lines().next().unwrap_or(&msg);
+        pgrx::error!("pg_typescript: syntax error: {first_line}");
+    });
+
+    parsed
+        .transpile(
+            &deno_ast::TranspileOptions {
+                imports_not_used_as_values: deno_ast::ImportsNotUsedAsValues::Remove,
+                decorators: deno_ast::DecoratorsTranspileOption::Ecma,
+                ..Default::default()
+            },
+            &deno_ast::TranspileModuleOptions {
+                module_kind: Some(deno_ast::ModuleKind::Esm),
+            },
+            &deno_ast::EmitOptions {
+                source_map: SourceMapOption::None,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| {
+            let msg = e.to_string();
+            let first_line = msg.lines().next().unwrap_or(&msg);
+            pgrx::error!("pg_typescript: syntax error: {first_line}");
+        })
+        .into_source()
+        .text
 }
 
 /// Extract the `default` export from a module namespace object.
@@ -450,11 +504,7 @@ fn call_fn_with_args<A: serde::Serialize>(
 }
 
 /// Deserialize a resolved V8 global using `seed`.
-fn global_to<S, R>(
-    rt: &mut deno_core::JsRuntime,
-    global: v8::Global<v8::Value>,
-    seed: S,
-) -> R
+fn global_to<S, R>(rt: &mut deno_core::JsRuntime, global: v8::Global<v8::Value>, seed: S) -> R
 where
     S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
 {
@@ -476,11 +526,15 @@ fn read_import_map(proc: &PgProc) -> HashMap<String, String> {
         .proconfig()
         .unwrap_or_default()
         .into_iter()
-        .find_map(|kv| kv.strip_prefix("typescript.import_map=").map(|v| v.to_string()));
+        .find_map(|kv| {
+            kv.strip_prefix("typescript.import_map=")
+                .map(|v| v.to_string())
+        });
 
     match json {
-        Some(ref j) => fetch::parse_import_map(j)
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}")),
+        Some(ref j) => {
+            fetch::parse_import_map(j).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+        }
         None => HashMap::new(),
     }
 }
@@ -492,8 +546,9 @@ fn read_inline_import_map() -> HashMap<String, String> {
         .get()
         .and_then(|cstr| cstr.to_str().ok().map(|s| s.to_string()));
     match json.as_deref() {
-        Some(j) if !j.is_empty() => fetch::parse_import_map(j)
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}")),
+        Some(j) if !j.is_empty() => {
+            fetch::parse_import_map(j).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+        }
         _ => HashMap::new(),
     }
 }
@@ -505,7 +560,7 @@ fn read_inline_import_map() -> HashMap<String, String> {
 #[cfg(test)]
 mod unit_tests {
     use crate::fetch::ModuleStore;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     struct JsonSeed;
 
@@ -532,12 +587,26 @@ mod unit_tests {
     ) -> (Value, bool) {
         let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
         let fn_oid = pgrx::pg_sys::Oid::from(0u32);
-        super::execute_typescript_fn(fn_oid, source, &import_map, &param_names, args, JsonSeed, store)
+        super::execute_typescript_fn(
+            fn_oid,
+            source,
+            &import_map,
+            &param_names,
+            args,
+            JsonSeed,
+            store,
+        )
     }
 
     /// Run a function body with no import map (pure JS, no packages).
     fn run(source: &str, params: &[&str], args: &[Value]) -> (Value, bool) {
-        run_impl(source, params, args, Default::default(), crate::fetch::HashMapModuleStore::new())
+        run_impl(
+            source,
+            params,
+            args,
+            Default::default(),
+            crate::fetch::HashMapModuleStore::new(),
+        )
     }
 
     macro_rules! ts_test {
@@ -582,9 +651,9 @@ mod unit_tests {
         use crate::runtime::{block_on, with_runtime};
         let module_source = super::assemble_module("const x = ;", &Default::default(), "");
         let hash = super::hash_str(&module_source);
-        let specifier = deno_core::resolve_url(
-            &format!("file:///pg_typescript/test_syntax_{hash:016x}.mjs"),
-        )
+        let specifier = deno_core::resolve_url(&format!(
+            "file:///pg_typescript/test_syntax_{hash:016x}.mjs"
+        ))
         .unwrap();
         let result = with_runtime(|rt| {
             let _ctx = crate::loader::set_loader_context(
@@ -594,7 +663,36 @@ mod unit_tests {
             );
             block_on(rt.load_side_es_module_from_code(&specifier, module_source))
         });
-        assert!(result.is_err(), "expected syntax error to cause module load failure");
+        assert!(
+            result.is_err(),
+            "expected syntax error to cause module load failure"
+        );
+    }
+
+    #[test]
+    fn transpile_parse_error_first_line_is_stable() {
+        let module_source = super::assemble_module("  const x = ;", &Default::default(), "");
+        let err = deno_ast::parse_module(deno_ast::ParseParams {
+            specifier: deno_core::resolve_url("file:///pg_typescript/input.ts").unwrap(),
+            text: module_source.into(),
+            media_type: deno_ast::MediaType::TypeScript,
+            capture_tokens: false,
+            scope_analysis: false,
+            maybe_syntax: None,
+        })
+        .err()
+        .expect("expected parse error");
+
+        let first_line = err
+            .to_string()
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            first_line,
+            "Expression expected at file:///pg_typescript/input.ts:3:13"
+        );
     }
 
     // --- assemble_module ----------------------------------------------------
@@ -608,7 +706,10 @@ mod unit_tests {
     #[test]
     fn assemble_with_params() {
         let out = super::assemble_module("return a + b;", &Default::default(), "a, b");
-        assert_eq!(out, "\nexport default async function(a, b) {\nreturn a + b;\n}\n");
+        assert_eq!(
+            out,
+            "\nexport default async function(a, b) {\nreturn a + b;\n}\n"
+        );
     }
 
     #[test]
@@ -635,18 +736,61 @@ mod unit_tests {
     fn inline_block_with_module() {
         let import_map = crate::fetch::make_import_map(&[("math", "https://esm.sh/math@1")]);
         let mut store = crate::fetch::HashMapModuleStore::new();
-        store.write(0, "https://esm.sh/math@1", "export function add(a, b) { return a + b; }");
+        store.write(
+            0,
+            "https://esm.sh/math@1",
+            "export function add(a, b) { return a + b; }",
+        );
         super::execute_inline_block("const result = math.add(1, 2);", &import_map, store);
     }
 
     // --- sync / async execution ---------------------------------------------
 
-    ts_test!(sync_add, "return a + b;", ["a", "b"], [json!(1), json!(2)], Some(json!(3)));
-    ts_test!(sync_string_template, "return `Hello, ${name}!`;", ["name"], [json!("world")], Some(json!("Hello, world!")));
-    ts_test!(sync_bool_comparison, "return a > b;", ["a", "b"], [json!(3.0), json!(1.5)], Some(json!(true)));
+    ts_test!(
+        sync_add,
+        "return a + b;",
+        ["a", "b"],
+        [json!(1), json!(2)],
+        Some(json!(3))
+    );
+    ts_test!(
+        sync_typescript_annotations,
+        "type NumBox = { value: number };
+         const box: NumBox = { value: n + 1 };
+         return box.value;",
+        ["n"],
+        [json!(41)],
+        Some(json!(42))
+    );
+    ts_test!(
+        sync_string_template,
+        "return `Hello, ${name}!`;",
+        ["name"],
+        [json!("world")],
+        Some(json!("Hello, world!"))
+    );
+    ts_test!(
+        sync_bool_comparison,
+        "return a > b;",
+        ["a", "b"],
+        [json!(3.0), json!(1.5)],
+        Some(json!(true))
+    );
     ts_test!(sync_null_return, "return null;", [], [], None);
-    ts_test!(sync_object_return, "return { x: n * 2 };", ["n"], [json!(21)], Some(json!({ "x": 42 })));
-    ts_test!(async_number, "return await Promise.resolve(n * 2);", ["n"], [json!(21)], Some(json!(42)));
+    ts_test!(
+        sync_object_return,
+        "return { x: n * 2 };",
+        ["n"],
+        [json!(21)],
+        Some(json!({ "x": 42 }))
+    );
+    ts_test!(
+        async_number,
+        "return await Promise.resolve(n * 2);",
+        ["n"],
+        [json!(21)],
+        Some(json!(42))
+    );
     ts_test!(
         async_string,
         "const greeting = await Promise.resolve(`Hello, ${name}!`);
@@ -664,7 +808,13 @@ mod unit_tests {
         [json!(4)],
         Some(json!(10))
     );
-    ts_test!(async_null_return, "return await Promise.resolve(null);", [], [], None);
+    ts_test!(
+        async_null_return,
+        "return await Promise.resolve(null);",
+        [],
+        [],
+        None
+    );
     ts_test!(
         async_object,
         "const doubled = await Promise.resolve(n * 2);
@@ -718,4 +868,3 @@ mod unit_tests {
         }
     );
 }
-

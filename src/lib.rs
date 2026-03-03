@@ -1,5 +1,5 @@
-use pgrx::prelude::*;
 use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
+use pgrx::prelude::*;
 
 pgrx::pg_module_magic!(name, version);
 
