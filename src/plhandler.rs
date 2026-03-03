@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::hash::{Hash, Hasher};
 
@@ -15,7 +15,7 @@ use pgrx::{fcinfo, pg_sys};
 use crate::convert::{PgDatum, PgDatumSeed};
 use crate::fetch;
 use crate::loader;
-use crate::runtime::{block_on, with_runtime};
+use crate::runtime::{block_on, set_runtime_permissions, with_runtime, RuntimePermissions};
 
 // ---------------------------------------------------------------------------
 // PostgreSQL V1 function-info records for our three PL handler entry points.
@@ -77,6 +77,7 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
         .collect();
 
     let import_map = read_import_map(&proc);
+    let permissions = read_function_permissions(&proc);
 
     let args: Vec<PgDatum> = (0..nargs)
         .map(|i| unsafe {
@@ -98,6 +99,7 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
         fn_oid,
         &source,
         &import_map,
+        &permissions,
         &param_names,
         &args,
         PgDatumSeed { oid: ret_type },
@@ -144,6 +146,7 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         .collect();
     let params = param_names.join(", ");
     let import_map = read_import_map(&proc);
+    let permissions = read_function_permissions(&proc);
 
     // If the function declares an import map, fetch all dependencies now.
     #[cfg(not(test))]
@@ -177,6 +180,7 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
     with_runtime(|rt| {
+        set_runtime_permissions(rt, &permissions);
         let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), Box::new(store));
 
         let module_id = block_on(rt.load_side_es_module_from_code(&specifier, module_source))
@@ -224,6 +228,7 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             .to_string();
 
         let import_map = read_inline_import_map();
+        let permissions = read_inline_permissions();
 
         // Fetch and cache all dependencies before execution — network access
         // happens here, never during the execute step.
@@ -242,7 +247,7 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
         #[cfg(test)]
         let store = fetch::HashMapModuleStore::new();
 
-        execute_inline_block(&source, &import_map, store);
+        execute_inline_block(&source, &import_map, &permissions, store);
         fcinfo::pg_return_void()
     }
 }
@@ -275,6 +280,7 @@ fn execute_typescript_fn<MS, A, S, R>(
     fn_oid: pg_sys::Oid,
     source: &str,
     import_map: &HashMap<String, String>,
+    permissions: &RuntimePermissions,
     param_names: &[String],
     args: &[A],
     seed: S,
@@ -292,6 +298,7 @@ where
     let oid_raw = u32::from(fn_oid);
 
     with_runtime(|rt| {
+        set_runtime_permissions(rt, permissions);
         // Look up (oid, source_hash) in the per-connection cache.
         // Cache hit: skip module loading, compilation, and loader context setup entirely.
         let fn_global = FN_CACHE.with(|c| c.borrow().get(&(oid_raw, source_hash)).cloned());
@@ -344,6 +351,7 @@ where
 fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
     source: &str,
     import_map: &HashMap<String, String>,
+    permissions: &RuntimePermissions,
     store: MS,
 ) {
     let module_source = assemble_module(source, import_map, "");
@@ -351,6 +359,7 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
     let source_hash = hash_str(&module_source);
 
     with_runtime(|rt| {
+        set_runtime_permissions(rt, permissions);
         let fn_global = FN_CACHE.with(|c| c.borrow().get(&(0u32, source_hash)).cloned());
 
         let fn_global = match fn_global {
@@ -522,14 +531,7 @@ where
 /// Read the `typescript.import_map` value from a function's proconfig and
 /// parse it into a specifier → URL map.
 fn read_import_map(proc: &PgProc) -> HashMap<String, String> {
-    let json = proc
-        .proconfig()
-        .unwrap_or_default()
-        .into_iter()
-        .find_map(|kv| {
-            kv.strip_prefix("typescript.import_map=")
-                .map(|v| v.to_string())
-        });
+    let json = read_function_config(proc, "typescript.import_map");
 
     match json {
         Some(ref j) => {
@@ -550,6 +552,241 @@ fn read_inline_import_map() -> HashMap<String, String> {
             fetch::parse_import_map(j).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
         }
         _ => HashMap::new(),
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PermissionValue {
+    Deny,
+    AllowAll,
+    AllowList(Vec<String>),
+}
+
+impl Default for PermissionValue {
+    fn default() -> Self {
+        Self::Deny
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct PermissionSpec {
+    read: PermissionValue,
+    write: PermissionValue,
+    net: PermissionValue,
+    env: PermissionValue,
+    run: PermissionValue,
+    ffi: PermissionValue,
+    sys: PermissionValue,
+    import: PermissionValue,
+}
+
+fn read_function_config(proc: &PgProc, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    proc.proconfig().unwrap_or_default().into_iter().find_map(|kv| {
+        kv.strip_prefix(&prefix).map(|v| v.to_string())
+    })
+}
+
+fn read_function_permissions(proc: &PgProc) -> RuntimePermissions {
+    let requested = PermissionSpec {
+        read: parse_permission_setting(
+            read_function_config(proc, "typescript.allow_read"),
+            "function setting typescript.allow_read",
+        ),
+        write: parse_permission_setting(
+            read_function_config(proc, "typescript.allow_write"),
+            "function setting typescript.allow_write",
+        ),
+        net: parse_permission_setting(
+            read_function_config(proc, "typescript.allow_net"),
+            "function setting typescript.allow_net",
+        ),
+        env: parse_permission_setting(
+            read_function_config(proc, "typescript.allow_env"),
+            "function setting typescript.allow_env",
+        ),
+        run: parse_permission_setting(
+            read_function_config(proc, "typescript.allow_run"),
+            "function setting typescript.allow_run",
+        ),
+        ffi: parse_permission_setting(
+            read_function_config(proc, "typescript.allow_ffi"),
+            "function setting typescript.allow_ffi",
+        ),
+        sys: parse_permission_setting(
+            read_function_config(proc, "typescript.allow_sys"),
+            "function setting typescript.allow_sys",
+        ),
+        import: parse_permission_setting(
+            read_function_config(proc, "typescript.allow_import"),
+            "function setting typescript.allow_import",
+        ),
+    };
+
+    effective_permissions(requested, read_max_permissions())
+}
+
+fn read_inline_permissions() -> RuntimePermissions {
+    let requested = PermissionSpec {
+        read: parse_permission_setting(
+            guc_value(crate::ALLOW_READ_GUC.get()),
+            "GUC typescript.allow_read",
+        ),
+        write: parse_permission_setting(
+            guc_value(crate::ALLOW_WRITE_GUC.get()),
+            "GUC typescript.allow_write",
+        ),
+        net: parse_permission_setting(
+            guc_value(crate::ALLOW_NET_GUC.get()),
+            "GUC typescript.allow_net",
+        ),
+        env: parse_permission_setting(
+            guc_value(crate::ALLOW_ENV_GUC.get()),
+            "GUC typescript.allow_env",
+        ),
+        run: parse_permission_setting(
+            guc_value(crate::ALLOW_RUN_GUC.get()),
+            "GUC typescript.allow_run",
+        ),
+        ffi: parse_permission_setting(
+            guc_value(crate::ALLOW_FFI_GUC.get()),
+            "GUC typescript.allow_ffi",
+        ),
+        sys: parse_permission_setting(
+            guc_value(crate::ALLOW_SYS_GUC.get()),
+            "GUC typescript.allow_sys",
+        ),
+        import: parse_permission_setting(
+            guc_value(crate::ALLOW_IMPORT_GUC.get()),
+            "GUC typescript.allow_import",
+        ),
+    };
+
+    effective_permissions(requested, read_max_permissions())
+}
+
+fn read_max_permissions() -> PermissionSpec {
+    PermissionSpec {
+        read: parse_permission_setting(
+            guc_value(crate::MAX_ALLOW_READ_GUC.get()),
+            "GUC typescript.max_allow_read",
+        ),
+        write: parse_permission_setting(
+            guc_value(crate::MAX_ALLOW_WRITE_GUC.get()),
+            "GUC typescript.max_allow_write",
+        ),
+        net: parse_permission_setting(
+            guc_value(crate::MAX_ALLOW_NET_GUC.get()),
+            "GUC typescript.max_allow_net",
+        ),
+        env: parse_permission_setting(
+            guc_value(crate::MAX_ALLOW_ENV_GUC.get()),
+            "GUC typescript.max_allow_env",
+        ),
+        run: parse_permission_setting(
+            guc_value(crate::MAX_ALLOW_RUN_GUC.get()),
+            "GUC typescript.max_allow_run",
+        ),
+        ffi: parse_permission_setting(
+            guc_value(crate::MAX_ALLOW_FFI_GUC.get()),
+            "GUC typescript.max_allow_ffi",
+        ),
+        sys: parse_permission_setting(
+            guc_value(crate::MAX_ALLOW_SYS_GUC.get()),
+            "GUC typescript.max_allow_sys",
+        ),
+        import: parse_permission_setting(
+            guc_value(crate::MAX_ALLOW_IMPORT_GUC.get()),
+            "GUC typescript.max_allow_import",
+        ),
+    }
+}
+
+fn guc_value(value: Option<std::ffi::CString>) -> Option<String> {
+    value
+        .and_then(|cstr| cstr.to_str().ok().map(|s| s.to_string()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn parse_permission_setting(raw: Option<String>, source: &str) -> PermissionValue {
+    let Some(value) = raw else {
+        return PermissionValue::Deny;
+    };
+
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "off" | "none" | "deny" | "false" | "0" => PermissionValue::Deny,
+        "*" | "all" | "on" | "true" | "1" => PermissionValue::AllowAll,
+        _ => PermissionValue::AllowList(parse_permission_list(&value, source)),
+    }
+}
+
+fn parse_permission_list(value: &str, source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw in value.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if seen.insert(item.to_string()) {
+            out.push(item.to_string());
+        }
+    }
+
+    if out.is_empty() {
+        pgrx::error!("pg_typescript: invalid empty permission list in {source}");
+    }
+
+    out
+}
+
+fn effective_permissions(requested: PermissionSpec, max: PermissionSpec) -> RuntimePermissions {
+    RuntimePermissions {
+        allow_read: to_runtime_allowlist(intersect_permission(requested.read, max.read)),
+        allow_write: to_runtime_allowlist(intersect_permission(requested.write, max.write)),
+        allow_net: to_runtime_allowlist(intersect_permission(requested.net, max.net)),
+        allow_env: to_runtime_allowlist(intersect_permission(requested.env, max.env)),
+        allow_run: to_runtime_allowlist(intersect_permission(requested.run, max.run)),
+        allow_ffi: to_runtime_allowlist(intersect_permission(requested.ffi, max.ffi)),
+        allow_sys: to_runtime_allowlist(intersect_permission(requested.sys, max.sys)),
+        allow_import: to_runtime_allowlist(intersect_permission(requested.import, max.import)),
+    }
+}
+
+fn intersect_permission(requested: PermissionValue, max: PermissionValue) -> PermissionValue {
+    match max {
+        PermissionValue::Deny => PermissionValue::Deny,
+        PermissionValue::AllowAll => requested,
+        PermissionValue::AllowList(max_list) => match requested {
+            PermissionValue::Deny => PermissionValue::Deny,
+            PermissionValue::AllowAll => PermissionValue::AllowList(max_list),
+            PermissionValue::AllowList(req_list) => {
+                let cap: HashSet<String> = max_list.into_iter().collect();
+                let mut out = Vec::new();
+                let mut seen = HashSet::new();
+                for item in req_list {
+                    if cap.contains(&item) && seen.insert(item.clone()) {
+                        out.push(item);
+                    }
+                }
+                if out.is_empty() {
+                    PermissionValue::Deny
+                } else {
+                    PermissionValue::AllowList(out)
+                }
+            }
+        },
+    }
+}
+
+fn to_runtime_allowlist(value: PermissionValue) -> Option<Vec<String>> {
+    match value {
+        PermissionValue::AllowAll => Some(vec![]),
+        PermissionValue::AllowList(values) => Some(values),
+        PermissionValue::Deny => None,
     }
 }
 
@@ -591,6 +828,7 @@ mod unit_tests {
             fn_oid,
             source,
             &import_map,
+            &super::RuntimePermissions::default(),
             &param_names,
             args,
             JsonSeed,
@@ -728,6 +966,7 @@ mod unit_tests {
         super::execute_inline_block(
             "const x = 1 + 1;",
             &Default::default(),
+            &super::RuntimePermissions::default(),
             crate::fetch::HashMapModuleStore::new(),
         );
     }
@@ -741,7 +980,12 @@ mod unit_tests {
             "https://esm.sh/math@1",
             "export function add(a, b) { return a + b; }",
         );
-        super::execute_inline_block("const result = math.add(1, 2);", &import_map, store);
+        super::execute_inline_block(
+            "const result = math.add(1, 2);",
+            &import_map,
+            &super::RuntimePermissions::default(),
+            store,
+        );
     }
 
     // --- sync / async execution ---------------------------------------------

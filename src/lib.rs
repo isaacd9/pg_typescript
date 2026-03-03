@@ -15,6 +15,47 @@ mod runtime;
 pub(crate) static IMPORT_MAP_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 
+/// Userset permission request knobs (function-level via `CREATE FUNCTION ... SET`, or
+/// session/local for DO blocks). Values:
+/// - `off|none|deny|false` => deny
+/// - `*|all|on|true` => allow all
+/// - `a,b,c` => allowlist
+pub(crate) static ALLOW_READ_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static ALLOW_WRITE_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static ALLOW_NET_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static ALLOW_ENV_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static ALLOW_RUN_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static ALLOW_FFI_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static ALLOW_SYS_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static ALLOW_IMPORT_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+
+/// Superuser caps for each permission. Effective permission is intersection of
+/// `allow_*` request and `max_allow_*` cap.
+pub(crate) static MAX_ALLOW_READ_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static MAX_ALLOW_WRITE_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static MAX_ALLOW_NET_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static MAX_ALLOW_ENV_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static MAX_ALLOW_RUN_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static MAX_ALLOW_FFI_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static MAX_ALLOW_SYS_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+pub(crate) static MAX_ALLOW_IMPORT_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+
 // Register the GUC for per-function import maps.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
@@ -24,6 +65,136 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         c"",
         &IMPORT_MAP_GUC,
         GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"typescript.allow_read",
+        c"Requested read permission: off|*|comma-list",
+        c"",
+        &ALLOW_READ_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.allow_write",
+        c"Requested write permission: off|*|comma-list",
+        c"",
+        &ALLOW_WRITE_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.allow_net",
+        c"Requested network permission: off|*|comma-list",
+        c"",
+        &ALLOW_NET_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.allow_env",
+        c"Requested environment permission: off|*|comma-list",
+        c"",
+        &ALLOW_ENV_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.allow_run",
+        c"Requested subprocess permission: off|*|comma-list",
+        c"",
+        &ALLOW_RUN_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.allow_ffi",
+        c"Requested FFI permission: off|*|comma-list",
+        c"",
+        &ALLOW_FFI_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.allow_sys",
+        c"Requested system-information permission: off|*|comma-list",
+        c"",
+        &ALLOW_SYS_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.allow_import",
+        c"Requested import permission: off|*|comma-list",
+        c"",
+        &ALLOW_IMPORT_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    GucRegistry::define_string_guc(
+        c"typescript.max_allow_read",
+        c"Superuser max read permission cap: off|*|comma-list",
+        c"",
+        &MAX_ALLOW_READ_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.max_allow_write",
+        c"Superuser max write permission cap: off|*|comma-list",
+        c"",
+        &MAX_ALLOW_WRITE_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.max_allow_net",
+        c"Superuser max network permission cap: off|*|comma-list",
+        c"",
+        &MAX_ALLOW_NET_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.max_allow_env",
+        c"Superuser max environment permission cap: off|*|comma-list",
+        c"",
+        &MAX_ALLOW_ENV_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.max_allow_run",
+        c"Superuser max subprocess permission cap: off|*|comma-list",
+        c"",
+        &MAX_ALLOW_RUN_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.max_allow_ffi",
+        c"Superuser max FFI permission cap: off|*|comma-list",
+        c"",
+        &MAX_ALLOW_FFI_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.max_allow_sys",
+        c"Superuser max system-information permission cap: off|*|comma-list",
+        c"",
+        &MAX_ALLOW_SYS_GUC,
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.max_allow_import",
+        c"Superuser max import permission cap: off|*|comma-list",
+        c"",
+        &MAX_ALLOW_IMPORT_GUC,
+        GucContext::Suset,
         GucFlags::default(),
     );
 }
