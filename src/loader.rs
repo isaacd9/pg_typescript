@@ -18,6 +18,7 @@ struct LoaderContext {
     fn_oid: u32,
     import_map: HashMap<String, String>,
     store: Box<dyn ModuleStore>,
+    inline_modules: HashMap<String, String>,
 }
 
 thread_local! {
@@ -44,11 +45,23 @@ pub fn set_loader_context(
     import_map: HashMap<String, String>,
     store: Box<dyn ModuleStore>,
 ) -> LoaderContextGuard {
+    set_loader_context_with_inline(fn_oid, import_map, store, HashMap::new())
+}
+
+/// Set the loader context for the current function call, with optional
+/// in-memory module sources keyed by absolute specifier URL.
+pub fn set_loader_context_with_inline(
+    fn_oid: u32,
+    import_map: HashMap<String, String>,
+    store: Box<dyn ModuleStore>,
+    inline_modules: HashMap<String, String>,
+) -> LoaderContextGuard {
     LOADER_CTX.with(|c| {
         *c.borrow_mut() = Some(LoaderContext {
             fn_oid,
             import_map,
             store,
+            inline_modules,
         });
     });
     LoaderContextGuard
@@ -103,6 +116,11 @@ impl ModuleLoader for PgModuleLoader {
                     "pg_typescript: error loading {url}: {e}"
                 ))));
             }
+        };
+
+        let source = match maybe_transpile_source(module_specifier, source) {
+            Ok(source) => source,
+            Err(e) => return ModuleLoadResponse::Sync(Err(e)),
         };
 
         ModuleLoadResponse::Sync(Ok(ModuleSource::new(
@@ -200,9 +218,43 @@ fn resolve_from_dep(specifier: &str, referrer: &str) -> Result<ModuleSpecifier, 
 
 fn load_module_source(url: String) -> Result<Option<String>, String> {
     LOADER_CTX.with(|c| match c.borrow().as_ref() {
-        Some(ctx) => ctx.store.load(ctx.fn_oid, &url),
+        Some(ctx) => {
+            if let Some(source) = ctx.inline_modules.get(&url) {
+                return Ok(Some(source.clone()));
+            }
+            ctx.store.load(ctx.fn_oid, &url)
+        }
         None => Err("no loader context set".to_string()),
     })
+}
+
+fn maybe_transpile_source(
+    module_specifier: &ModuleSpecifier,
+    source: String,
+) -> Result<String, JsErrorBox> {
+    let name = module_specifier.as_str();
+    if !should_transpile(name) {
+        return Ok(source);
+    }
+
+    let (transpiled, _) =
+        deno_runtime::transpile::maybe_transpile_source(name.to_string().into(), source.into())?;
+    Ok(transpiled.to_string())
+}
+
+fn should_transpile(name: &str) -> bool {
+    if name.starts_with("node:") {
+        return true;
+    }
+
+    let Ok(specifier) = ModuleSpecifier::parse(name) else {
+        return false;
+    };
+    let path = specifier.path().to_ascii_lowercase();
+    path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".mts")
+        || path.ends_with(".cts")
 }
 
 // ---------------------------------------------------------------------------

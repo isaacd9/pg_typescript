@@ -82,7 +82,12 @@ fn emit_console_line(level: &str, msg: &str) {
     eprintln!("[pg_typescript:{level}] {msg}");
 }
 
-deno_core::extension!(pg_typescript_console, ops = [op_pg_console_log]);
+deno_core::extension!(
+    pg_typescript_console,
+    ops = [op_pg_console_log],
+    esm_entry_point = "ext:pg_typescript_console/console_bridge.js",
+    esm = [ dir "src/js", "console_bridge.js" ],
+);
 deno_core::extension!(
     pg_typescript_runtime_state,
     state = |state| {
@@ -94,7 +99,7 @@ deno_core::extension!(
 
 const CONSOLE_HOOK_JS: &str = r#"
 (() => {
-  const op = globalThis?.Deno?.core?.ops?.op_pg_console_log;
+  const op = globalThis?.__pg_op_console_log;
   if (typeof op !== "function" || typeof globalThis.console === "undefined") return;
 
   const stringify = (value) => {
@@ -118,6 +123,19 @@ const CONSOLE_HOOK_JS: &str = r#"
   console.error = bind("error");
 })();
 "#;
+
+fn install_console_hook(rt: &mut JsRuntime) {
+    rt.execute_script(
+        "pg_typescript:console_hook",
+        CONSOLE_HOOK_JS.to_string(),
+    )
+    .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to install console hook: {e}"));
+}
+
+/// Re-apply the console hook in case runtime bootstrap code replaced console methods.
+pub fn ensure_console_hook(rt: &mut JsRuntime) {
+    install_console_hook(rt);
+}
 
 /// Run `f` with the per-connection runtime, initialising it on first use.
 pub fn with_runtime<F, R>(f: F) -> R
@@ -216,12 +234,7 @@ fn create_runtime() -> MainWorker {
         ..Default::default()
     });
 
-    worker
-        .execute_script(
-            "pg_typescript:console_hook",
-            CONSOLE_HOOK_JS.to_string().into(),
-        )
-        .expect("pg_typescript: failed to install console hook");
+    install_console_hook(&mut worker.js_runtime);
 
     worker
 }

@@ -4,9 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::hash::{Hash, Hasher};
 
-use deno_ast::MediaType;
-use deno_ast::ParseParams;
-use deno_ast::SourceMapOption;
 use deno_core::v8;
 use pgrx::pg_catalog::pg_proc::PgProc;
 use pgrx::prelude::*;
@@ -15,7 +12,9 @@ use pgrx::{fcinfo, pg_sys};
 use crate::convert::{PgDatum, PgDatumSeed};
 use crate::fetch;
 use crate::loader;
-use crate::runtime::{block_on, set_runtime_permissions, with_runtime, RuntimePermissions};
+use crate::runtime::{
+    block_on, ensure_console_hook, set_runtime_permissions, with_runtime, RuntimePermissions,
+};
 
 // ---------------------------------------------------------------------------
 // PostgreSQL V1 function-info records for our three PL handler entry points.
@@ -159,10 +158,9 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         );
     }
 
-    // Assemble and transpile the same module source the call handler will use so that the
+    // Assemble the same module source the call handler will use so that the
     // specifier and hash match and we can pre-warm FN_CACHE.
     let module_source = assemble_module(&source, &import_map, &params);
-    let module_source = transpile_module(&module_source);
     let source_hash = hash_str(&module_source);
     let oid_raw = u32::from(fn_oid);
 
@@ -175,21 +173,30 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     // (not main) lets multiple functions coexist in the same long-lived runtime.
     // V8 always eagerly parses ES module bodies, so syntax errors are caught here.
     // Pre-warming FN_CACHE means the first SELECT call skips module loading entirely.
-    let specifier_str = format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.mjs");
+    let specifier_str = format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.ts");
     let specifier = deno_core::resolve_url(&specifier_str)
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
     with_runtime(|rt| {
+        ensure_console_hook(rt);
         set_runtime_permissions(rt, &permissions);
-        let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), Box::new(store));
+        let mut inline_modules = HashMap::new();
+        inline_modules.insert(specifier_str.clone(), module_source.clone());
+        let _ctx = loader::set_loader_context_with_inline(
+            oid_raw,
+            import_map.clone(),
+            Box::new(store),
+            inline_modules,
+        );
 
-        let module_id = block_on(rt.load_side_es_module_from_code(&specifier, module_source))
+        let module_id = block_on(rt.load_side_es_module(&specifier))
             .unwrap_or_else(|e| {
                 // Only report the first line — the rest is a V8 stack trace that
                 // contains an unstable OID/hash (e.g. "at file:///pg_typescript/fn_NNNN_...").
                 let msg = e.to_string();
                 let first_line = msg.lines().next().unwrap_or(&msg);
-                pgrx::error!("pg_typescript: syntax error: {first_line}");
+                let normalized = normalize_syntax_error_line(first_line);
+                pgrx::error!("pg_typescript: syntax error: {normalized}");
             });
 
         let evaluate = rt.mod_evaluate(module_id);
@@ -293,11 +300,11 @@ where
 {
     let params = param_names.join(", ");
     let module_source = assemble_module(source, import_map, &params);
-    let module_source = transpile_module(&module_source);
     let source_hash = hash_str(&module_source);
     let oid_raw = u32::from(fn_oid);
 
     with_runtime(|rt| {
+        ensure_console_hook(rt);
         set_runtime_permissions(rt, permissions);
         // Look up (oid, source_hash) in the per-connection cache.
         // Cache hit: skip module loading, compilation, and loader context setup entirely.
@@ -308,18 +315,24 @@ where
             None => {
                 // Set loader context only on cache miss — the module loader is
                 // only called during initial load, never when calling a cached function.
-                let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), Box::new(store));
-
                 // Specifier is stable per (function, source version): ALTER FUNCTION changes
                 // the source, which changes the hash and therefore triggers a fresh load.
                 let specifier_str =
-                    format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.mjs");
+                    format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.ts");
                 let specifier = deno_core::resolve_url(&specifier_str)
                     .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
-                let module_id =
-                    block_on(rt.load_side_es_module_from_code(&specifier, module_source))
-                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
+                let mut inline_modules = HashMap::new();
+                inline_modules.insert(specifier_str, module_source.clone());
+                let _ctx = loader::set_loader_context_with_inline(
+                    oid_raw,
+                    import_map.clone(),
+                    Box::new(store),
+                    inline_modules,
+                );
+
+                let module_id = block_on(rt.load_side_es_module(&specifier))
+                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
 
                 // Evaluate the module; future must be awaited so errors are not silently lost.
                 let evaluate = rt.mod_evaluate(module_id);
@@ -355,10 +368,10 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
     store: MS,
 ) {
     let module_source = assemble_module(source, import_map, "");
-    let module_source = transpile_module(&module_source);
     let source_hash = hash_str(&module_source);
 
     with_runtime(|rt| {
+        ensure_console_hook(rt);
         set_runtime_permissions(rt, permissions);
         let fn_global = FN_CACHE.with(|c| c.borrow().get(&(0u32, source_hash)).cloned());
 
@@ -366,15 +379,21 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
             Some(f) => f,
             None => {
                 // Set loader context only on cache miss.
-                let _ctx = loader::set_loader_context(0u32, import_map.clone(), Box::new(store));
-
-                let specifier_str = format!("file:///pg_typescript/do_{source_hash:016x}.mjs");
+                let specifier_str = format!("file:///pg_typescript/do_{source_hash:016x}.ts");
                 let specifier = deno_core::resolve_url(&specifier_str)
                     .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
-                let module_id =
-                    block_on(rt.load_side_es_module_from_code(&specifier, module_source))
-                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
+                let mut inline_modules = HashMap::new();
+                inline_modules.insert(specifier_str, module_source.clone());
+                let _ctx = loader::set_loader_context_with_inline(
+                    0u32,
+                    import_map.clone(),
+                    Box::new(store),
+                    inline_modules,
+                );
+
+                let module_id = block_on(rt.load_side_es_module(&specifier))
+                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
 
                 let evaluate = rt.mod_evaluate(module_id);
                 block_on(rt.with_event_loop_promise(evaluate, Default::default())).unwrap_or_else(
@@ -425,47 +444,21 @@ fn assemble_module(body: &str, import_map: &HashMap<String, String>, params: &st
     module
 }
 
-/// Transpile TypeScript/TSX syntax to JavaScript. This does not type-check.
-fn transpile_module(source: &str) -> String {
-    let specifier = deno_core::resolve_url("file:///pg_typescript/input.ts")
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid transpile specifier: {e}"));
+/// Replace synthetic function specifiers with a stable placeholder path.
+fn normalize_syntax_error_line(line: &str) -> String {
+    let mut out = line
+        .strip_prefix("Uncaught SyntaxError: ")
+        .unwrap_or(line)
+        .to_string();
 
-    let parsed = deno_ast::parse_module(ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::TypeScript,
-        capture_tokens: false,
-        scope_analysis: false,
-        maybe_syntax: None,
-    })
-    .unwrap_or_else(|e| {
-        let msg = e.to_string();
-        let first_line = msg.lines().next().unwrap_or(&msg);
-        pgrx::error!("pg_typescript: syntax error: {first_line}");
-    });
+    if let Some(start) = out.find("file:///pg_typescript/") {
+        if let Some(end_rel) = out[start..].find(".ts:") {
+            let end = start + end_rel + 3;
+            out.replace_range(start..end, "file:///pg_typescript/input.ts");
+        }
+    }
 
-    parsed
-        .transpile(
-            &deno_ast::TranspileOptions {
-                imports_not_used_as_values: deno_ast::ImportsNotUsedAsValues::Remove,
-                decorators: deno_ast::DecoratorsTranspileOption::Ecma,
-                ..Default::default()
-            },
-            &deno_ast::TranspileModuleOptions {
-                module_kind: Some(deno_ast::ModuleKind::Esm),
-            },
-            &deno_ast::EmitOptions {
-                source_map: SourceMapOption::None,
-                ..Default::default()
-            },
-        )
-        .unwrap_or_else(|e| {
-            let msg = e.to_string();
-            let first_line = msg.lines().next().unwrap_or(&msg);
-            pgrx::error!("pg_typescript: syntax error: {first_line}");
-        })
-        .into_source()
-        .text
+    out
 }
 
 /// Extract the `default` export from a module namespace object.
@@ -890,7 +883,7 @@ mod unit_tests {
         let module_source = super::assemble_module("const x = ;", &Default::default(), "");
         let hash = super::hash_str(&module_source);
         let specifier = deno_core::resolve_url(&format!(
-            "file:///pg_typescript/test_syntax_{hash:016x}.mjs"
+            "file:///pg_typescript/test_syntax_{hash:016x}.ts"
         ))
         .unwrap();
         let result = with_runtime(|rt| {
@@ -908,28 +901,13 @@ mod unit_tests {
     }
 
     #[test]
-    fn transpile_parse_error_first_line_is_stable() {
-        let module_source = super::assemble_module("  const x = ;", &Default::default(), "");
-        let err = deno_ast::parse_module(deno_ast::ParseParams {
-            specifier: deno_core::resolve_url("file:///pg_typescript/input.ts").unwrap(),
-            text: module_source.into(),
-            media_type: deno_ast::MediaType::TypeScript,
-            capture_tokens: false,
-            scope_analysis: false,
-            maybe_syntax: None,
-        })
-        .err()
-        .expect("expected parse error");
-
-        let first_line = err
-            .to_string()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string();
+    fn normalize_syntax_error_line_is_stable() {
+        let first_line = super::normalize_syntax_error_line(
+            "Uncaught SyntaxError: Expression expected at file:///pg_typescript/fn_123_abcdeffedcba1234.ts:4:13"
+        );
         assert_eq!(
             first_line,
-            "Expression expected at file:///pg_typescript/input.ts:3:13"
+            "Expression expected at file:///pg_typescript/input.ts:4:13"
         );
     }
 
