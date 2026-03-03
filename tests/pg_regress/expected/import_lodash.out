@@ -1,0 +1,19 @@
+-- very simple import-map test with lodash from esm.sh
+CREATE OR REPLACE FUNCTION ts_lodash_capitalize(name text) RETURNS text
+LANGUAGE typescript
+SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
+AS $$
+  return lodash.capitalize(name);
+$$;
+SELECT ts_lodash_capitalize('hello world') = 'Hello world' AS ok;
+ ok 
+----
+ t
+(1 row)
+
+SELECT ts_lodash_capitalize('POSTGRES') = 'Postgres' AS ok;
+ ok 
+----
+ t
+(1 row)
+

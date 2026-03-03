@@ -5,11 +5,10 @@ regress pg_version="pg18":
   cd {{justfile_directory()}}
   cargo pgrx regress {{pg_version}}
   for expected in tests/pg_regress/expected/*.out; do \
-    file="$$(basename "$$expected")"; \
-    diff -u "$$expected" "tests/pg_regress/results/$$file"; \
+    file="$(basename "$expected")"; \
+    diff -u "$expected" "tests/pg_regress/results/$file"; \
   done
 
-# Run unit tests with verbose cargo output.
-unit-tests:
+test:
   cd {{justfile_directory()}}
   cargo test -v
