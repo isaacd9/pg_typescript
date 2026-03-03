@@ -1,0 +1,205 @@
+-- supported type mappings and round-trips
+
+CREATE OR REPLACE FUNCTION ts_typeof_int4(v integer) RETURNS text
+LANGUAGE typescript AS $$
+  return typeof v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_typeof_bool(v boolean) RETURNS text
+LANGUAGE typescript AS $$
+  return typeof v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_typeof_text(v text) RETURNS text
+LANGUAGE typescript AS $$
+  return typeof v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_typeof_jsonb(v jsonb) RETURNS text
+LANGUAGE typescript AS $$
+  return typeof v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_typeof_uuid(v uuid) RETURNS text
+LANGUAGE typescript AS $$
+  return typeof v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_typeof_bytea(v bytea) RETURNS text
+LANGUAGE typescript AS $$
+  return typeof v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_typeof_int4_array(v int[]) RETURNS text
+LANGUAGE typescript AS $$
+  return typeof v;
+$$;
+
+SELECT test, ok
+FROM (
+  VALUES
+    ('01_typeof_int4_number', ts_typeof_int4(7) = 'number'),
+    ('02_typeof_bool_boolean', ts_typeof_bool(true) = 'boolean'),
+    ('03_typeof_text_string', ts_typeof_text('x') = 'string'),
+    ('04_typeof_jsonb_object', ts_typeof_jsonb('{"a":1}'::jsonb) = 'object'),
+    ('05_typeof_uuid_string', ts_typeof_uuid('550e8400-e29b-41d4-a716-446655440000'::uuid) = 'string'),
+    ('06_typeof_bytea_string', ts_typeof_bytea(decode('DEADBEEF', 'hex')) = 'string'),
+    ('07_typeof_int4_array_string', ts_typeof_int4_array(ARRAY[1,2,3]) = 'string')
+) AS checks(test, ok)
+ORDER BY test;
+
+CREATE OR REPLACE FUNCTION ts_rt_int2(v smallint) RETURNS smallint
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_int4(v integer) RETURNS integer
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_int8(v bigint) RETURNS bigint
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_oid(v oid) RETURNS oid
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_float4(v real) RETURNS real
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_float8(v double precision) RETURNS double precision
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_bool(v boolean) RETURNS boolean
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_text(v text) RETURNS text
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_varchar(v varchar) RETURNS varchar
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_jsonb(v jsonb) RETURNS jsonb
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_bytea(v bytea) RETURNS bytea
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_date(v date) RETURNS date
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_time(v time) RETURNS time
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_timestamp(v timestamp) RETURNS timestamp
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_timestamptz(v timestamptz) RETURNS timestamptz
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_numeric(v numeric) RETURNS numeric
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_uuid(v uuid) RETURNS uuid
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_rt_int4_array(v int[]) RETURNS int[]
+LANGUAGE typescript AS $$
+  return v;
+$$;
+
+SELECT test, ok
+FROM (
+  VALUES
+    ('01_rt_int2_smallint', ts_rt_int2(7::smallint) = 7::smallint),
+    ('02_rt_int4_integer', ts_rt_int4(42) = 42),
+    ('03_rt_int4_null', ts_rt_int4(NULL) IS NULL),
+    ('04_rt_int8_bigint', ts_rt_int8(900719925474099::bigint) = 900719925474099::bigint),
+    ('05_rt_oid', ts_rt_oid(42::oid) = 42::oid),
+    ('06_rt_float4_real', abs(ts_rt_float4(3.25::real) - 3.25::real) < 0.0001),
+    ('07_rt_float8_double', abs(ts_rt_float8(3.25::double precision) - 3.25::double precision) < 1e-9),
+    ('08_rt_bool', ts_rt_bool(true) = true),
+    ('09_rt_text', ts_rt_text('hello') = 'hello'::text),
+    ('10_rt_varchar', ts_rt_varchar('hello'::varchar) = 'hello'::varchar),
+    ('11_rt_jsonb', ts_rt_jsonb('{"a":1,"b":[2,3]}'::jsonb) = '{"a":1,"b":[2,3]}'::jsonb),
+    ('12_rt_bytea', ts_rt_bytea(decode('DEADBEEF', 'hex')) = decode('DEADBEEF', 'hex')),
+    ('13_rt_date', ts_rt_date('2024-01-02'::date) = '2024-01-02'::date),
+    ('14_rt_time', ts_rt_time('12:34:56'::time) = '12:34:56'::time),
+    ('15_rt_timestamp', ts_rt_timestamp('2024-01-02 12:34:56'::timestamp) = '2024-01-02 12:34:56'::timestamp),
+    ('16_rt_timestamptz', ts_rt_timestamptz('2024-01-02 12:34:56+00'::timestamptz) = '2024-01-02 12:34:56+00'::timestamptz),
+    ('17_rt_numeric', ts_rt_numeric(12345.6789::numeric) = 12345.6789::numeric),
+    ('18_rt_uuid', ts_rt_uuid('550e8400-e29b-41d4-a716-446655440000'::uuid) = '550e8400-e29b-41d4-a716-446655440000'::uuid),
+    ('19_rt_int4_array', ts_rt_int4_array(ARRAY[1,2,3]) = ARRAY[1,2,3])
+) AS checks(test, ok)
+ORDER BY test;
+
+-- unsupported "natural JS shapes" should fail for strict scalar parsers
+CREATE OR REPLACE FUNCTION ts_assert_raises(stmt text) RETURNS bool
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE stmt;
+  RETURN false;
+EXCEPTION WHEN others THEN
+  RETURN true;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_bad_uuid() RETURNS uuid
+LANGUAGE typescript AS $$
+  return { nope: "x" };
+$$;
+
+CREATE OR REPLACE FUNCTION ts_bad_int4_array() RETURNS int[]
+LANGUAGE typescript AS $$
+  return { nope: "x" };
+$$;
+
+CREATE OR REPLACE FUNCTION ts_bad_date() RETURNS date
+LANGUAGE typescript AS $$
+  return { nope: "x" };
+$$;
+
+CREATE OR REPLACE FUNCTION ts_bad_timestamptz() RETURNS timestamptz
+LANGUAGE typescript AS $$
+  return { nope: "x" };
+$$;
+
+SELECT test, ok
+FROM (
+  VALUES
+    ('01_bad_uuid_raises', ts_assert_raises('SELECT ts_bad_uuid()')),
+    ('02_bad_int4_array_raises', ts_assert_raises('SELECT ts_bad_int4_array()')),
+    ('03_bad_date_raises', ts_assert_raises('SELECT ts_bad_date()')),
+    ('04_bad_timestamptz_raises', ts_assert_raises('SELECT ts_bad_timestamptz()'))
+) AS checks(test, ok)
+ORDER BY test;
