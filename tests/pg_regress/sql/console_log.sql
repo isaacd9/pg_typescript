@@ -1,0 +1,21 @@
+-- probe console.log behavior in the runtime
+CREATE OR REPLACE FUNCTION ts_console_log_probe() RETURNS text
+LANGUAGE typescript AS $$
+  if (typeof console === "undefined") {
+    return "console_missing";
+  }
+  const methods = ["debug", "log", "info", "warn", "error"];
+  for (const method of methods) {
+    if (typeof console[method] !== "function") {
+      return `missing_${method}`;
+    }
+  }
+  console.debug("debug from ts_console_log_probe");
+  console.log("log from ts_console_log_probe");
+  console.info("info from ts_console_log_probe");
+  console.warn("warn from ts_console_log_probe");
+  console.error("error from ts_console_log_probe");
+  return "console_methods_present";
+$$;
+
+SELECT ts_console_log_probe();
