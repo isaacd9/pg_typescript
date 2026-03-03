@@ -24,3 +24,14 @@ SELECT add(1, 2);
 ```bash
 cargo pgrx test pg18
 ```
+
+## Profile (Setup vs Execution)
+
+```bash
+just profile
+```
+
+This runs `tests/profiling/setup_vs_exec.sql`, which:
+- Creates a tiny `typescript` add function and a SQL baseline add function.
+- Measures one cold first call and 100 warm calls for each.
+- Prints summary stats (`avg`, `p50`, `p95`, `min`, `max`) in microseconds.
