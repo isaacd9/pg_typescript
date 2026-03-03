@@ -15,6 +15,9 @@ use node_resolver::{InNpmPackageChecker, NpmPackageFolderResolver, UrlOrPathRef}
 
 use crate::loader::PgModuleLoader;
 
+const STARTUP_SNAPSHOT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pg_typescript_runtime.snap"));
+
 thread_local! {
     static JS_RT: RefCell<Option<MainWorker>> = RefCell::new(None);
     static TOKIO_RT: RefCell<Option<tokio::runtime::Runtime>> = RefCell::new(None);
@@ -99,7 +102,8 @@ deno_core::extension!(
 
 const CONSOLE_HOOK_JS: &str = r#"
 (() => {
-  const op = globalThis?.__pg_op_console_log;
+  const op = globalThis?.Deno?.core?.ops?.op_pg_console_log
+    ?? globalThis?.__pg_op_console_log;
   if (typeof op !== "function" || typeof globalThis.console === "undefined") return;
 
   const stringify = (value) => {
@@ -235,6 +239,7 @@ fn create_runtime() -> MainWorker {
         &main_module,
         services,
         WorkerOptions {
+            startup_snapshot: Some(STARTUP_SNAPSHOT),
             extensions: vec![
                 pg_typescript_runtime_state::init(),
                 pg_typescript_console::init(),
