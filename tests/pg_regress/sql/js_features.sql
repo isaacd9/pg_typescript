@@ -1,0 +1,67 @@
+-- destructuring + defaults + nullish coalescing
+CREATE OR REPLACE FUNCTION ts_js_destructure(payload jsonb) RETURNS int
+LANGUAGE typescript AS $$
+  const { a = 1, b = 2, nested: { c = 3 } = {} } = payload ?? {};
+  return a + b + c;
+$$;
+
+SELECT ts_js_destructure('{"a": 5, "nested": {"c": 7}}') = 14 AS ok;
+SELECT ts_js_destructure('{}') = 6 AS ok;
+
+-- optional chaining + array pipeline + arrow functions
+CREATE OR REPLACE FUNCTION ts_js_array_pipeline(payload jsonb) RETURNS jsonb
+LANGUAGE typescript AS $$
+  const nums = Array.isArray(payload?.nums) ? payload.nums : [];
+  return nums
+    .filter((n) => Number.isFinite(n) && n % 2 === 0)
+    .map((n) => n * n);
+$$;
+
+SELECT ts_js_array_pipeline('{"nums": [1, 2, 3, 4, 5]}') = '[4, 16]'::jsonb AS ok;
+
+-- regex named groups + template literals + string normalization
+CREATE OR REPLACE FUNCTION ts_js_regex(name text) RETURNS text
+LANGUAGE typescript AS $$
+  const cleaned = name.trim().replace(/\s+/g, " ");
+  const match = cleaned.match(/^(?<first>[A-Za-z]+)\s+(?<last>[A-Za-z]+)$/);
+  if (!match?.groups) {
+    return `invalid:${cleaned.toLowerCase()}`;
+  }
+  const { first, last } = match.groups;
+  return `${last.toUpperCase()}, ${first}`;
+$$;
+
+SELECT ts_js_regex('  Ada   Lovelace  ') = 'LOVELACE, Ada' AS ok;
+SELECT ts_js_regex('Prince') = 'invalid:prince' AS ok;
+
+-- class + private fields + method chaining
+CREATE OR REPLACE FUNCTION ts_js_class_counter(seed int) RETURNS int
+LANGUAGE typescript AS $$
+  class Counter {
+    #value: number;
+    constructor(start: number) {
+      this.#value = start;
+    }
+    inc(step: number = 1): Counter {
+      this.#value += step;
+      return this;
+    }
+    value(): number {
+      return this.#value;
+    }
+  }
+  return new Counter(seed).inc().inc(2).value();
+$$;
+
+SELECT ts_js_class_counter(39) = 42 AS ok;
+
+-- async/await + Promise.all + Set + reduce
+CREATE OR REPLACE FUNCTION ts_js_async_set(payload jsonb) RETURNS int
+LANGUAGE typescript AS $$
+  const values = Array.isArray(payload?.values) ? payload.values : [];
+  const doubled = await Promise.all(values.map(async (v: number) => v * 2));
+  const unique = [...new Set(doubled)];
+  return unique.reduce((sum, n) => sum + n, 0);
+$$;
+
+SELECT ts_js_async_set('{"values": [1, 2, 2, 3]}') = 12 AS ok;
