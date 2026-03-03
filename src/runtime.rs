@@ -125,11 +125,8 @@ const CONSOLE_HOOK_JS: &str = r#"
 "#;
 
 fn install_console_hook(rt: &mut JsRuntime) {
-    rt.execute_script(
-        "pg_typescript:console_hook",
-        CONSOLE_HOOK_JS.to_string(),
-    )
-    .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to install console hook: {e}"));
+    rt.execute_script("pg_typescript:console_hook", CONSOLE_HOOK_JS.to_string())
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to install console hook: {e}"));
 }
 
 /// Re-apply the console hook in case runtime bootstrap code replaced console methods.
@@ -150,6 +147,14 @@ where
         let worker = borrow.as_mut().unwrap();
         f(&mut worker.js_runtime)
     })
+}
+
+/// Eagerly initialize the per-connection runtime.
+///
+/// This is used by `_PG_init` when `typescript.prewarm_runtime` is enabled so
+/// first function execution does not pay runtime bootstrap latency.
+pub fn prewarm_runtime() {
+    with_runtime(|_| ());
 }
 
 /// Apply effective permissions to the runtime before module load/evaluation.
@@ -218,21 +223,25 @@ fn create_runtime() -> MainWorker {
         node_services: None,
         npm_process_state_provider: None,
         permissions,
-        root_cert_store_provider: None,
+        root_cert_store_provider: Default::default(),
         fetch_dns_resolver: deno_runtime::deno_fetch::dns::Resolver::default(),
-        shared_array_buffer_store: None,
-        compiled_wasm_module_store: None,
-        v8_code_cache: None,
+        shared_array_buffer_store: Default::default(),
+        compiled_wasm_module_store: Default::default(),
+        v8_code_cache: Default::default(),
         bundle_provider: None,
     };
 
-    let mut worker = MainWorker::bootstrap_from_options(&main_module, services, WorkerOptions {
-        extensions: vec![
-            pg_typescript_runtime_state::init(),
-            pg_typescript_console::init(),
-        ],
-        ..Default::default()
-    });
+    let mut worker = MainWorker::bootstrap_from_options(
+        &main_module,
+        services,
+        WorkerOptions {
+            extensions: vec![
+                pg_typescript_runtime_state::init(),
+                pg_typescript_console::init(),
+            ],
+            ..Default::default()
+        },
+    );
 
     install_console_hook(&mut worker.js_runtime);
 

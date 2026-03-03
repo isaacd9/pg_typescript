@@ -56,6 +56,10 @@ pub(crate) static MAX_ALLOW_SYS_GUC: GucSetting<Option<std::ffi::CString>> =
 pub(crate) static MAX_ALLOW_IMPORT_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 
+/// If enabled, eagerly initialize the per-backend Deno runtime in `_PG_init`.
+/// This shifts cold-start latency from first function execution to extension load.
+pub(crate) static PREWARM_RUNTIME_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 // Register the GUC for per-function import maps.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
@@ -197,6 +201,20 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         GucContext::Suset,
         GucFlags::default(),
     );
+
+    GucRegistry::define_bool_guc(
+        c"typescript.prewarm_runtime",
+        c"Eagerly initialize pg_typescript runtime in each backend",
+        c"",
+        &PREWARM_RUNTIME_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+
+    // Don't initialize V8 in the postmaster process.
+    if PREWARM_RUNTIME_GUC.get() && unsafe { pg_sys::IsUnderPostmaster } {
+        runtime::prewarm_runtime();
+    }
 }
 
 // Internal schema, module cache table, and cleanup trigger.
