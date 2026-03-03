@@ -82,9 +82,15 @@ impl ModuleLoader for PgModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        // file:// specifiers are always our own main module being normalised by
-        // deno_core — pass through unconditionally.
+        // Only allow file:// for the loader entrypoint specifier (resolved with
+        // "." as the referrer by deno_core). Any nested file:// import from
+        // user code is rejected to prevent reaching synthetic fn_* modules.
         if specifier.starts_with("file://") {
+            if referrer != "." {
+                return Err(JsErrorBox::generic(format!(
+                    "pg_typescript: file:// imports are not allowed from function code: '{specifier}'"
+                )));
+            }
             return ModuleSpecifier::parse(specifier).map_err(JsErrorBox::from_err);
         }
 
@@ -263,6 +269,8 @@ fn should_transpile(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use deno_core::{ModuleLoader, ResolutionKind};
+
     use crate::fetch::{make_import_map, HashMapModuleStore, ModuleStore};
 
     /// Set up a loader context with the given import map entries and a
@@ -398,5 +406,34 @@ mod tests {
         let _ctx = make_ctx(&[], HashMapModuleStore::new());
 
         assert!(super::resolve_from_dep("unknown", "https://esm.sh/pkg/index.js").is_err());
+    }
+
+    #[test]
+    fn resolve_file_root_allowed() {
+        let loader = super::PgModuleLoader;
+        let url = loader
+            .resolve(
+                "file:///pg_typescript/fn_1_deadbeefdeadbeef.ts",
+                ".",
+                ResolutionKind::Import,
+            )
+            .unwrap();
+        assert_eq!(url.as_str(), "file:///pg_typescript/fn_1_deadbeefdeadbeef.ts");
+    }
+
+    #[test]
+    fn resolve_file_from_function_rejected() {
+        let loader = super::PgModuleLoader;
+        let err = loader
+            .resolve(
+                "file:///pg_typescript/fn_2_deadbeefdeadbeef.ts",
+                "file:///pg_typescript/fn_1_deadbeefdeadbeef.ts",
+                ResolutionKind::Import,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("file:// imports are not allowed"),
+            "unexpected error: {err}"
+        );
     }
 }
