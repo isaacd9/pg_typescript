@@ -1,6 +1,7 @@
 # pg_typescript
 
-JavaScript functions in PostgreSQL via Deno/V8.
+This is a postgres extension, build with `pgrx` in Rust that allows users to run
+TypeScript functions in PostgreSQL via Deno/V8.
 
 ## Run
 
