@@ -25,6 +25,20 @@ SELECT add(1, 2);
 cargo pgrx test pg18
 ```
 
+## PostgREST Example
+
+```bash
+just postgrest
+```
+
+This starts local `pg18`, recreates a fresh `postgrest_demo` database, resets
+the demo roles (`web_anon`, `postgrest_authenticator`), applies
+`examples/postgrest/setup.sql`, and launches PostgREST on
+`http://127.0.0.1:3000`.
+
+See `examples/postgrest/README.md` for curl commands to insert rows and read
+auto-generated JSON payloads.
+
 ## Profile (Setup vs Execution)
 
 ```bash

@@ -22,3 +22,9 @@ profile pg_version="pg18":
   cargo pgrx start {{pg_version}}
   cargo pgrx install --features "{{pg_version}}" --no-default-features
   cargo pgrx connect {{pg_version}} < tests/profiling/setup_vs_exec.sql
+
+# Start PostgREST against the local pgrx Postgres instance.
+# Example: just postgrest
+postgrest pg_version="pg18" api_port="3000" db_name="postgrest_demo":
+  cd "{{justfile_directory()}}"
+  ./examples/postgrest/run.sh "{{pg_version}}" "{{api_port}}" "{{db_name}}"

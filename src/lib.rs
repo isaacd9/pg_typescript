@@ -230,6 +230,9 @@ pgrx::extension_sql!(
         PRIMARY KEY (function_oid, url)
     );
     REVOKE ALL ON deno_internal.deno_package_modules FROM PUBLIC;
+    -- Runtime function execution needs read-only access to cached module source.
+    GRANT USAGE ON SCHEMA deno_internal TO PUBLIC;
+    GRANT SELECT ON deno_internal.deno_package_modules TO PUBLIC;
 
     CREATE OR REPLACE FUNCTION deno_internal.cleanup_modules()
     RETURNS event_trigger LANGUAGE plpgsql AS $$
