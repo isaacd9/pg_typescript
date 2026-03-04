@@ -342,7 +342,11 @@ where
         let _runtime_zone = tracy_client::span!("execute_fn_runtime");
 
         ensure_console_hook(rt);
-        set_runtime_permissions(rt, permissions);
+        {
+            #[cfg(feature = "tracy")]
+            let _permissions_zone = tracy_client::span!("execute_fn_set_permissions");
+            set_runtime_permissions(rt, permissions);
+        }
         // Look up (oid, source_hash) in the per-connection cache.
         // Cache hit: skip module loading, compilation, and loader context setup entirely.
         let fn_global = {
@@ -375,22 +379,32 @@ where
                     inline_modules,
                 );
 
-                let module_id = block_on(rt.load_side_es_module(&specifier))
-                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
+                let module_id = {
+                    #[cfg(feature = "tracy")]
+                    let _module_load_zone = tracy_client::span!("execute_fn_module_load");
+                    block_on(rt.load_side_es_module(&specifier))
+                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"))
+                };
 
                 // Evaluate the module; future must be awaited so errors are not silently lost.
-                let evaluate = rt.mod_evaluate(module_id);
-                block_on(rt.with_event_loop_promise(evaluate, Default::default())).unwrap_or_else(
-                    |e| pgrx::error!("pg_typescript: module evaluation failed: {e}"),
-                );
+                {
+                    #[cfg(feature = "tracy")]
+                    let _module_eval_zone = tracy_client::span!("execute_fn_module_eval");
+                    let evaluate = rt.mod_evaluate(module_id);
+                    block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+                }
 
-                let namespace = rt
-                    .get_module_namespace(module_id)
-                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
-                let f = extract_default_export(rt, namespace);
-
-                FN_CACHE.with(|c| c.borrow_mut().insert((oid_raw, source_hash), f.clone()));
-                f
+                {
+                    #[cfg(feature = "tracy")]
+                    let _export_zone = tracy_client::span!("execute_fn_module_export");
+                    let namespace = rt
+                        .get_module_namespace(module_id)
+                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+                    let f = extract_default_export(rt, namespace);
+                    FN_CACHE.with(|c| c.borrow_mut().insert((oid_raw, source_hash), f.clone()));
+                    f
+                }
             }
         };
 
@@ -438,7 +452,11 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
         let _runtime_zone = tracy_client::span!("execute_inline_runtime");
 
         ensure_console_hook(rt);
-        set_runtime_permissions(rt, permissions);
+        {
+            #[cfg(feature = "tracy")]
+            let _permissions_zone = tracy_client::span!("execute_inline_set_permissions");
+            set_runtime_permissions(rt, permissions);
+        }
         let fn_global = {
             #[cfg(feature = "tracy")]
             let _cache_lookup_zone = tracy_client::span!("execute_inline_cache_lookup");
@@ -465,21 +483,31 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
                     inline_modules,
                 );
 
-                let module_id = block_on(rt.load_side_es_module(&specifier))
-                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
+                let module_id = {
+                    #[cfg(feature = "tracy")]
+                    let _module_load_zone = tracy_client::span!("execute_inline_module_load");
+                    block_on(rt.load_side_es_module(&specifier))
+                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"))
+                };
 
-                let evaluate = rt.mod_evaluate(module_id);
-                block_on(rt.with_event_loop_promise(evaluate, Default::default())).unwrap_or_else(
-                    |e| pgrx::error!("pg_typescript: module evaluation failed: {e}"),
-                );
+                {
+                    #[cfg(feature = "tracy")]
+                    let _module_eval_zone = tracy_client::span!("execute_inline_module_eval");
+                    let evaluate = rt.mod_evaluate(module_id);
+                    block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+                }
 
-                let namespace = rt
-                    .get_module_namespace(module_id)
-                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
-                let f = extract_default_export(rt, namespace);
-
-                FN_CACHE.with(|c| c.borrow_mut().insert((0u32, source_hash), f.clone()));
-                f
+                {
+                    #[cfg(feature = "tracy")]
+                    let _export_zone = tracy_client::span!("execute_inline_module_export");
+                    let namespace = rt
+                        .get_module_namespace(module_id)
+                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+                    let f = extract_default_export(rt, namespace);
+                    FN_CACHE.with(|c| c.borrow_mut().insert((0u32, source_hash), f.clone()));
+                    f
+                }
             }
         };
 
