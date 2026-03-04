@@ -1,7 +1,8 @@
 use pgrx::{pg_sys, FromDatum, IntoDatum};
-use serde::de::{Deserialize, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::de::{Deserialize, DeserializeSeed, Deserializer, Error, MapAccess, SeqAccess, Visitor};
 use serde::Serialize;
 use serde_json::Value;
+use std::convert::TryFrom;
 
 // ---------------------------------------------------------------------------
 // Serialize: direct Datum → V8 value (no JSON intermediary)
@@ -89,6 +90,34 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
         )
     }
 
+    fn visit_i8<E: serde::de::Error>(self, v: i8) -> Result<Self::Value, E> {
+        self.visit_i64(v as i64)
+    }
+
+    fn visit_i16<E: serde::de::Error>(self, v: i16) -> Result<Self::Value, E> {
+        self.visit_i64(v as i64)
+    }
+
+    fn visit_i32<E: serde::de::Error>(self, v: i32) -> Result<Self::Value, E> {
+        self.visit_i64(v as i64)
+    }
+
+    fn visit_u8<E: serde::de::Error>(self, v: u8) -> Result<Self::Value, E> {
+        self.visit_u64(v as u64)
+    }
+
+    fn visit_u16<E: serde::de::Error>(self, v: u16) -> Result<Self::Value, E> {
+        self.visit_u64(v as u64)
+    }
+
+    fn visit_u32<E: serde::de::Error>(self, v: u32) -> Result<Self::Value, E> {
+        self.visit_u64(v as u64)
+    }
+
+    fn visit_f32<E: serde::de::Error>(self, v: f32) -> Result<Self::Value, E> {
+        self.visit_f64(v as f64)
+    }
+
     // JS null / undefined
     fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
         Ok((pg_sys::Datum::from(0usize), true))
@@ -100,48 +129,99 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
     fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
         let datum = match self.oid {
             pg_sys::BOOLOID => v.into_datum().unwrap(),
-            pg_sys::TEXTOID | pg_sys::VARCHAROID => v.to_string().into_datum().unwrap(),
-            _ => (v as i32).into_datum().unwrap(),
+            pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::Bool(v)).into_datum().unwrap(),
+            oid if !is_strict_scalar_oid(oid) => input_fn_call(&v.to_string(), oid),
+            _ => return Err(E::custom(type_mismatch_message(self.oid, "boolean"))),
         };
         Ok((datum, false))
     }
 
     fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
         let datum = match self.oid {
-            pg_sys::INT2OID => (v as i16).into_datum().unwrap(),
-            pg_sys::INT4OID => (v as i32).into_datum().unwrap(),
+            pg_sys::INT2OID => i16::try_from(v)
+                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int2: {v}")))?
+                .into_datum()
+                .unwrap(),
+            pg_sys::INT4OID => i32::try_from(v)
+                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int4: {v}")))?
+                .into_datum()
+                .unwrap(),
             pg_sys::INT8OID => v.into_datum().unwrap(),
             pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
             pg_sys::FLOAT8OID => (v as f64).into_datum().unwrap(),
-            pg_sys::TEXTOID | pg_sys::VARCHAROID => v.to_string().into_datum().unwrap(),
-            pg_sys::BOOLOID => (v != 0).into_datum().unwrap(),
-            _ => input_fn_call(&v.to_string(), self.oid),
+            pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::from(v)).into_datum().unwrap(),
+            oid if !is_strict_scalar_oid(oid) => input_fn_call(&v.to_string(), oid),
+            _ => return Err(E::custom(type_mismatch_message(self.oid, "number"))),
         };
         Ok((datum, false))
     }
     fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
         let datum = match self.oid {
-            pg_sys::INT2OID => (v as i16).into_datum().unwrap(),
-            pg_sys::INT4OID => (v as i32).into_datum().unwrap(),
-            pg_sys::INT8OID => (v as i64).into_datum().unwrap(),
+            pg_sys::INT2OID => i16::try_from(v)
+                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int2: {v}")))?
+                .into_datum()
+                .unwrap(),
+            pg_sys::INT4OID => i32::try_from(v)
+                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int4: {v}")))?
+                .into_datum()
+                .unwrap(),
+            pg_sys::INT8OID => i64::try_from(v)
+                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int8: {v}")))?
+                .into_datum()
+                .unwrap(),
             pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
             pg_sys::FLOAT8OID => (v as f64).into_datum().unwrap(),
-            pg_sys::TEXTOID | pg_sys::VARCHAROID => v.to_string().into_datum().unwrap(),
-            pg_sys::BOOLOID => (v != 0).into_datum().unwrap(),
-            _ => input_fn_call(&v.to_string(), self.oid),
+            pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::from(v)).into_datum().unwrap(),
+            oid if !is_strict_scalar_oid(oid) => input_fn_call(&v.to_string(), oid),
+            _ => return Err(E::custom(type_mismatch_message(self.oid, "number"))),
         };
         Ok((datum, false))
     }
     fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
         let datum = match self.oid {
-            pg_sys::INT2OID => (v as i16).into_datum().unwrap(),
-            pg_sys::INT4OID => (v as i32).into_datum().unwrap(),
-            pg_sys::INT8OID => (v as i64).into_datum().unwrap(),
+            pg_sys::INT2OID => {
+                if !v.is_finite() || v.fract() != 0.0 {
+                    return Err(E::custom(format!(
+                        "pg_typescript: expected integral number for int2, got {v}"
+                    )));
+                }
+                let iv = i64::try_from(v as i128).map_err(|_| {
+                    E::custom(format!("pg_typescript: integer out of range for int2: {v}"))
+                })?;
+                i16::try_from(iv)
+                    .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int2: {v}")))?
+                    .into_datum()
+                    .unwrap()
+            }
+            pg_sys::INT4OID => {
+                if !v.is_finite() || v.fract() != 0.0 {
+                    return Err(E::custom(format!(
+                        "pg_typescript: expected integral number for int4, got {v}"
+                    )));
+                }
+                let iv = i64::try_from(v as i128).map_err(|_| {
+                    E::custom(format!("pg_typescript: integer out of range for int4: {v}"))
+                })?;
+                i32::try_from(iv)
+                    .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int4: {v}")))?
+                    .into_datum()
+                    .unwrap()
+            }
+            pg_sys::INT8OID => {
+                if !v.is_finite() || v.fract() != 0.0 {
+                    return Err(E::custom(format!(
+                        "pg_typescript: expected integral number for int8, got {v}"
+                    )));
+                }
+                let iv = i64::try_from(v as i128)
+                    .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int8: {v}")))?;
+                iv.into_datum().unwrap()
+            }
             pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
             pg_sys::FLOAT8OID => v.into_datum().unwrap(),
-            pg_sys::TEXTOID | pg_sys::VARCHAROID => v.to_string().into_datum().unwrap(),
-            pg_sys::BOOLOID => (v != 0.0).into_datum().unwrap(),
-            _ => input_fn_call(&v.to_string(), self.oid),
+            pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::from(v)).into_datum().unwrap(),
+            oid if !is_strict_scalar_oid(oid) => input_fn_call(&v.to_string(), oid),
+            _ => return Err(E::custom(type_mismatch_message(self.oid, "number"))),
         };
         Ok((datum, false))
     }
@@ -151,19 +231,9 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
             pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID => {
                 v.into_datum().unwrap()
             }
-            pg_sys::INT4OID => v.parse::<i32>().unwrap_or(0).into_datum().unwrap(),
-            pg_sys::INT8OID => v.parse::<i64>().unwrap_or(0).into_datum().unwrap(),
-            pg_sys::FLOAT8OID => v.parse::<f64>().unwrap_or(0.0).into_datum().unwrap(),
-            pg_sys::BOOLOID => matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "on")
-                .into_datum()
-                .unwrap(),
-            pg_sys::JSONOID | pg_sys::JSONBOID => {
-                let jb = pgrx::JsonB(
-                    serde_json::from_str(v).unwrap_or_else(|_| Value::String(v.to_owned())),
-                );
-                jb.into_datum().unwrap()
-            }
-            _ => input_fn_call(v, self.oid),
+            pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::String(v.to_owned())).into_datum().unwrap(),
+            oid if !is_strict_scalar_oid(oid) => input_fn_call(v, oid),
+            _ => return Err(E::custom(type_mismatch_message(self.oid, "string"))),
         };
         Ok((datum, false))
     }
@@ -176,8 +246,8 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
         let value = Value::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
         let datum = match self.oid {
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(value).into_datum().unwrap(),
-            pg_sys::TEXTOID | pg_sys::VARCHAROID => value.to_string().into_datum().unwrap(),
-            _ => input_fn_call(&value.to_string(), self.oid),
+            oid if !is_strict_scalar_oid(oid) => input_fn_call(&value.to_string(), oid),
+            _ => return Err(A::Error::custom(type_mismatch_message(self.oid, "object"))),
         };
         Ok((datum, false))
     }
@@ -185,11 +255,54 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
         let value = Value::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
         let datum = match self.oid {
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(value).into_datum().unwrap(),
-            pg_sys::TEXTOID | pg_sys::VARCHAROID => value.to_string().into_datum().unwrap(),
-            _ => input_fn_call(&value.to_string(), self.oid),
+            oid if !is_strict_scalar_oid(oid) => input_fn_call(&value.to_string(), oid),
+            _ => return Err(A::Error::custom(type_mismatch_message(self.oid, "array"))),
         };
         Ok((datum, false))
     }
+}
+
+fn expected_sql_type(oid: pg_sys::Oid) -> &'static str {
+    match oid {
+        pg_sys::BOOLOID => "boolean",
+        pg_sys::INT2OID => "int2",
+        pg_sys::INT4OID => "int4",
+        pg_sys::INT8OID => "int8",
+        pg_sys::FLOAT4OID => "float4",
+        pg_sys::FLOAT8OID => "float8",
+        pg_sys::TEXTOID => "text",
+        pg_sys::VARCHAROID => "varchar",
+        pg_sys::BPCHAROID => "char",
+        pg_sys::NAMEOID => "name",
+        pg_sys::JSONOID => "json",
+        pg_sys::JSONBOID => "jsonb",
+        _ => "declared SQL return type",
+    }
+}
+
+fn type_mismatch_message(oid: pg_sys::Oid, got: &str) -> String {
+    format!(
+        "pg_typescript: return type mismatch: expected {}, got {got}",
+        expected_sql_type(oid)
+    )
+}
+
+fn is_strict_scalar_oid(oid: pg_sys::Oid) -> bool {
+    matches!(
+        oid,
+        pg_sys::BOOLOID
+            | pg_sys::INT2OID
+            | pg_sys::INT4OID
+            | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
+            | pg_sys::TEXTOID
+            | pg_sys::VARCHAROID
+            | pg_sys::BPCHAROID
+            | pg_sys::NAMEOID
+            | pg_sys::JSONOID
+            | pg_sys::JSONBOID
+    )
 }
 
 /// Call the type's output function to convert a datum to a string.

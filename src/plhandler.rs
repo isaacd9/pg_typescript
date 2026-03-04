@@ -674,6 +674,7 @@ fn read_function_config(proc: &PgProc, key: &str) -> Option<String> {
 #[cfg(test)]
 mod unit_tests {
     use crate::fetch::ModuleStore;
+    use pgrx::FromDatum;
     use serde_json::{json, Value};
 
     struct JsonSeed;
@@ -739,6 +740,26 @@ mod unit_tests {
             args,
             Default::default(),
             permissions,
+            crate::fetch::HashMapModuleStore::new(),
+        )
+    }
+
+    /// Run a function body and deserialize directly into a SQL return type via OID.
+    fn run_with_return_oid(
+        source: &str,
+        ret_oid: pgrx::pg_sys::Oid,
+    ) -> (pgrx::pg_sys::Datum, bool) {
+        let fn_oid = pgrx::pg_sys::Oid::from(0u32);
+        let params: Vec<String> = vec![];
+        let args: Vec<Value> = vec![];
+        super::execute_typescript_fn(
+            fn_oid,
+            source,
+            &Default::default(),
+            &super::RuntimePermissions::default(),
+            &params,
+            &args,
+            crate::convert::PgDatumSeed { oid: ret_oid },
             crate::fetch::HashMapModuleStore::new(),
         )
     }
@@ -1037,6 +1058,32 @@ mod unit_tests {
             ..Default::default()
         }
     );
+
+    // --- SQL return type strictness ----------------------------------------
+
+    #[test]
+    fn strict_sql_return_int4_ok() {
+        let (datum, is_null) = run_with_return_oid("return 42;", pgrx::pg_sys::INT4OID);
+        assert!(!is_null);
+        let out = unsafe { i32::from_datum(datum, false).expect("int4 datum should decode") };
+        assert_eq!(out, 42);
+    }
+
+    #[test]
+    fn strict_sql_return_bool_ok() {
+        let (datum, is_null) = run_with_return_oid("return true;", pgrx::pg_sys::BOOLOID);
+        assert!(!is_null);
+        let out = unsafe { bool::from_datum(datum, false).expect("bool datum should decode") };
+        assert!(out);
+    }
+
+    #[test]
+    fn strict_sql_return_bool_rejects_number() {
+        let err = std::panic::catch_unwind(|| {
+            let _ = run_with_return_oid("return 1;", pgrx::pg_sys::BOOLOID);
+        });
+        assert!(err.is_err(), "expected return type mismatch to panic");
+    }
 
     // --- module loading -----------------------------------------------------
 
