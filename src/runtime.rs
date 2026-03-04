@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Once;
 use std::sync::Arc;
 
 use deno_core::{op2, JsRuntime};
@@ -22,6 +23,8 @@ thread_local! {
     static JS_RT: RefCell<Option<MainWorker>> = RefCell::new(None);
     static TOKIO_RT: RefCell<Option<tokio::runtime::Runtime>> = RefCell::new(None);
 }
+
+static RUSTLS_PROVIDER_INIT: Once = Once::new();
 
 #[derive(Clone, Debug, Default)]
 pub struct RuntimePermissions {
@@ -194,6 +197,35 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     TOKIO_RT.with(|cell| cell.borrow().as_ref().unwrap().block_on(future))
 }
 
+/// Enter the per-connection Tokio runtime context while executing `f`.
+///
+/// This is needed for synchronous JS entrypoints that may invoke ops which
+/// call `tokio::spawn` before we later `block_on` the returned promise.
+pub fn with_tokio_context<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    TOKIO_RT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow.is_none() {
+            #[cfg(feature = "tracy")]
+            let _tokio_init_zone = tracy_client::span!("tokio_runtime_init");
+            *borrow = Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("pg_typescript: failed to create tokio runtime"),
+            );
+        }
+    });
+
+    TOKIO_RT.with(|cell| {
+        let borrow = cell.borrow();
+        let _guard = borrow.as_ref().unwrap().enter();
+        f()
+    })
+}
+
 fn build_permissions_container(permissions: &RuntimePermissions) -> PermissionsContainer {
     let parser = RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys);
     let options = PermissionsOptions {
@@ -216,6 +248,12 @@ fn build_permissions_container(permissions: &RuntimePermissions) -> PermissionsC
 }
 
 fn create_runtime() -> MainWorker {
+    RUSTLS_PROVIDER_INIT.call_once(|| {
+        // rustls 0.23 requires a process-level crypto provider before TLS use.
+        let _ = deno_runtime::deno_tls::rustls::crypto::aws_lc_rs::default_provider()
+            .install_default();
+    });
+
     #[cfg(feature = "tracy")]
     let _create_zone = tracy_client::span!("runtime_create_total");
 

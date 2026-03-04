@@ -14,7 +14,8 @@ use crate::fetch;
 use crate::loader;
 use crate::permissions::{read_function_permissions, read_inline_permissions};
 use crate::runtime::{
-    block_on, ensure_console_hook, set_runtime_permissions, with_runtime, RuntimePermissions,
+    block_on, ensure_console_hook, set_runtime_permissions, with_runtime, with_tokio_context,
+    RuntimePermissions,
 };
 
 // ---------------------------------------------------------------------------
@@ -411,7 +412,7 @@ where
         let promise_global = {
             #[cfg(feature = "tracy")]
             let _invoke_zone = tracy_client::span!("execute_fn_call");
-            call_fn_with_args(rt, fn_global, args)
+            with_tokio_context(|| call_fn_with_args(rt, fn_global, args))
         };
         let resolved = {
             #[cfg(feature = "tracy")]
@@ -977,6 +978,31 @@ mod unit_tests {
         ["name"],
         [json!("PATH")],
         Some(json!("denied"))
+    );
+    ts_test!(
+        permissions_net_fetch_example_com_denied_by_default,
+        "try { await fetch('https://example.com/'); return 'allowed'; } catch { return 'denied'; }",
+        [],
+        [],
+        Some(json!("denied"))
+    );
+    ts_test_with_permissions!(
+        permissions_net_fetch_example_com_allowed,
+        "try {
+           const res = await fetch('https://example.com/');
+           return res.status > 0;
+         } catch (e) {
+           // Network resolution/TLS can still fail in CI; ensure this is not
+           // a permissions rejection when allow_net includes example.com.
+           return !String(e).includes('Requires net access');
+         }",
+        [],
+        [],
+        Some(json!(true)),
+        super::RuntimePermissions {
+            allow_net: Some(vec!["example.com".to_string()]),
+            ..Default::default()
+        }
     );
     ts_test_with_permissions!(
         permissions_env_allow_all,
