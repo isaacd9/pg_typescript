@@ -6,6 +6,7 @@ pgrx::pg_module_magic!(name, version);
 mod convert;
 mod fetch;
 mod loader;
+mod permissions;
 mod plhandler;
 mod runtime;
 
@@ -59,7 +60,6 @@ pub(crate) static MAX_ALLOW_IMPORT_GUC: GucSetting<Option<std::ffi::CString>> =
 /// If enabled, eagerly initialize the per-backend Deno runtime in `_PG_init`.
 /// This shifts cold-start latency from first function execution to extension load.
 pub(crate) static PREWARM_RUNTIME_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
-pub(crate) static LOG_TIMING_GUC: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 // Register the GUC for per-function import maps.
 #[pg_guard]
@@ -214,15 +214,6 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::default(),
     );
-    GucRegistry::define_bool_guc(
-        c"typescript.log_timing",
-        c"Emit internal pg_typescript phase timings for profiling",
-        c"",
-        &LOG_TIMING_GUC,
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-
     // Don't initialize V8 in the postmaster process.
     if PREWARM_RUNTIME_GUC.get() && unsafe { pg_sys::IsUnderPostmaster } {
         runtime::prewarm_runtime();

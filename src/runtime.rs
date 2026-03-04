@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
 
 use deno_core::{op2, JsRuntime};
 use deno_runtime::deno_permissions::{
@@ -152,14 +151,7 @@ where
         if borrow.is_none() {
             #[cfg(feature = "tracy")]
             let _init_zone = tracy_client::span!("runtime_init");
-            let t0 = Instant::now();
             *borrow = Some(create_runtime());
-            if crate::LOG_TIMING_GUC.get() {
-                pgrx::info!(
-                    "pg_typescript: timing runtime_init_ms={:.3}",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
         }
         let worker = borrow.as_mut().unwrap();
         f(&mut worker.js_runtime)
@@ -190,19 +182,12 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
         if borrow.is_none() {
             #[cfg(feature = "tracy")]
             let _tokio_init_zone = tracy_client::span!("tokio_runtime_init");
-            let t0 = Instant::now();
             *borrow = Some(
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("pg_typescript: failed to create tokio runtime"),
             );
-            if crate::LOG_TIMING_GUC.get() {
-                pgrx::info!(
-                    "pg_typescript: timing tokio_runtime_init_ms={:.3}",
-                    t0.elapsed().as_secs_f64() * 1000.0
-                );
-            }
         }
     });
 

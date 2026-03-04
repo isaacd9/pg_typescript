@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::hash::{Hash, Hasher};
 
@@ -12,6 +12,7 @@ use pgrx::{fcinfo, pg_sys};
 use crate::convert::{PgDatum, PgDatumSeed};
 use crate::fetch;
 use crate::loader;
+use crate::permissions::{read_function_permissions, read_inline_permissions};
 use crate::runtime::{
     block_on, ensure_console_hook, set_runtime_permissions, with_runtime, RuntimePermissions,
 };
@@ -204,15 +205,14 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         let module_id = {
             #[cfg(feature = "tracy")]
             let _load_zone = tracy_client::span!("validator_module_load");
-            block_on(rt.load_side_es_module(&specifier))
-                .unwrap_or_else(|e| {
-                    // Only report the first line — the rest is a V8 stack trace that
-                    // contains an unstable OID/hash (e.g. "at file:///pg_typescript/fn_NNNN_...").
-                    let msg = e.to_string();
-                    let first_line = msg.lines().next().unwrap_or(&msg);
-                    let normalized = normalize_syntax_error_line(first_line);
-                    pgrx::error!("pg_typescript: syntax error: {normalized}");
-                })
+            block_on(rt.load_side_es_module(&specifier)).unwrap_or_else(|e| {
+                // Only report the first line — the rest is a V8 stack trace that
+                // contains an unstable OID/hash (e.g. "at file:///pg_typescript/fn_NNNN_...").
+                let msg = e.to_string();
+                let first_line = msg.lines().next().unwrap_or(&msg);
+                let normalized = normalize_syntax_error_line(first_line);
+                pgrx::error!("pg_typescript: syntax error: {normalized}");
+            })
         };
 
         {
@@ -630,239 +630,12 @@ fn read_inline_import_map() -> HashMap<String, String> {
     }
 }
 
-#[derive(Clone, Debug)]
-enum PermissionValue {
-    Deny,
-    AllowAll,
-    AllowList(Vec<String>),
-}
-
-impl Default for PermissionValue {
-    fn default() -> Self {
-        Self::Deny
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-struct PermissionSpec {
-    read: PermissionValue,
-    write: PermissionValue,
-    net: PermissionValue,
-    env: PermissionValue,
-    run: PermissionValue,
-    ffi: PermissionValue,
-    sys: PermissionValue,
-    import: PermissionValue,
-}
-
 fn read_function_config(proc: &PgProc, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
-    proc.proconfig().unwrap_or_default().into_iter().find_map(|kv| {
-        kv.strip_prefix(&prefix).map(|v| v.to_string())
-    })
-}
-
-fn read_function_permissions(proc: &PgProc) -> RuntimePermissions {
-    let requested = PermissionSpec {
-        read: parse_permission_setting(
-            read_function_config(proc, "typescript.allow_read"),
-            "function setting typescript.allow_read",
-        ),
-        write: parse_permission_setting(
-            read_function_config(proc, "typescript.allow_write"),
-            "function setting typescript.allow_write",
-        ),
-        net: parse_permission_setting(
-            read_function_config(proc, "typescript.allow_net"),
-            "function setting typescript.allow_net",
-        ),
-        env: parse_permission_setting(
-            read_function_config(proc, "typescript.allow_env"),
-            "function setting typescript.allow_env",
-        ),
-        run: parse_permission_setting(
-            read_function_config(proc, "typescript.allow_run"),
-            "function setting typescript.allow_run",
-        ),
-        ffi: parse_permission_setting(
-            read_function_config(proc, "typescript.allow_ffi"),
-            "function setting typescript.allow_ffi",
-        ),
-        sys: parse_permission_setting(
-            read_function_config(proc, "typescript.allow_sys"),
-            "function setting typescript.allow_sys",
-        ),
-        import: parse_permission_setting(
-            read_function_config(proc, "typescript.allow_import"),
-            "function setting typescript.allow_import",
-        ),
-    };
-
-    effective_permissions(requested, read_max_permissions())
-}
-
-fn read_inline_permissions() -> RuntimePermissions {
-    let requested = PermissionSpec {
-        read: parse_permission_setting(
-            guc_value(crate::ALLOW_READ_GUC.get()),
-            "GUC typescript.allow_read",
-        ),
-        write: parse_permission_setting(
-            guc_value(crate::ALLOW_WRITE_GUC.get()),
-            "GUC typescript.allow_write",
-        ),
-        net: parse_permission_setting(
-            guc_value(crate::ALLOW_NET_GUC.get()),
-            "GUC typescript.allow_net",
-        ),
-        env: parse_permission_setting(
-            guc_value(crate::ALLOW_ENV_GUC.get()),
-            "GUC typescript.allow_env",
-        ),
-        run: parse_permission_setting(
-            guc_value(crate::ALLOW_RUN_GUC.get()),
-            "GUC typescript.allow_run",
-        ),
-        ffi: parse_permission_setting(
-            guc_value(crate::ALLOW_FFI_GUC.get()),
-            "GUC typescript.allow_ffi",
-        ),
-        sys: parse_permission_setting(
-            guc_value(crate::ALLOW_SYS_GUC.get()),
-            "GUC typescript.allow_sys",
-        ),
-        import: parse_permission_setting(
-            guc_value(crate::ALLOW_IMPORT_GUC.get()),
-            "GUC typescript.allow_import",
-        ),
-    };
-
-    effective_permissions(requested, read_max_permissions())
-}
-
-fn read_max_permissions() -> PermissionSpec {
-    PermissionSpec {
-        read: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_READ_GUC.get()),
-            "GUC typescript.max_allow_read",
-        ),
-        write: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_WRITE_GUC.get()),
-            "GUC typescript.max_allow_write",
-        ),
-        net: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_NET_GUC.get()),
-            "GUC typescript.max_allow_net",
-        ),
-        env: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_ENV_GUC.get()),
-            "GUC typescript.max_allow_env",
-        ),
-        run: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_RUN_GUC.get()),
-            "GUC typescript.max_allow_run",
-        ),
-        ffi: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_FFI_GUC.get()),
-            "GUC typescript.max_allow_ffi",
-        ),
-        sys: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_SYS_GUC.get()),
-            "GUC typescript.max_allow_sys",
-        ),
-        import: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_IMPORT_GUC.get()),
-            "GUC typescript.max_allow_import",
-        ),
-    }
-}
-
-fn guc_value(value: Option<std::ffi::CString>) -> Option<String> {
-    value
-        .and_then(|cstr| cstr.to_str().ok().map(|s| s.to_string()))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn parse_permission_setting(raw: Option<String>, source: &str) -> PermissionValue {
-    let Some(value) = raw else {
-        return PermissionValue::Deny;
-    };
-
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "off" | "none" | "deny" | "false" | "0" => PermissionValue::Deny,
-        "*" | "all" | "on" | "true" | "1" => PermissionValue::AllowAll,
-        _ => PermissionValue::AllowList(parse_permission_list(&value, source)),
-    }
-}
-
-fn parse_permission_list(value: &str, source: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-
-    for raw in value.split(',') {
-        let item = raw.trim();
-        if item.is_empty() {
-            continue;
-        }
-        if seen.insert(item.to_string()) {
-            out.push(item.to_string());
-        }
-    }
-
-    if out.is_empty() {
-        pgrx::error!("pg_typescript: invalid empty permission list in {source}");
-    }
-
-    out
-}
-
-fn effective_permissions(requested: PermissionSpec, max: PermissionSpec) -> RuntimePermissions {
-    RuntimePermissions {
-        allow_read: to_runtime_allowlist(intersect_permission(requested.read, max.read)),
-        allow_write: to_runtime_allowlist(intersect_permission(requested.write, max.write)),
-        allow_net: to_runtime_allowlist(intersect_permission(requested.net, max.net)),
-        allow_env: to_runtime_allowlist(intersect_permission(requested.env, max.env)),
-        allow_run: to_runtime_allowlist(intersect_permission(requested.run, max.run)),
-        allow_ffi: to_runtime_allowlist(intersect_permission(requested.ffi, max.ffi)),
-        allow_sys: to_runtime_allowlist(intersect_permission(requested.sys, max.sys)),
-        allow_import: to_runtime_allowlist(intersect_permission(requested.import, max.import)),
-    }
-}
-
-fn intersect_permission(requested: PermissionValue, max: PermissionValue) -> PermissionValue {
-    match max {
-        PermissionValue::Deny => PermissionValue::Deny,
-        PermissionValue::AllowAll => requested,
-        PermissionValue::AllowList(max_list) => match requested {
-            PermissionValue::Deny => PermissionValue::Deny,
-            PermissionValue::AllowAll => PermissionValue::AllowList(max_list),
-            PermissionValue::AllowList(req_list) => {
-                let cap: HashSet<String> = max_list.into_iter().collect();
-                let mut out = Vec::new();
-                let mut seen = HashSet::new();
-                for item in req_list {
-                    if cap.contains(&item) && seen.insert(item.clone()) {
-                        out.push(item);
-                    }
-                }
-                if out.is_empty() {
-                    PermissionValue::Deny
-                } else {
-                    PermissionValue::AllowList(out)
-                }
-            }
-        },
-    }
-}
-
-fn to_runtime_allowlist(value: PermissionValue) -> Option<Vec<String>> {
-    match value {
-        PermissionValue::AllowAll => Some(vec![]),
-        PermissionValue::AllowList(values) => Some(values),
-        PermissionValue::Deny => None,
-    }
+    proc.proconfig()
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|kv| kv.strip_prefix(&prefix).map(|v| v.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -895,6 +668,7 @@ mod unit_tests {
         params: &[&str],
         args: &[Value],
         import_map: std::collections::HashMap<String, String>,
+        permissions: super::RuntimePermissions,
         store: crate::fetch::HashMapModuleStore,
     ) -> (Value, bool) {
         let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
@@ -903,7 +677,7 @@ mod unit_tests {
             fn_oid,
             source,
             &import_map,
-            &super::RuntimePermissions::default(),
+            &permissions,
             &param_names,
             args,
             JsonSeed,
@@ -918,6 +692,24 @@ mod unit_tests {
             params,
             args,
             Default::default(),
+            super::RuntimePermissions::default(),
+            crate::fetch::HashMapModuleStore::new(),
+        )
+    }
+
+    /// Run a function body with explicit runtime permissions.
+    fn run_with_permissions(
+        source: &str,
+        params: &[&str],
+        args: &[Value],
+        permissions: super::RuntimePermissions,
+    ) -> (Value, bool) {
+        run_impl(
+            source,
+            params,
+            args,
+            Default::default(),
+            permissions,
             crate::fetch::HashMapModuleStore::new(),
         )
     }
@@ -947,7 +739,29 @@ mod unit_tests {
                 let import_map = crate::fetch::make_import_map(&[$(($spec, $url)),*]);
                 let mut store = crate::fetch::HashMapModuleStore::new();
                 $( store.write(0, $murl, $msrc); )*
-                let (val, is_null) = run_impl($src, &[$($p),*], &args, import_map, store);
+                let (val, is_null) = run_impl(
+                    $src,
+                    &[$($p),*],
+                    &args,
+                    import_map,
+                    super::RuntimePermissions::default(),
+                    store,
+                );
+                let expected: Option<Value> = $expected;
+                match expected {
+                    Some(exp) => assert_eq!(val, exp),
+                    None => assert!(is_null),
+                }
+            }
+        };
+    }
+
+    macro_rules! ts_test_with_permissions {
+        ($name:ident, $src:expr, [$($p:literal),*], [$($a:expr),*], $expected:expr, $perms:expr) => {
+            #[test]
+            fn $name() {
+                let args: Vec<Value> = vec![$($a),*];
+                let (val, is_null) = run_with_permissions($src, &[$($p),*], &args, $perms);
                 let expected: Option<Value> = $expected;
                 match expected {
                     Some(exp) => assert_eq!(val, exp),
@@ -964,10 +778,9 @@ mod unit_tests {
         use crate::runtime::{block_on, with_runtime};
         let module_source = super::assemble_module("const x = ;", &Default::default(), "");
         let hash = super::hash_str(&module_source);
-        let specifier = deno_core::resolve_url(&format!(
-            "file:///pg_typescript/test_syntax_{hash:016x}.ts"
-        ))
-        .unwrap();
+        let specifier =
+            deno_core::resolve_url(&format!("file:///pg_typescript/test_syntax_{hash:016x}.ts"))
+                .unwrap();
         let result = with_runtime(|rt| {
             let _ctx = crate::loader::set_loader_context(
                 0,
@@ -1126,6 +939,49 @@ mod unit_tests {
         ["n"],
         [json!(7)],
         Some(json!({ "original": 7, "doubled": 14 }))
+    );
+
+    // --- runtime permissions -----------------------------------------------
+
+    ts_test!(
+        permissions_env_denied_by_default,
+        "try { Deno.env.get(name); return 'allowed'; } catch { return 'denied'; }",
+        ["name"],
+        [json!("PATH")],
+        Some(json!("denied"))
+    );
+    ts_test_with_permissions!(
+        permissions_env_allow_all,
+        "try { Deno.env.get(name); return 'allowed'; } catch { return 'denied'; }",
+        ["name"],
+        [json!("PATH")],
+        Some(json!("allowed")),
+        super::RuntimePermissions {
+            allow_env: Some(vec![]),
+            ..Default::default()
+        }
+    );
+    ts_test_with_permissions!(
+        permissions_env_allow_list_hit,
+        "try { Deno.env.get(name); return 'allowed'; } catch { return 'denied'; }",
+        ["name"],
+        [json!("PATH")],
+        Some(json!("allowed")),
+        super::RuntimePermissions {
+            allow_env: Some(vec!["PATH".to_string()]),
+            ..Default::default()
+        }
+    );
+    ts_test_with_permissions!(
+        permissions_env_allow_list_miss,
+        "try { Deno.env.get(name); return 'allowed'; } catch { return 'denied'; }",
+        ["name"],
+        [json!("USER")],
+        Some(json!("denied")),
+        super::RuntimePermissions {
+            allow_env: Some(vec!["PATH".to_string()]),
+            ..Default::default()
+        }
     );
 
     // --- module loading -----------------------------------------------------

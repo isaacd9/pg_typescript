@@ -1,0 +1,55 @@
+-- function-level allow_* should be intersected with session max_allow_* caps
+CREATE OR REPLACE FUNCTION ts_perm_env_any(name text) RETURNS boolean
+LANGUAGE typescript
+SET typescript.allow_env = '*'
+AS $$
+  try {
+    Deno.env.get(name);
+    return true;
+  } catch (_) {
+    return false;
+  }
+$$;
+
+CREATE OR REPLACE FUNCTION ts_perm_env_user_only(name text) RETURNS boolean
+LANGUAGE typescript
+SET typescript.allow_env = 'USER'
+AS $$
+  try {
+    Deno.env.get(name);
+    return true;
+  } catch (_) {
+    return false;
+  }
+$$;
+
+CREATE OR REPLACE FUNCTION ts_perm_env_off(name text) RETURNS boolean
+LANGUAGE typescript
+SET typescript.allow_env = 'off'
+AS $$
+  try {
+    Deno.env.get(name);
+    return true;
+  } catch (_) {
+    return false;
+  }
+$$;
+
+RESET typescript.max_allow_env;
+SELECT ts_perm_env_any('PATH') = false AS max_none_denies;
+
+SET typescript.max_allow_env = '*';
+SELECT ts_perm_env_any('PATH') = true AS max_all_allows;
+SELECT ts_perm_env_off('PATH') = false AS request_off_still_denies;
+
+SET typescript.max_allow_env = 'PATH';
+SELECT ts_perm_env_any('PATH') = true AS max_list_allows_intersection;
+SELECT ts_perm_env_user_only('USER') = false AS max_list_blocks_non_intersection;
+
+SET typescript.max_allow_env = 'PATH,USER';
+SELECT ts_perm_env_user_only('USER') = true AS max_list_allows_overlap;
+
+SET typescript.max_allow_env = 'off';
+SELECT ts_perm_env_any('PATH') = false AS max_off_denies;
+
+RESET typescript.max_allow_env;
