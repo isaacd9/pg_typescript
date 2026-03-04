@@ -64,9 +64,6 @@ pub(crate) static PREWARM_RUNTIME_GUC: GucSetting<bool> = GucSetting::<bool>::ne
 // Register the GUC for per-function import maps.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
-    #[cfg(feature = "tracy")]
-    let _tracy_client = tracy_client::Client::start();
-
     GucRegistry::define_string_guc(
         c"typescript.import_map",
         c"Deno-style import map JSON for pg_typescript functions, e.g. {\"imports\":{\"lodash\":\"https://esm.sh/lodash@4.17.23\"}}",
