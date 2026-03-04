@@ -59,10 +59,14 @@ pub(crate) static MAX_ALLOW_IMPORT_GUC: GucSetting<Option<std::ffi::CString>> =
 /// If enabled, eagerly initialize the per-backend Deno runtime in `_PG_init`.
 /// This shifts cold-start latency from first function execution to extension load.
 pub(crate) static PREWARM_RUNTIME_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
+pub(crate) static LOG_TIMING_GUC: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 // Register the GUC for per-function import maps.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
+    #[cfg(feature = "tracy")]
+    let _tracy_client = tracy_client::Client::start();
+
     GucRegistry::define_string_guc(
         c"typescript.import_map",
         c"Deno-style import map JSON for pg_typescript functions, e.g. {\"imports\":{\"lodash\":\"https://esm.sh/lodash@4.17.23\"}}",
@@ -207,6 +211,14 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         c"Eagerly initialize pg_typescript runtime in each backend",
         c"",
         &PREWARM_RUNTIME_GUC,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"typescript.log_timing",
+        c"Emit internal pg_typescript phase timings for profiling",
+        c"",
+        &LOG_TIMING_GUC,
         GucContext::Userset,
         GucFlags::default(),
     );

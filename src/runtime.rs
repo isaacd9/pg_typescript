@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use deno_core::{op2, JsRuntime};
 use deno_runtime::deno_permissions::{
@@ -143,10 +144,22 @@ pub fn with_runtime<F, R>(f: F) -> R
 where
     F: FnOnce(&mut JsRuntime) -> R,
 {
+    #[cfg(feature = "tracy")]
+    let _with_runtime_zone = tracy_client::span!("runtime_with_runtime");
+
     JS_RT.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if borrow.is_none() {
+            #[cfg(feature = "tracy")]
+            let _init_zone = tracy_client::span!("runtime_init");
+            let t0 = Instant::now();
             *borrow = Some(create_runtime());
+            if crate::LOG_TIMING_GUC.get() {
+                pgrx::info!(
+                    "pg_typescript: timing runtime_init_ms={:.3}",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
         let worker = borrow.as_mut().unwrap();
         f(&mut worker.js_runtime)
@@ -175,12 +188,21 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     TOKIO_RT.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if borrow.is_none() {
+            #[cfg(feature = "tracy")]
+            let _tokio_init_zone = tracy_client::span!("tokio_runtime_init");
+            let t0 = Instant::now();
             *borrow = Some(
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                     .expect("pg_typescript: failed to create tokio runtime"),
             );
+            if crate::LOG_TIMING_GUC.get() {
+                pgrx::info!(
+                    "pg_typescript: timing tokio_runtime_init_ms={:.3}",
+                    t0.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
     });
 
@@ -209,6 +231,9 @@ fn build_permissions_container(permissions: &RuntimePermissions) -> PermissionsC
 }
 
 fn create_runtime() -> MainWorker {
+    #[cfg(feature = "tracy")]
+    let _create_zone = tracy_client::span!("runtime_create_total");
+
     let permissions = build_permissions_container(&RuntimePermissions::default());
     let main_module = deno_core::resolve_url("file:///pg_typescript/runtime_bootstrap.mjs")
         .expect("pg_typescript: invalid runtime bootstrap specifier");
@@ -235,20 +260,29 @@ fn create_runtime() -> MainWorker {
         bundle_provider: None,
     };
 
-    let mut worker = MainWorker::bootstrap_from_options(
-        &main_module,
-        services,
-        WorkerOptions {
-            startup_snapshot: Some(STARTUP_SNAPSHOT),
-            extensions: vec![
-                pg_typescript_runtime_state::init(),
-                pg_typescript_console::init(),
-            ],
-            ..Default::default()
-        },
-    );
+    let mut worker = {
+        #[cfg(feature = "tracy")]
+        let _bootstrap_zone = tracy_client::span!("runtime_worker_bootstrap");
 
-    install_console_hook(&mut worker.js_runtime);
+        MainWorker::bootstrap_from_options(
+            &main_module,
+            services,
+            WorkerOptions {
+                startup_snapshot: Some(STARTUP_SNAPSHOT),
+                extensions: vec![
+                    pg_typescript_runtime_state::init(),
+                    pg_typescript_console::init(),
+                ],
+                ..Default::default()
+            },
+        )
+    };
+
+    {
+        #[cfg(feature = "tracy")]
+        let _console_hook_zone = tracy_client::span!("runtime_install_console_hook");
+        install_console_hook(&mut worker.js_runtime);
+    }
 
     worker
 }

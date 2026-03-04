@@ -52,6 +52,9 @@ pub extern "C" fn pg_finfo_typescript_validator() -> &'static pg_sys::Pg_finfo_r
 pub unsafe extern "C-unwind" fn typescript_call_handler(
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> pg_sys::Datum {
+    #[cfg(feature = "tracy")]
+    let _call_handler_zone = tracy_client::span!("call_handler_total");
+
     let fn_oid = unsafe { (*(*fcinfo).flinfo).fn_oid };
 
     let proc = PgProc::new(fn_oid).unwrap_or_else(|| {
@@ -121,6 +124,9 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
 pub unsafe extern "C-unwind" fn typescript_validator(
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> pg_sys::Datum {
+    #[cfg(feature = "tracy")]
+    let _validator_zone = tracy_client::span!("validator_total");
+
     // Postgres passes the to-be-validated function's OID as arg 0.
     let fn_oid: pg_sys::Oid =
         unsafe { pg_sys::Oid::from(fcinfo::pg_get_nullable_datum(fcinfo, 0).value.value() as u32) };
@@ -150,6 +156,8 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     // If the function declares an import map, fetch all dependencies now.
     #[cfg(not(test))]
     if !import_map.is_empty() {
+        #[cfg(feature = "tracy")]
+        let _fetch_zone = tracy_client::span!("validator_fetch_and_cache");
         fetch::fetch_and_cache(
             u32::from(fn_oid),
             &import_map,
@@ -160,7 +168,11 @@ pub unsafe extern "C-unwind" fn typescript_validator(
 
     // Assemble the same module source the call handler will use so that the
     // specifier and hash match and we can pre-warm FN_CACHE.
-    let module_source = assemble_module(&source, &import_map, &params);
+    let module_source = {
+        #[cfg(feature = "tracy")]
+        let _assemble_zone = tracy_client::span!("validator_assemble");
+        assemble_module(&source, &import_map, &params)
+    };
     let source_hash = hash_str(&module_source);
     let oid_raw = u32::from(fn_oid);
 
@@ -189,24 +201,36 @@ pub unsafe extern "C-unwind" fn typescript_validator(
             inline_modules,
         );
 
-        let module_id = block_on(rt.load_side_es_module(&specifier))
-            .unwrap_or_else(|e| {
-                // Only report the first line — the rest is a V8 stack trace that
-                // contains an unstable OID/hash (e.g. "at file:///pg_typescript/fn_NNNN_...").
-                let msg = e.to_string();
-                let first_line = msg.lines().next().unwrap_or(&msg);
-                let normalized = normalize_syntax_error_line(first_line);
-                pgrx::error!("pg_typescript: syntax error: {normalized}");
-            });
+        let module_id = {
+            #[cfg(feature = "tracy")]
+            let _load_zone = tracy_client::span!("validator_module_load");
+            block_on(rt.load_side_es_module(&specifier))
+                .unwrap_or_else(|e| {
+                    // Only report the first line — the rest is a V8 stack trace that
+                    // contains an unstable OID/hash (e.g. "at file:///pg_typescript/fn_NNNN_...").
+                    let msg = e.to_string();
+                    let first_line = msg.lines().next().unwrap_or(&msg);
+                    let normalized = normalize_syntax_error_line(first_line);
+                    pgrx::error!("pg_typescript: syntax error: {normalized}");
+                })
+        };
 
-        let evaluate = rt.mod_evaluate(module_id);
-        block_on(rt.with_event_loop_promise(evaluate, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+        {
+            #[cfg(feature = "tracy")]
+            let _eval_zone = tracy_client::span!("validator_module_eval");
+            let evaluate = rt.mod_evaluate(module_id);
+            block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+        }
 
-        let namespace = rt
-            .get_module_namespace(module_id)
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
-        let f = extract_default_export(rt, namespace);
+        let f = {
+            #[cfg(feature = "tracy")]
+            let _cache_zone = tracy_client::span!("validator_export_cache");
+            let namespace = rt
+                .get_module_namespace(module_id)
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+            extract_default_export(rt, namespace)
+        };
 
         FN_CACHE.with(|c| c.borrow_mut().insert((oid_raw, source_hash), f));
     });
@@ -223,6 +247,9 @@ pub unsafe extern "C-unwind" fn typescript_validator(
 pub unsafe extern "C-unwind" fn typescript_inline_handler(
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> pg_sys::Datum {
+    #[cfg(feature = "tracy")]
+    let _inline_handler_zone = tracy_client::span!("inline_handler_total");
+
     unsafe {
         let nd = fcinfo::pg_get_nullable_datum(fcinfo, 0);
         if nd.isnull {
@@ -298,21 +325,38 @@ where
     A: serde::Serialize,
     S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
 {
+    #[cfg(feature = "tracy")]
+    let _execute_zone = tracy_client::span!("execute_fn_total");
+
     let params = param_names.join(", ");
-    let module_source = assemble_module(source, import_map, &params);
+    let module_source = {
+        #[cfg(feature = "tracy")]
+        let _assemble_zone = tracy_client::span!("execute_fn_assemble_module");
+        assemble_module(source, import_map, &params)
+    };
     let source_hash = hash_str(&module_source);
     let oid_raw = u32::from(fn_oid);
 
     with_runtime(|rt| {
+        #[cfg(feature = "tracy")]
+        let _runtime_zone = tracy_client::span!("execute_fn_runtime");
+
         ensure_console_hook(rt);
         set_runtime_permissions(rt, permissions);
         // Look up (oid, source_hash) in the per-connection cache.
         // Cache hit: skip module loading, compilation, and loader context setup entirely.
-        let fn_global = FN_CACHE.with(|c| c.borrow().get(&(oid_raw, source_hash)).cloned());
+        let fn_global = {
+            #[cfg(feature = "tracy")]
+            let _cache_lookup_zone = tracy_client::span!("execute_fn_cache_lookup");
+            FN_CACHE.with(|c| c.borrow().get(&(oid_raw, source_hash)).cloned())
+        };
 
         let fn_global = match fn_global {
             Some(f) => f,
             None => {
+                #[cfg(feature = "tracy")]
+                let _cache_miss_zone = tracy_client::span!("execute_fn_cache_miss_pipeline");
+
                 // Set loader context only on cache miss — the module loader is
                 // only called during initial load, never when calling a cached function.
                 // Specifier is stable per (function, source version): ALTER FUNCTION changes
@@ -350,12 +394,24 @@ where
             }
         };
 
-        let promise_global = call_fn_with_args(rt, fn_global, args);
-        let resolve_fut = rt.resolve(promise_global);
-        let resolved = block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+        let promise_global = {
+            #[cfg(feature = "tracy")]
+            let _invoke_zone = tracy_client::span!("execute_fn_call");
+            call_fn_with_args(rt, fn_global, args)
+        };
+        let resolved = {
+            #[cfg(feature = "tracy")]
+            let _resolve_zone = tracy_client::span!("execute_fn_resolve");
+            let resolve_fut = rt.resolve(promise_global);
+            block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+        };
 
-        global_to(rt, resolved, seed)
+        {
+            #[cfg(feature = "tracy")]
+            let _deserialize_zone = tracy_client::span!("execute_fn_deserialize");
+            global_to(rt, resolved, seed)
+        }
     })
 }
 
@@ -367,17 +423,34 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
     permissions: &RuntimePermissions,
     store: MS,
 ) {
-    let module_source = assemble_module(source, import_map, "");
+    #[cfg(feature = "tracy")]
+    let _execute_zone = tracy_client::span!("execute_inline_total");
+
+    let module_source = {
+        #[cfg(feature = "tracy")]
+        let _assemble_zone = tracy_client::span!("execute_inline_assemble_module");
+        assemble_module(source, import_map, "")
+    };
     let source_hash = hash_str(&module_source);
 
     with_runtime(|rt| {
+        #[cfg(feature = "tracy")]
+        let _runtime_zone = tracy_client::span!("execute_inline_runtime");
+
         ensure_console_hook(rt);
         set_runtime_permissions(rt, permissions);
-        let fn_global = FN_CACHE.with(|c| c.borrow().get(&(0u32, source_hash)).cloned());
+        let fn_global = {
+            #[cfg(feature = "tracy")]
+            let _cache_lookup_zone = tracy_client::span!("execute_inline_cache_lookup");
+            FN_CACHE.with(|c| c.borrow().get(&(0u32, source_hash)).cloned())
+        };
 
         let fn_global = match fn_global {
             Some(f) => f,
             None => {
+                #[cfg(feature = "tracy")]
+                let _cache_miss_zone = tracy_client::span!("execute_inline_cache_miss_pipeline");
+
                 // Set loader context only on cache miss.
                 let specifier_str = format!("file:///pg_typescript/do_{source_hash:016x}.ts");
                 let specifier = deno_core::resolve_url(&specifier_str)
@@ -411,10 +484,19 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
         };
 
         let no_args: &[serde_json::Value] = &[];
-        let promise_global = call_fn_with_args(rt, fn_global, no_args);
-        let resolve_fut = rt.resolve(promise_global);
-        block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: event loop error in DO block: {e}"));
+        let promise_global = {
+            #[cfg(feature = "tracy")]
+            let _invoke_zone = tracy_client::span!("execute_inline_call");
+            call_fn_with_args(rt, fn_global, no_args)
+        };
+        {
+            #[cfg(feature = "tracy")]
+            let _resolve_zone = tracy_client::span!("execute_inline_resolve");
+            let resolve_fut = rt.resolve(promise_global);
+            block_on(rt.with_event_loop_promise(resolve_fut, Default::default())).unwrap_or_else(
+                |e| pgrx::error!("pg_typescript: event loop error in DO block: {e}"),
+            );
+        }
     });
 }
 
