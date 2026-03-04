@@ -38,8 +38,8 @@ pub(crate) static ALLOW_SYS_GUC: GucSetting<Option<std::ffi::CString>> =
 pub(crate) static ALLOW_IMPORT_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 
-/// Superuser caps for each permission. Effective permission is intersection of
-/// `allow_*` request and `max_allow_*` cap.
+/// Superuser caps for each permission. `allow_*` requests must be fully
+/// satisfiable by `max_allow_*`; otherwise execution fails with an error.
 pub(crate) static MAX_ALLOW_READ_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 pub(crate) static MAX_ALLOW_WRITE_GUC: GucSetting<Option<std::ffi::CString>> =

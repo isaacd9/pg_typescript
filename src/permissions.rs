@@ -68,7 +68,57 @@ pub(crate) fn read_function_permissions(proc: &PgProc) -> RuntimePermissions {
         ),
     };
 
-    effective_permissions(requested, read_max_permissions())
+    let max = read_max_permissions();
+    enforce_permission_cap(
+        &requested.read,
+        &max.read,
+        "function setting typescript.allow_read",
+        "GUC typescript.max_allow_read",
+    );
+    enforce_permission_cap(
+        &requested.write,
+        &max.write,
+        "function setting typescript.allow_write",
+        "GUC typescript.max_allow_write",
+    );
+    enforce_permission_cap(
+        &requested.net,
+        &max.net,
+        "function setting typescript.allow_net",
+        "GUC typescript.max_allow_net",
+    );
+    enforce_permission_cap(
+        &requested.env,
+        &max.env,
+        "function setting typescript.allow_env",
+        "GUC typescript.max_allow_env",
+    );
+    enforce_permission_cap(
+        &requested.run,
+        &max.run,
+        "function setting typescript.allow_run",
+        "GUC typescript.max_allow_run",
+    );
+    enforce_permission_cap(
+        &requested.ffi,
+        &max.ffi,
+        "function setting typescript.allow_ffi",
+        "GUC typescript.max_allow_ffi",
+    );
+    enforce_permission_cap(
+        &requested.sys,
+        &max.sys,
+        "function setting typescript.allow_sys",
+        "GUC typescript.max_allow_sys",
+    );
+    enforce_permission_cap(
+        &requested.import,
+        &max.import,
+        "function setting typescript.allow_import",
+        "GUC typescript.max_allow_import",
+    );
+
+    effective_permissions(requested, max)
 }
 
 pub(crate) fn read_inline_permissions() -> RuntimePermissions {
@@ -107,7 +157,57 @@ pub(crate) fn read_inline_permissions() -> RuntimePermissions {
         ),
     };
 
-    effective_permissions(requested, read_max_permissions())
+    let max = read_max_permissions();
+    enforce_permission_cap(
+        &requested.read,
+        &max.read,
+        "GUC typescript.allow_read",
+        "GUC typescript.max_allow_read",
+    );
+    enforce_permission_cap(
+        &requested.write,
+        &max.write,
+        "GUC typescript.allow_write",
+        "GUC typescript.max_allow_write",
+    );
+    enforce_permission_cap(
+        &requested.net,
+        &max.net,
+        "GUC typescript.allow_net",
+        "GUC typescript.max_allow_net",
+    );
+    enforce_permission_cap(
+        &requested.env,
+        &max.env,
+        "GUC typescript.allow_env",
+        "GUC typescript.max_allow_env",
+    );
+    enforce_permission_cap(
+        &requested.run,
+        &max.run,
+        "GUC typescript.allow_run",
+        "GUC typescript.max_allow_run",
+    );
+    enforce_permission_cap(
+        &requested.ffi,
+        &max.ffi,
+        "GUC typescript.allow_ffi",
+        "GUC typescript.max_allow_ffi",
+    );
+    enforce_permission_cap(
+        &requested.sys,
+        &max.sys,
+        "GUC typescript.allow_sys",
+        "GUC typescript.max_allow_sys",
+    );
+    enforce_permission_cap(
+        &requested.import,
+        &max.import,
+        "GUC typescript.allow_import",
+        "GUC typescript.max_allow_import",
+    );
+
+    effective_permissions(requested, max)
 }
 
 fn read_max_permissions() -> PermissionSpec {
@@ -199,6 +299,63 @@ fn effective_permissions(requested: PermissionSpec, max: PermissionSpec) -> Runt
         allow_sys: to_runtime_allowlist(intersect_permission(requested.sys, max.sys)),
         allow_import: to_runtime_allowlist(intersect_permission(requested.import, max.import)),
     }
+}
+
+fn enforce_permission_cap(
+    requested: &PermissionValue,
+    max: &PermissionValue,
+    requested_source: &str,
+    max_source: &str,
+) {
+    if let Some(detail) = unfulfillable_detail(requested, max) {
+        pgrx::error!("pg_typescript: {requested_source} cannot be fulfilled by {max_source}: {detail}");
+    }
+}
+
+fn unfulfillable_detail(requested: &PermissionValue, max: &PermissionValue) -> Option<String> {
+    match requested {
+        PermissionValue::Deny => None,
+        PermissionValue::AllowAll => match max {
+            PermissionValue::AllowAll => None,
+            PermissionValue::Deny => Some("requested '*' but cap is 'off'".to_string()),
+            PermissionValue::AllowList(max_list) => Some(format!(
+                "requested '*' but cap only allows {}",
+                format_permission_values(max_list),
+            )),
+        },
+        PermissionValue::AllowList(req_list) => match max {
+            PermissionValue::AllowAll => None,
+            PermissionValue::Deny => Some(format!(
+                "requested {} but cap is 'off'",
+                format_permission_values(req_list),
+            )),
+            PermissionValue::AllowList(max_list) => {
+                let cap: HashSet<String> = max_list.iter().cloned().collect();
+                let mut disallowed = Vec::new();
+                let mut seen = HashSet::new();
+
+                for item in req_list {
+                    if !cap.contains(item) && seen.insert(item.clone()) {
+                        disallowed.push(item.clone());
+                    }
+                }
+
+                if disallowed.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "requested {} includes disallowed values {}",
+                        format_permission_values(req_list),
+                        format_permission_values(&disallowed),
+                    ))
+                }
+            }
+        },
+    }
+}
+
+fn format_permission_values(values: &[String]) -> String {
+    format!("[{}]", values.join(","))
 }
 
 fn intersect_permission(requested: PermissionValue, max: PermissionValue) -> PermissionValue {
@@ -313,12 +470,12 @@ mod unit_tests {
     #[test]
     fn effective_permissions_enforces_cap() {
         let requested = PermissionSpec {
-            env: PermissionValue::AllowAll,
-            net: allow_list(&["example.com", "internal"]),
+            env: allow_list(&["PATH"]),
+            net: allow_list(&["internal"]),
             ..Default::default()
         };
         let max = PermissionSpec {
-            env: allow_list(&["PATH"]),
+            env: allow_list(&["PATH", "USER"]),
             net: allow_list(&["internal"]),
             ..Default::default()
         };
@@ -327,5 +484,34 @@ mod unit_tests {
         assert_eq!(out.allow_env, Some(vec!["PATH".to_string()]));
         assert_eq!(out.allow_net, Some(vec!["internal".to_string()]));
         assert_eq!(out.allow_read, None);
+    }
+
+    #[test]
+    fn unfulfillable_detail_rejects_wildcard_above_list_cap() {
+        assert_eq!(
+            unfulfillable_detail(&PermissionValue::AllowAll, &allow_list(&["PATH", "HOME"])),
+            Some("requested '*' but cap only allows [PATH,HOME]".to_string())
+        );
+    }
+
+    #[test]
+    fn unfulfillable_detail_rejects_partial_overlap() {
+        assert_eq!(
+            unfulfillable_detail(
+                &allow_list(&["USER", "PATH", "SHELL"]),
+                &allow_list(&["PATH", "HOME", "USER"])
+            ),
+            Some(
+                "requested [USER,PATH,SHELL] includes disallowed values [SHELL]".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn unfulfillable_detail_accepts_subset() {
+        assert_eq!(
+            unfulfillable_detail(&allow_list(&["USER", "PATH"]), &allow_list(&["PATH", "USER"])),
+            None
+        );
     }
 }

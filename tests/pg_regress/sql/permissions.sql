@@ -1,55 +1,90 @@
--- function-level allow_* should be intersected with session max_allow_* caps
-CREATE OR REPLACE FUNCTION ts_perm_env_any(name text) RETURNS boolean
-LANGUAGE typescript
-SET typescript.allow_env = '*'
-AS $$
-  try {
-    Deno.env.get(name);
-    return true;
-  } catch (_) {
-    return false;
-  }
+-- requested allow_* settings must be fully satisfiable by max_allow_* caps
+CREATE OR REPLACE FUNCTION ts_perm_stmt_fails_with(stmt text, needle text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE stmt;
+  RETURN false;
+EXCEPTION WHEN others THEN
+  RETURN position(needle in SQLERRM) > 0;
+END;
 $$;
-
-CREATE OR REPLACE FUNCTION ts_perm_env_user_only(name text) RETURNS boolean
-LANGUAGE typescript
-SET typescript.allow_env = 'USER'
-AS $$
-  try {
-    Deno.env.get(name);
-    return true;
-  } catch (_) {
-    return false;
-  }
-$$;
-
-CREATE OR REPLACE FUNCTION ts_perm_env_off(name text) RETURNS boolean
-LANGUAGE typescript
-SET typescript.allow_env = 'off'
-AS $$
-  try {
-    Deno.env.get(name);
-    return true;
-  } catch (_) {
-    return false;
-  }
-$$;
-
-RESET typescript.max_allow_env;
-SELECT ts_perm_env_any('PATH') = false AS max_none_denies;
 
 SET typescript.max_allow_env = '*';
-SELECT ts_perm_env_any('PATH') = true AS max_all_allows;
-SELECT ts_perm_env_off('PATH') = false AS request_off_still_denies;
 
-SET typescript.max_allow_env = 'PATH';
-SELECT ts_perm_env_any('PATH') = true AS max_list_allows_intersection;
-SELECT ts_perm_env_user_only('USER') = false AS max_list_blocks_non_intersection;
+CREATE OR REPLACE FUNCTION ts_perm_env_path_only(name text) RETURNS boolean
+LANGUAGE typescript
+SET typescript.allow_env = 'PATH'
+AS $$
+  try {
+    Deno.env.get(name);
+    return true;
+  } catch (_) {
+    return false;
+  }
+$$;
 
-SET typescript.max_allow_env = 'PATH,USER';
-SELECT ts_perm_env_user_only('USER') = true AS max_list_allows_overlap;
+SET typescript.max_allow_env = 'none';
+SELECT ts_perm_stmt_fails_with($sql$
+  CREATE OR REPLACE FUNCTION ts_perm_env_any(name text) RETURNS boolean
+  LANGUAGE typescript
+  SET typescript.allow_env = '*'
+  AS $fn$
+    return true;
+  $fn$;
+$sql$, 'cannot be fulfilled by') AS env_create_rejects_max_none;
 
-SET typescript.max_allow_env = 'off';
-SELECT ts_perm_env_any('PATH') = false AS max_off_denies;
+SET typescript.max_allow_net = 'example.com,deno.land';
+SELECT ts_perm_stmt_fails_with($sql$
+  CREATE OR REPLACE FUNCTION ts_perm_net_any(url text) RETURNS boolean
+  LANGUAGE typescript
+  SET typescript.allow_net = '*'
+  AS $fn$
+    return true;
+  $fn$;
+$sql$, 'cannot be fulfilled by') AS net_create_rejects_wildcard_outside_max;
 
+SELECT ts_perm_stmt_fails_with($sql$
+  CREATE OR REPLACE FUNCTION ts_perm_net_partial(url text) RETURNS boolean
+  LANGUAGE typescript
+  SET typescript.allow_net = 'example.com,google.com'
+  AS $fn$
+    return true;
+  $fn$;
+$sql$, 'disallowed values') AS net_create_rejects_partial_overlap;
+
+CREATE OR REPLACE FUNCTION ts_perm_net_example_only(url text) RETURNS boolean
+LANGUAGE typescript
+SET typescript.allow_net = 'example.com'
+AS $$
+  try {
+    const res = await fetch(url);
+    return res.status > 0;
+  } catch (e) {
+    // DNS/TLS can fail in CI; only fail on permission rejection.
+    return !String(e).includes('Requires net access');
+  }
+$$;
+
+SELECT ts_perm_net_example_only('https://example.com/') = true AS net_subset_allows_inside_max;
+SELECT ts_perm_net_example_only('https://deno.land/') = false AS net_subset_denies_non_requested;
+
+SET typescript.allow_net = '*';
+SELECT ts_perm_stmt_fails_with($sql$
+  DO $do$
+    const x = 40 + 2;
+    if (x !== 42) throw new Error('bad math');
+  $do$ LANGUAGE typescript;
+$sql$, 'cannot be fulfilled by') AS inline_rejects_unfulfillable_request;
+RESET typescript.allow_net;
+
+SET typescript.max_allow_env = '*';
+SELECT ts_perm_env_path_only('PATH') = true AS env_exec_allows_when_fulfillable;
+
+SET typescript.max_allow_env = 'none';
+SELECT ts_perm_stmt_fails_with(
+  $$SELECT ts_perm_env_path_only('PATH');$$,
+  'cannot be fulfilled by'
+) AS env_exec_rejects_after_cap_tightened;
+
+RESET typescript.max_allow_net;
 RESET typescript.max_allow_env;
