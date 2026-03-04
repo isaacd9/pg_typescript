@@ -17,7 +17,7 @@ LANGUAGE typescript AS $$
   return pair.right;
 $$;
 SELECT ts_types_ok(41);
- ts_types_ok
+ ts_types_ok 
 -------------
           42
 (1 row)
@@ -33,7 +33,7 @@ LANGUAGE typescript AS $$
   return x + step;
 $$;
 SELECT ts_enum_ok(40);
- ts_enum_ok
+ ts_enum_ok 
 ------------
          42
 (1 row)
@@ -124,3 +124,4 @@ ORDER BY test;
  02_reject_malformed_type  | t
  03_reject_unclosed_params | t
 (3 rows)
+

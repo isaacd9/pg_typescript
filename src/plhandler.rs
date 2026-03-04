@@ -4,9 +4,6 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::hash::{Hash, Hasher};
 
-use deno_ast::MediaType;
-use deno_ast::ParseParams;
-use deno_ast::SourceMapOption;
 use deno_core::v8;
 use pgrx::pg_catalog::pg_proc::PgProc;
 use pgrx::prelude::*;
@@ -15,7 +12,10 @@ use pgrx::{fcinfo, pg_sys};
 use crate::convert::{PgDatum, PgDatumSeed};
 use crate::fetch;
 use crate::loader;
-use crate::runtime::{block_on, with_runtime};
+use crate::permissions::{read_function_permissions, read_inline_permissions};
+use crate::runtime::{
+    block_on, ensure_console_hook, set_runtime_permissions, with_runtime, RuntimePermissions,
+};
 
 // ---------------------------------------------------------------------------
 // PostgreSQL V1 function-info records for our three PL handler entry points.
@@ -53,6 +53,9 @@ pub extern "C" fn pg_finfo_typescript_validator() -> &'static pg_sys::Pg_finfo_r
 pub unsafe extern "C-unwind" fn typescript_call_handler(
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> pg_sys::Datum {
+    #[cfg(feature = "tracy")]
+    let _call_handler_zone = tracy_client::span!("call_handler_total");
+
     let fn_oid = unsafe { (*(*fcinfo).flinfo).fn_oid };
 
     let proc = PgProc::new(fn_oid).unwrap_or_else(|| {
@@ -77,6 +80,7 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
         .collect();
 
     let import_map = read_import_map(&proc);
+    let permissions = read_function_permissions(&proc);
 
     let args: Vec<PgDatum> = (0..nargs)
         .map(|i| unsafe {
@@ -98,6 +102,7 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
         fn_oid,
         &source,
         &import_map,
+        &permissions,
         &param_names,
         &args,
         PgDatumSeed { oid: ret_type },
@@ -120,6 +125,9 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
 pub unsafe extern "C-unwind" fn typescript_validator(
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> pg_sys::Datum {
+    #[cfg(feature = "tracy")]
+    let _validator_zone = tracy_client::span!("validator_total");
+
     // Postgres passes the to-be-validated function's OID as arg 0.
     let fn_oid: pg_sys::Oid =
         unsafe { pg_sys::Oid::from(fcinfo::pg_get_nullable_datum(fcinfo, 0).value.value() as u32) };
@@ -144,10 +152,13 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         .collect();
     let params = param_names.join(", ");
     let import_map = read_import_map(&proc);
+    let permissions = read_function_permissions(&proc);
 
     // If the function declares an import map, fetch all dependencies now.
     #[cfg(not(test))]
     if !import_map.is_empty() {
+        #[cfg(feature = "tracy")]
+        let _fetch_zone = tracy_client::span!("validator_fetch_and_cache");
         fetch::fetch_and_cache(
             u32::from(fn_oid),
             &import_map,
@@ -156,10 +167,13 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         );
     }
 
-    // Assemble and transpile the same module source the call handler will use so that the
+    // Assemble the same module source the call handler will use so that the
     // specifier and hash match and we can pre-warm FN_CACHE.
-    let module_source = assemble_module(&source, &import_map, &params);
-    let module_source = transpile_module(&module_source);
+    let module_source = {
+        #[cfg(feature = "tracy")]
+        let _assemble_zone = tracy_client::span!("validator_assemble");
+        assemble_module(&source, &import_map, &params)
+    };
     let source_hash = hash_str(&module_source);
     let oid_raw = u32::from(fn_oid);
 
@@ -172,30 +186,51 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     // (not main) lets multiple functions coexist in the same long-lived runtime.
     // V8 always eagerly parses ES module bodies, so syntax errors are caught here.
     // Pre-warming FN_CACHE means the first SELECT call skips module loading entirely.
-    let specifier_str = format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.mjs");
+    let specifier_str = format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.ts");
     let specifier = deno_core::resolve_url(&specifier_str)
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
     with_runtime(|rt| {
-        let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), Box::new(store));
+        ensure_console_hook(rt);
+        set_runtime_permissions(rt, &permissions);
+        let mut inline_modules = HashMap::new();
+        inline_modules.insert(specifier_str.clone(), module_source.clone());
+        let _ctx = loader::set_loader_context_with_inline(
+            oid_raw,
+            import_map.clone(),
+            Box::new(store),
+            inline_modules,
+        );
 
-        let module_id = block_on(rt.load_side_es_module_from_code(&specifier, module_source))
-            .unwrap_or_else(|e| {
+        let module_id = {
+            #[cfg(feature = "tracy")]
+            let _load_zone = tracy_client::span!("validator_module_load");
+            block_on(rt.load_side_es_module(&specifier)).unwrap_or_else(|e| {
                 // Only report the first line — the rest is a V8 stack trace that
                 // contains an unstable OID/hash (e.g. "at file:///pg_typescript/fn_NNNN_...").
                 let msg = e.to_string();
                 let first_line = msg.lines().next().unwrap_or(&msg);
-                pgrx::error!("pg_typescript: syntax error: {first_line}");
-            });
+                let normalized = normalize_syntax_error_line(first_line);
+                pgrx::error!("pg_typescript: syntax error: {normalized}");
+            })
+        };
 
-        let evaluate = rt.mod_evaluate(module_id);
-        block_on(rt.with_event_loop_promise(evaluate, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+        {
+            #[cfg(feature = "tracy")]
+            let _eval_zone = tracy_client::span!("validator_module_eval");
+            let evaluate = rt.mod_evaluate(module_id);
+            block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+        }
 
-        let namespace = rt
-            .get_module_namespace(module_id)
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
-        let f = extract_default_export(rt, namespace);
+        let f = {
+            #[cfg(feature = "tracy")]
+            let _cache_zone = tracy_client::span!("validator_export_cache");
+            let namespace = rt
+                .get_module_namespace(module_id)
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+            extract_default_export(rt, namespace)
+        };
 
         FN_CACHE.with(|c| c.borrow_mut().insert((oid_raw, source_hash), f));
     });
@@ -212,6 +247,9 @@ pub unsafe extern "C-unwind" fn typescript_validator(
 pub unsafe extern "C-unwind" fn typescript_inline_handler(
     fcinfo: pg_sys::FunctionCallInfo,
 ) -> pg_sys::Datum {
+    #[cfg(feature = "tracy")]
+    let _inline_handler_zone = tracy_client::span!("inline_handler_total");
+
     unsafe {
         let nd = fcinfo::pg_get_nullable_datum(fcinfo, 0);
         if nd.isnull {
@@ -224,6 +262,7 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             .to_string();
 
         let import_map = read_inline_import_map();
+        let permissions = read_inline_permissions();
 
         // Fetch and cache all dependencies before execution — network access
         // happens here, never during the execute step.
@@ -242,7 +281,7 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
         #[cfg(test)]
         let store = fetch::HashMapModuleStore::new();
 
-        execute_inline_block(&source, &import_map, store);
+        execute_inline_block(&source, &import_map, &permissions, store);
         fcinfo::pg_return_void()
     }
 }
@@ -275,6 +314,7 @@ fn execute_typescript_fn<MS, A, S, R>(
     fn_oid: pg_sys::Oid,
     source: &str,
     import_map: &HashMap<String, String>,
+    permissions: &RuntimePermissions,
     param_names: &[String],
     args: &[A],
     seed: S,
@@ -285,34 +325,58 @@ where
     A: serde::Serialize,
     S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
 {
+    #[cfg(feature = "tracy")]
+    let _execute_zone = tracy_client::span!("execute_fn_total");
+
     let params = param_names.join(", ");
-    let module_source = assemble_module(source, import_map, &params);
-    let module_source = transpile_module(&module_source);
+    let module_source = {
+        #[cfg(feature = "tracy")]
+        let _assemble_zone = tracy_client::span!("execute_fn_assemble_module");
+        assemble_module(source, import_map, &params)
+    };
     let source_hash = hash_str(&module_source);
     let oid_raw = u32::from(fn_oid);
 
     with_runtime(|rt| {
+        #[cfg(feature = "tracy")]
+        let _runtime_zone = tracy_client::span!("execute_fn_runtime");
+
+        ensure_console_hook(rt);
+        set_runtime_permissions(rt, permissions);
         // Look up (oid, source_hash) in the per-connection cache.
         // Cache hit: skip module loading, compilation, and loader context setup entirely.
-        let fn_global = FN_CACHE.with(|c| c.borrow().get(&(oid_raw, source_hash)).cloned());
+        let fn_global = {
+            #[cfg(feature = "tracy")]
+            let _cache_lookup_zone = tracy_client::span!("execute_fn_cache_lookup");
+            FN_CACHE.with(|c| c.borrow().get(&(oid_raw, source_hash)).cloned())
+        };
 
         let fn_global = match fn_global {
             Some(f) => f,
             None => {
+                #[cfg(feature = "tracy")]
+                let _cache_miss_zone = tracy_client::span!("execute_fn_cache_miss_pipeline");
+
                 // Set loader context only on cache miss — the module loader is
                 // only called during initial load, never when calling a cached function.
-                let _ctx = loader::set_loader_context(oid_raw, import_map.clone(), Box::new(store));
-
                 // Specifier is stable per (function, source version): ALTER FUNCTION changes
                 // the source, which changes the hash and therefore triggers a fresh load.
                 let specifier_str =
-                    format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.mjs");
+                    format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.ts");
                 let specifier = deno_core::resolve_url(&specifier_str)
                     .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
-                let module_id =
-                    block_on(rt.load_side_es_module_from_code(&specifier, module_source))
-                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
+                let mut inline_modules = HashMap::new();
+                inline_modules.insert(specifier_str, module_source.clone());
+                let _ctx = loader::set_loader_context_with_inline(
+                    oid_raw,
+                    import_map.clone(),
+                    Box::new(store),
+                    inline_modules,
+                );
+
+                let module_id = block_on(rt.load_side_es_module(&specifier))
+                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
 
                 // Evaluate the module; future must be awaited so errors are not silently lost.
                 let evaluate = rt.mod_evaluate(module_id);
@@ -330,12 +394,24 @@ where
             }
         };
 
-        let promise_global = call_fn_with_args(rt, fn_global, args);
-        let resolve_fut = rt.resolve(promise_global);
-        let resolved = block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+        let promise_global = {
+            #[cfg(feature = "tracy")]
+            let _invoke_zone = tracy_client::span!("execute_fn_call");
+            call_fn_with_args(rt, fn_global, args)
+        };
+        let resolved = {
+            #[cfg(feature = "tracy")]
+            let _resolve_zone = tracy_client::span!("execute_fn_resolve");
+            let resolve_fut = rt.resolve(promise_global);
+            block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+        };
 
-        global_to(rt, resolved, seed)
+        {
+            #[cfg(feature = "tracy")]
+            let _deserialize_zone = tracy_client::span!("execute_fn_deserialize");
+            global_to(rt, resolved, seed)
+        }
     })
 }
 
@@ -344,28 +420,53 @@ where
 fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
     source: &str,
     import_map: &HashMap<String, String>,
+    permissions: &RuntimePermissions,
     store: MS,
 ) {
-    let module_source = assemble_module(source, import_map, "");
-    let module_source = transpile_module(&module_source);
+    #[cfg(feature = "tracy")]
+    let _execute_zone = tracy_client::span!("execute_inline_total");
+
+    let module_source = {
+        #[cfg(feature = "tracy")]
+        let _assemble_zone = tracy_client::span!("execute_inline_assemble_module");
+        assemble_module(source, import_map, "")
+    };
     let source_hash = hash_str(&module_source);
 
     with_runtime(|rt| {
-        let fn_global = FN_CACHE.with(|c| c.borrow().get(&(0u32, source_hash)).cloned());
+        #[cfg(feature = "tracy")]
+        let _runtime_zone = tracy_client::span!("execute_inline_runtime");
+
+        ensure_console_hook(rt);
+        set_runtime_permissions(rt, permissions);
+        let fn_global = {
+            #[cfg(feature = "tracy")]
+            let _cache_lookup_zone = tracy_client::span!("execute_inline_cache_lookup");
+            FN_CACHE.with(|c| c.borrow().get(&(0u32, source_hash)).cloned())
+        };
 
         let fn_global = match fn_global {
             Some(f) => f,
             None => {
-                // Set loader context only on cache miss.
-                let _ctx = loader::set_loader_context(0u32, import_map.clone(), Box::new(store));
+                #[cfg(feature = "tracy")]
+                let _cache_miss_zone = tracy_client::span!("execute_inline_cache_miss_pipeline");
 
-                let specifier_str = format!("file:///pg_typescript/do_{source_hash:016x}.mjs");
+                // Set loader context only on cache miss.
+                let specifier_str = format!("file:///pg_typescript/do_{source_hash:016x}.ts");
                 let specifier = deno_core::resolve_url(&specifier_str)
                     .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
 
-                let module_id =
-                    block_on(rt.load_side_es_module_from_code(&specifier, module_source))
-                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
+                let mut inline_modules = HashMap::new();
+                inline_modules.insert(specifier_str, module_source.clone());
+                let _ctx = loader::set_loader_context_with_inline(
+                    0u32,
+                    import_map.clone(),
+                    Box::new(store),
+                    inline_modules,
+                );
+
+                let module_id = block_on(rt.load_side_es_module(&specifier))
+                    .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
 
                 let evaluate = rt.mod_evaluate(module_id);
                 block_on(rt.with_event_loop_promise(evaluate, Default::default())).unwrap_or_else(
@@ -383,10 +484,19 @@ fn execute_inline_block<MS: fetch::ModuleStore + 'static>(
         };
 
         let no_args: &[serde_json::Value] = &[];
-        let promise_global = call_fn_with_args(rt, fn_global, no_args);
-        let resolve_fut = rt.resolve(promise_global);
-        block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: event loop error in DO block: {e}"));
+        let promise_global = {
+            #[cfg(feature = "tracy")]
+            let _invoke_zone = tracy_client::span!("execute_inline_call");
+            call_fn_with_args(rt, fn_global, no_args)
+        };
+        {
+            #[cfg(feature = "tracy")]
+            let _resolve_zone = tracy_client::span!("execute_inline_resolve");
+            let resolve_fut = rt.resolve(promise_global);
+            block_on(rt.with_event_loop_promise(resolve_fut, Default::default())).unwrap_or_else(
+                |e| pgrx::error!("pg_typescript: event loop error in DO block: {e}"),
+            );
+        }
     });
 }
 
@@ -416,47 +526,21 @@ fn assemble_module(body: &str, import_map: &HashMap<String, String>, params: &st
     module
 }
 
-/// Transpile TypeScript/TSX syntax to JavaScript. This does not type-check.
-fn transpile_module(source: &str) -> String {
-    let specifier = deno_core::resolve_url("file:///pg_typescript/input.ts")
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid transpile specifier: {e}"));
+/// Replace synthetic function specifiers with a stable placeholder path.
+fn normalize_syntax_error_line(line: &str) -> String {
+    let mut out = line
+        .strip_prefix("Uncaught SyntaxError: ")
+        .unwrap_or(line)
+        .to_string();
 
-    let parsed = deno_ast::parse_module(ParseParams {
-        specifier,
-        text: source.into(),
-        media_type: MediaType::TypeScript,
-        capture_tokens: false,
-        scope_analysis: false,
-        maybe_syntax: None,
-    })
-    .unwrap_or_else(|e| {
-        let msg = e.to_string();
-        let first_line = msg.lines().next().unwrap_or(&msg);
-        pgrx::error!("pg_typescript: syntax error: {first_line}");
-    });
+    if let Some(start) = out.find("file:///pg_typescript/") {
+        if let Some(end_rel) = out[start..].find(".ts:") {
+            let end = start + end_rel + 3;
+            out.replace_range(start..end, "file:///pg_typescript/input.ts");
+        }
+    }
 
-    parsed
-        .transpile(
-            &deno_ast::TranspileOptions {
-                imports_not_used_as_values: deno_ast::ImportsNotUsedAsValues::Remove,
-                decorators: deno_ast::DecoratorsTranspileOption::Ecma,
-                ..Default::default()
-            },
-            &deno_ast::TranspileModuleOptions {
-                module_kind: Some(deno_ast::ModuleKind::Esm),
-            },
-            &deno_ast::EmitOptions {
-                source_map: SourceMapOption::None,
-                ..Default::default()
-            },
-        )
-        .unwrap_or_else(|e| {
-            let msg = e.to_string();
-            let first_line = msg.lines().next().unwrap_or(&msg);
-            pgrx::error!("pg_typescript: syntax error: {first_line}");
-        })
-        .into_source()
-        .text
+    out
 }
 
 /// Extract the `default` export from a module namespace object.
@@ -522,14 +606,7 @@ where
 /// Read the `typescript.import_map` value from a function's proconfig and
 /// parse it into a specifier → URL map.
 fn read_import_map(proc: &PgProc) -> HashMap<String, String> {
-    let json = proc
-        .proconfig()
-        .unwrap_or_default()
-        .into_iter()
-        .find_map(|kv| {
-            kv.strip_prefix("typescript.import_map=")
-                .map(|v| v.to_string())
-        });
+    let json = read_function_config(proc, "typescript.import_map");
 
     match json {
         Some(ref j) => {
@@ -551,6 +628,14 @@ fn read_inline_import_map() -> HashMap<String, String> {
         }
         _ => HashMap::new(),
     }
+}
+
+fn read_function_config(proc: &PgProc, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    proc.proconfig()
+        .unwrap_or_default()
+        .into_iter()
+        .find_map(|kv| kv.strip_prefix(&prefix).map(|v| v.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -583,6 +668,7 @@ mod unit_tests {
         params: &[&str],
         args: &[Value],
         import_map: std::collections::HashMap<String, String>,
+        permissions: super::RuntimePermissions,
         store: crate::fetch::HashMapModuleStore,
     ) -> (Value, bool) {
         let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
@@ -591,6 +677,7 @@ mod unit_tests {
             fn_oid,
             source,
             &import_map,
+            &permissions,
             &param_names,
             args,
             JsonSeed,
@@ -605,6 +692,24 @@ mod unit_tests {
             params,
             args,
             Default::default(),
+            super::RuntimePermissions::default(),
+            crate::fetch::HashMapModuleStore::new(),
+        )
+    }
+
+    /// Run a function body with explicit runtime permissions.
+    fn run_with_permissions(
+        source: &str,
+        params: &[&str],
+        args: &[Value],
+        permissions: super::RuntimePermissions,
+    ) -> (Value, bool) {
+        run_impl(
+            source,
+            params,
+            args,
+            Default::default(),
+            permissions,
             crate::fetch::HashMapModuleStore::new(),
         )
     }
@@ -634,7 +739,29 @@ mod unit_tests {
                 let import_map = crate::fetch::make_import_map(&[$(($spec, $url)),*]);
                 let mut store = crate::fetch::HashMapModuleStore::new();
                 $( store.write(0, $murl, $msrc); )*
-                let (val, is_null) = run_impl($src, &[$($p),*], &args, import_map, store);
+                let (val, is_null) = run_impl(
+                    $src,
+                    &[$($p),*],
+                    &args,
+                    import_map,
+                    super::RuntimePermissions::default(),
+                    store,
+                );
+                let expected: Option<Value> = $expected;
+                match expected {
+                    Some(exp) => assert_eq!(val, exp),
+                    None => assert!(is_null),
+                }
+            }
+        };
+    }
+
+    macro_rules! ts_test_with_permissions {
+        ($name:ident, $src:expr, [$($p:literal),*], [$($a:expr),*], $expected:expr, $perms:expr) => {
+            #[test]
+            fn $name() {
+                let args: Vec<Value> = vec![$($a),*];
+                let (val, is_null) = run_with_permissions($src, &[$($p),*], &args, $perms);
                 let expected: Option<Value> = $expected;
                 match expected {
                     Some(exp) => assert_eq!(val, exp),
@@ -651,10 +778,9 @@ mod unit_tests {
         use crate::runtime::{block_on, with_runtime};
         let module_source = super::assemble_module("const x = ;", &Default::default(), "");
         let hash = super::hash_str(&module_source);
-        let specifier = deno_core::resolve_url(&format!(
-            "file:///pg_typescript/test_syntax_{hash:016x}.mjs"
-        ))
-        .unwrap();
+        let specifier =
+            deno_core::resolve_url(&format!("file:///pg_typescript/test_syntax_{hash:016x}.ts"))
+                .unwrap();
         let result = with_runtime(|rt| {
             let _ctx = crate::loader::set_loader_context(
                 0,
@@ -670,28 +796,13 @@ mod unit_tests {
     }
 
     #[test]
-    fn transpile_parse_error_first_line_is_stable() {
-        let module_source = super::assemble_module("  const x = ;", &Default::default(), "");
-        let err = deno_ast::parse_module(deno_ast::ParseParams {
-            specifier: deno_core::resolve_url("file:///pg_typescript/input.ts").unwrap(),
-            text: module_source.into(),
-            media_type: deno_ast::MediaType::TypeScript,
-            capture_tokens: false,
-            scope_analysis: false,
-            maybe_syntax: None,
-        })
-        .err()
-        .expect("expected parse error");
-
-        let first_line = err
-            .to_string()
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string();
+    fn normalize_syntax_error_line_is_stable() {
+        let first_line = super::normalize_syntax_error_line(
+            "Uncaught SyntaxError: Expression expected at file:///pg_typescript/fn_123_abcdeffedcba1234.ts:4:13"
+        );
         assert_eq!(
             first_line,
-            "Expression expected at file:///pg_typescript/input.ts:3:13"
+            "Expression expected at file:///pg_typescript/input.ts:4:13"
         );
     }
 
@@ -728,6 +839,7 @@ mod unit_tests {
         super::execute_inline_block(
             "const x = 1 + 1;",
             &Default::default(),
+            &super::RuntimePermissions::default(),
             crate::fetch::HashMapModuleStore::new(),
         );
     }
@@ -741,7 +853,12 @@ mod unit_tests {
             "https://esm.sh/math@1",
             "export function add(a, b) { return a + b; }",
         );
-        super::execute_inline_block("const result = math.add(1, 2);", &import_map, store);
+        super::execute_inline_block(
+            "const result = math.add(1, 2);",
+            &import_map,
+            &super::RuntimePermissions::default(),
+            store,
+        );
     }
 
     // --- sync / async execution ---------------------------------------------
@@ -822,6 +939,49 @@ mod unit_tests {
         ["n"],
         [json!(7)],
         Some(json!({ "original": 7, "doubled": 14 }))
+    );
+
+    // --- runtime permissions -----------------------------------------------
+
+    ts_test!(
+        permissions_env_denied_by_default,
+        "try { Deno.env.get(name); return 'allowed'; } catch { return 'denied'; }",
+        ["name"],
+        [json!("PATH")],
+        Some(json!("denied"))
+    );
+    ts_test_with_permissions!(
+        permissions_env_allow_all,
+        "try { Deno.env.get(name); return 'allowed'; } catch { return 'denied'; }",
+        ["name"],
+        [json!("PATH")],
+        Some(json!("allowed")),
+        super::RuntimePermissions {
+            allow_env: Some(vec![]),
+            ..Default::default()
+        }
+    );
+    ts_test_with_permissions!(
+        permissions_env_allow_list_hit,
+        "try { Deno.env.get(name); return 'allowed'; } catch { return 'denied'; }",
+        ["name"],
+        [json!("PATH")],
+        Some(json!("allowed")),
+        super::RuntimePermissions {
+            allow_env: Some(vec!["PATH".to_string()]),
+            ..Default::default()
+        }
+    );
+    ts_test_with_permissions!(
+        permissions_env_allow_list_miss,
+        "try { Deno.env.get(name); return 'allowed'; } catch { return 'denied'; }",
+        ["name"],
+        [json!("USER")],
+        Some(json!("denied")),
+        super::RuntimePermissions {
+            allow_env: Some(vec!["PATH".to_string()]),
+            ..Default::default()
+        }
     );
 
     // --- module loading -----------------------------------------------------

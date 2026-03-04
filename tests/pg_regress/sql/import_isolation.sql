@@ -1,0 +1,63 @@
+-- enforce import boundaries:
+-- 1) dynamic runtime imports are rejected
+-- 2) file:// probing of fn_* internals is rejected
+-- 3) declared static import-map bindings still work
+
+CREATE OR REPLACE FUNCTION ts_assert_raises(stmt text) RETURNS bool
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE stmt;
+  RETURN false;
+EXCEPTION WHEN others THEN
+  RETURN true;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_dynamic_import_undeclared() RETURNS text
+LANGUAGE typescript AS $$
+  const mod = await import("https://esm.sh/lodash@4.17.23");
+  return mod.default.capitalize("hello");
+$$;
+
+CREATE OR REPLACE FUNCTION ts_dynamic_import_bare_not_mapped() RETURNS text
+LANGUAGE typescript
+SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
+AS $$
+  const mod = await import("zod");
+  return mod.string().parse("ok");
+$$;
+
+CREATE OR REPLACE FUNCTION ts_dynamic_import_file_probe() RETURNS int
+LANGUAGE typescript AS $$
+  await import("file:///pg_typescript/fn_9999_deadbeefdeadbeef.ts");
+  return 1;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_static_import_declared(name text) RETURNS text
+LANGUAGE typescript
+SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
+AS $$
+  return lodash.capitalize(name);
+$$;
+
+SELECT test, ok
+FROM (
+  VALUES
+    (
+      '01_undeclared_url_rejected',
+      ts_assert_raises('SELECT ts_dynamic_import_undeclared()')
+    ),
+    (
+      '02_bare_not_in_map_rejected',
+      ts_assert_raises('SELECT ts_dynamic_import_bare_not_mapped()')
+    ),
+    (
+      '03_file_import_rejected',
+      ts_assert_raises('SELECT ts_dynamic_import_file_probe()')
+    ),
+    (
+      '04_declared_static_import_allowed',
+      ts_static_import_declared('hello world') = 'Hello world'
+    )
+) AS checks(test, ok)
+ORDER BY test;

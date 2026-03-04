@@ -18,19 +18,28 @@ pg16 = ["pgrx/pg16", "pgrx-tests/pg16"]
 pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg18 = ["pgrx/pg18", "pgrx-tests/pg18"]
 pg_test = []
+tracy = ["dep:tracy-client", "tracy-client/enable"]
 
 [dependencies]
 pgrx = "=0.17.0"
-deno_core = "0.387.0"
+deno_core = "0.386.0"
+deno_runtime = { version = "0.242.0", features = ["transpile"] }
 tokio = { version = "1", features = ["rt", "time"] }
 serde = "1"
 serde_json = "1"
 ureq = "2"
-deno_error = "0.7.3"
-deno_ast = { version = "=0.52.0", features = ["transpiling"] }
+deno_error = "=0.7.1"
+deno_ast = { version = "=0.53.1", features = ["transpiling"] }
+sys_traits = "0.1.24"
+node_resolver = "0.72.0"
+deno_semver = "=0.9.1"
+tracy-client = { version = "0.18.4", default-features = false, optional = true }
 
 [dev-dependencies]
 pgrx-tests = "=0.17.0"
+
+[build-dependencies]
+deno_runtime = { version = "0.242.0", features = ["snapshot"] }
 
 [profile.dev]
 panic = "unwind"

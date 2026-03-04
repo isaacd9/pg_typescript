@@ -1,6 +1,13 @@
 \timing on
+\set ON_ERROR_STOP on
+
+\echo '=== preload (shared library load) ==='
+LOAD 'pg_typescript';
+
 \echo '=== setup ==='
 CREATE EXTENSION IF NOT EXISTS pg_typescript;
+SET client_min_messages = info;
+SET typescript.log_timing = on;
 
 CREATE OR REPLACE FUNCTION ts_profile_add(a integer, b integer) RETURNS integer
 LANGUAGE typescript AS $$

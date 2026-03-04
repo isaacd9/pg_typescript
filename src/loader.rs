@@ -18,6 +18,7 @@ struct LoaderContext {
     fn_oid: u32,
     import_map: HashMap<String, String>,
     store: Box<dyn ModuleStore>,
+    inline_modules: HashMap<String, String>,
 }
 
 thread_local! {
@@ -44,11 +45,23 @@ pub fn set_loader_context(
     import_map: HashMap<String, String>,
     store: Box<dyn ModuleStore>,
 ) -> LoaderContextGuard {
+    set_loader_context_with_inline(fn_oid, import_map, store, HashMap::new())
+}
+
+/// Set the loader context for the current function call, with optional
+/// in-memory module sources keyed by absolute specifier URL.
+pub fn set_loader_context_with_inline(
+    fn_oid: u32,
+    import_map: HashMap<String, String>,
+    store: Box<dyn ModuleStore>,
+    inline_modules: HashMap<String, String>,
+) -> LoaderContextGuard {
     LOADER_CTX.with(|c| {
         *c.borrow_mut() = Some(LoaderContext {
             fn_oid,
             import_map,
             store,
+            inline_modules,
         });
     });
     LoaderContextGuard
@@ -69,9 +82,15 @@ impl ModuleLoader for PgModuleLoader {
         referrer: &str,
         _kind: ResolutionKind,
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        // file:// specifiers are always our own main module being normalised by
-        // deno_core — pass through unconditionally.
+        // Only allow file:// for the loader entrypoint specifier (resolved with
+        // "." as the referrer by deno_core). Any nested file:// import from
+        // user code is rejected to prevent reaching synthetic fn_* modules.
         if specifier.starts_with("file://") {
+            if referrer != "." {
+                return Err(JsErrorBox::generic(format!(
+                    "pg_typescript: file:// imports are not allowed from function code: '{specifier}'"
+                )));
+            }
             return ModuleSpecifier::parse(specifier).map_err(JsErrorBox::from_err);
         }
 
@@ -103,6 +122,11 @@ impl ModuleLoader for PgModuleLoader {
                     "pg_typescript: error loading {url}: {e}"
                 ))));
             }
+        };
+
+        let source = match maybe_transpile_source(module_specifier, source) {
+            Ok(source) => source,
+            Err(e) => return ModuleLoadResponse::Sync(Err(e)),
         };
 
         ModuleLoadResponse::Sync(Ok(ModuleSource::new(
@@ -200,9 +224,43 @@ fn resolve_from_dep(specifier: &str, referrer: &str) -> Result<ModuleSpecifier, 
 
 fn load_module_source(url: String) -> Result<Option<String>, String> {
     LOADER_CTX.with(|c| match c.borrow().as_ref() {
-        Some(ctx) => ctx.store.load(ctx.fn_oid, &url),
+        Some(ctx) => {
+            if let Some(source) = ctx.inline_modules.get(&url) {
+                return Ok(Some(source.clone()));
+            }
+            ctx.store.load(ctx.fn_oid, &url)
+        }
         None => Err("no loader context set".to_string()),
     })
+}
+
+fn maybe_transpile_source(
+    module_specifier: &ModuleSpecifier,
+    source: String,
+) -> Result<String, JsErrorBox> {
+    let name = module_specifier.as_str();
+    if !should_transpile(name) {
+        return Ok(source);
+    }
+
+    let (transpiled, _) =
+        deno_runtime::transpile::maybe_transpile_source(name.to_string().into(), source.into())?;
+    Ok(transpiled.to_string())
+}
+
+fn should_transpile(name: &str) -> bool {
+    if name.starts_with("node:") {
+        return true;
+    }
+
+    let Ok(specifier) = ModuleSpecifier::parse(name) else {
+        return false;
+    };
+    let path = specifier.path().to_ascii_lowercase();
+    path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".mts")
+        || path.ends_with(".cts")
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +269,8 @@ fn load_module_source(url: String) -> Result<Option<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    use deno_core::{ModuleLoader, ResolutionKind};
+
     use crate::fetch::{make_import_map, HashMapModuleStore, ModuleStore};
 
     /// Set up a loader context with the given import map entries and a
@@ -346,5 +406,34 @@ mod tests {
         let _ctx = make_ctx(&[], HashMapModuleStore::new());
 
         assert!(super::resolve_from_dep("unknown", "https://esm.sh/pkg/index.js").is_err());
+    }
+
+    #[test]
+    fn resolve_file_root_allowed() {
+        let loader = super::PgModuleLoader;
+        let url = loader
+            .resolve(
+                "file:///pg_typescript/fn_1_deadbeefdeadbeef.ts",
+                ".",
+                ResolutionKind::Import,
+            )
+            .unwrap();
+        assert_eq!(url.as_str(), "file:///pg_typescript/fn_1_deadbeefdeadbeef.ts");
+    }
+
+    #[test]
+    fn resolve_file_from_function_rejected() {
+        let loader = super::PgModuleLoader;
+        let err = loader
+            .resolve(
+                "file:///pg_typescript/fn_2_deadbeefdeadbeef.ts",
+                "file:///pg_typescript/fn_1_deadbeefdeadbeef.ts",
+                ResolutionKind::Import,
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("file:// imports are not allowed"),
+            "unexpected error: {err}"
+        );
     }
 }
