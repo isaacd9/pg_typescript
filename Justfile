@@ -20,7 +20,7 @@ profile pg_version="pg18":
   set -euo pipefail
   cd "{{justfile_directory()}}"
   cargo pgrx start {{pg_version}}
-  cargo pgrx install --features "{{pg_version}}" --no-default-features
+  cargo pgrx install --features "{{pg_version}}" --no-default-features --release
   cargo pgrx connect {{pg_version}} < tests/profiling/setup_vs_exec.sql
 
 # Start PostgREST against the local pgrx Postgres instance.

@@ -92,7 +92,18 @@ ORDER BY engine;
 \echo '=== first 10 calls (microseconds) ==='
 SELECT engine, iter, round(elapsed_us::numeric, 3) AS us
 FROM pg_typescript_profile_samples
-WHERE iter <= 10
 ORDER BY engine, iter;
+
+\echo '=== aggregate stats (microseconds) ==='
+SELECT
+  engine,
+  round(AVG(elapsed_us)::numeric, 3)                            AS avg_us,
+  round(MIN(elapsed_us)::numeric, 3)                            AS min_us,
+  round(MAX(elapsed_us)::numeric, 3)                            AS max_us,
+  round(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY elapsed_us)::numeric, 3) AS median_us,
+  round(PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY elapsed_us)::numeric, 3) AS p99_us
+FROM pg_typescript_profile_samples
+GROUP BY engine
+ORDER BY engine;
 
 DROP TABLE pg_typescript_profile_samples;
