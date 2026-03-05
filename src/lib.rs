@@ -249,8 +249,15 @@ pgrx::extension_sql!(
     );
     REVOKE ALL ON deno_internal.deno_package_modules FROM PUBLIC;
     -- Runtime function execution needs read-only access to cached module source.
+    -- Keep table-level SELECT for language execution, but gate row visibility so
+    -- users can only see cache rows for functions they can execute.
     GRANT USAGE ON SCHEMA deno_internal TO PUBLIC;
     GRANT SELECT ON deno_internal.deno_package_modules TO PUBLIC;
+    ALTER TABLE deno_internal.deno_package_modules ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY deno_package_modules_select_if_executable
+      ON deno_internal.deno_package_modules
+      FOR SELECT
+      USING (pg_catalog.has_function_privilege(function_oid, 'EXECUTE'));
 
     CREATE OR REPLACE FUNCTION deno_internal.cleanup_modules()
     RETURNS event_trigger LANGUAGE plpgsql AS $$
