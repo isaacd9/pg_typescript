@@ -11,6 +11,7 @@ use pgrx::{fcinfo, pg_sys};
 
 use crate::convert::{PgDatum, PgDatumSeed};
 use crate::fetch;
+use crate::guc::{import_url_allowed, GucParser, ImportUrlCap};
 use crate::loader;
 use crate::permissions::{read_function_config, read_function_permissions, read_inline_permissions};
 use crate::runtime::{
@@ -494,12 +495,9 @@ where
 // ---------------------------------------------------------------------------
 
 /// Read `typescript.max_imports` from GUC and parse it into an import-URL cap.
-fn read_max_imports_cap() -> fetch::ImportUrlCap {
-    let raw = crate::MAX_IMPORTS_GUC
-        .get()
-        .and_then(|cstr| cstr.to_str().ok().map(|s| s.trim().to_string()))
-        .filter(|s| !s.is_empty());
-    fetch::parse_max_imports_setting(raw, "GUC typescript.max_imports")
+fn read_max_imports_cap() -> ImportUrlCap {
+    crate::MAX_IMPORTS_GUC
+        .parse_setting("GUC typescript.max_imports")
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
 }
 
@@ -509,7 +507,7 @@ fn format_import_urls(values: &[String]) -> String {
 
 fn enforce_import_map_cap(
     import_map: &HashMap<String, String>,
-    max_imports: &fetch::ImportUrlCap,
+    max_imports: &ImportUrlCap,
     requested_source: &str,
 ) {
     let mut requested: Vec<String> = import_map.values().cloned().collect();
@@ -518,7 +516,7 @@ fn enforce_import_map_cap(
 
     let mut disallowed = Vec::new();
     for url in &requested {
-        match fetch::import_url_allowed(url, max_imports) {
+        match import_url_allowed(url, max_imports) {
             Ok(true) => {}
             Ok(false) => disallowed.push(url.clone()),
             Err(e) => pgrx::error!("pg_typescript: {e}"),
@@ -536,14 +534,14 @@ fn enforce_import_map_cap(
 
 /// Read the `typescript.import_map` value from a function's proconfig and
 /// parse it into a specifier → URL map, enforcing `typescript.max_imports`.
-fn read_import_map(proc: &PgProc) -> (HashMap<String, String>, fetch::ImportUrlCap) {
+fn read_import_map(proc: &PgProc) -> (HashMap<String, String>, ImportUrlCap) {
     let max_imports = read_max_imports_cap();
-    let map = match read_function_config(proc, "typescript.import_map") {
-        Some(j) => {
-            fetch::parse_import_map(&j).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
-        }
-        None => HashMap::new(),
-    };
+    let map = crate::IMPORT_MAP_GUC
+        .parse_raw(
+            read_function_config(proc, "typescript.import_map"),
+            "function setting typescript.import_map",
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
     enforce_import_map_cap(
         &map,
         &max_imports,
@@ -554,17 +552,11 @@ fn read_import_map(proc: &PgProc) -> (HashMap<String, String>, fetch::ImportUrlC
 
 /// Read the `typescript.import_map` GUC (set via `SET LOCAL typescript.import_map = '...'`)
 /// and parse it for use by DO blocks, enforcing `typescript.max_imports`.
-fn read_inline_import_map() -> (HashMap<String, String>, fetch::ImportUrlCap) {
+fn read_inline_import_map() -> (HashMap<String, String>, ImportUrlCap) {
     let max_imports = read_max_imports_cap();
-    let json = crate::IMPORT_MAP_GUC
-        .get()
-        .and_then(|cstr| cstr.to_str().ok().map(|s| s.to_string()));
-    let map = match json.as_deref() {
-        Some(j) if !j.is_empty() => {
-            fetch::parse_import_map(j).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
-        }
-        _ => HashMap::new(),
-    };
+    let map = crate::IMPORT_MAP_GUC
+        .parse_setting("GUC typescript.import_map")
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
     enforce_import_map_cap(&map, &max_imports, "GUC typescript.import_map");
     (map, max_imports)
 }

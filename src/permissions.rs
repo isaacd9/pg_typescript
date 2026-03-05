@@ -2,15 +2,10 @@ use std::collections::HashSet;
 
 use pgrx::pg_catalog::pg_proc::PgProc;
 
+use crate::guc::{GucParser, PermissionSetting};
 use crate::runtime::RuntimePermissions;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-enum PermissionValue {
-    #[default]
-    Deny,
-    AllowAll,
-    AllowList(Vec<String>),
-}
+type PermissionValue = PermissionSetting;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct PermissionSpec {
@@ -33,162 +28,82 @@ pub(crate) fn read_function_config(proc: &PgProc, key: &str) -> Option<String> {
 }
 
 pub(crate) fn read_function_permissions(proc: &PgProc) -> RuntimePermissions {
+    read_function_permissions_result(proc).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+}
+
+fn read_function_permissions_result(proc: &PgProc) -> Result<RuntimePermissions, String> {
     let requested = PermissionSpec {
-        read: parse_permission_setting(
+        read: crate::ALLOW_READ_GUC.parse_raw(
             read_function_config(proc, "typescript.allow_read"),
             "function setting typescript.allow_read",
-        ),
-        write: parse_permission_setting(
+        )?,
+        write: crate::ALLOW_WRITE_GUC.parse_raw(
             read_function_config(proc, "typescript.allow_write"),
             "function setting typescript.allow_write",
-        ),
-        net: parse_permission_setting(
+        )?,
+        net: crate::ALLOW_NET_GUC.parse_raw(
             read_function_config(proc, "typescript.allow_net"),
             "function setting typescript.allow_net",
-        ),
-        env: parse_permission_setting(
+        )?,
+        env: crate::ALLOW_ENV_GUC.parse_raw(
             read_function_config(proc, "typescript.allow_env"),
             "function setting typescript.allow_env",
-        ),
-        run: parse_permission_setting(
+        )?,
+        run: crate::ALLOW_RUN_GUC.parse_raw(
             read_function_config(proc, "typescript.allow_run"),
             "function setting typescript.allow_run",
-        ),
-        ffi: parse_permission_setting(
+        )?,
+        ffi: crate::ALLOW_FFI_GUC.parse_raw(
             read_function_config(proc, "typescript.allow_ffi"),
             "function setting typescript.allow_ffi",
-        ),
-        sys: parse_permission_setting(
+        )?,
+        sys: crate::ALLOW_SYS_GUC.parse_raw(
             read_function_config(proc, "typescript.allow_sys"),
             "function setting typescript.allow_sys",
-        ),
-        import: parse_permission_setting(
+        )?,
+        import: crate::ALLOW_IMPORT_GUC.parse_raw(
             read_function_config(proc, "typescript.allow_import"),
             "function setting typescript.allow_import",
-        ),
+        )?,
     };
 
-    let max = read_max_permissions();
-    enforce_all_caps(&requested, &max, "function setting typescript");
-    effective_permissions(requested, max)
+    let max = read_max_permissions()?;
+    enforce_all_caps(&requested, &max, "function setting typescript")?;
+    Ok(effective_permissions(requested, max))
 }
 
 pub(crate) fn read_inline_permissions() -> RuntimePermissions {
+    read_inline_permissions_result().unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+}
+
+fn read_inline_permissions_result() -> Result<RuntimePermissions, String> {
     let requested = PermissionSpec {
-        read: parse_permission_setting(
-            guc_value(crate::ALLOW_READ_GUC.get()),
-            "GUC typescript.allow_read",
-        ),
-        write: parse_permission_setting(
-            guc_value(crate::ALLOW_WRITE_GUC.get()),
-            "GUC typescript.allow_write",
-        ),
-        net: parse_permission_setting(
-            guc_value(crate::ALLOW_NET_GUC.get()),
-            "GUC typescript.allow_net",
-        ),
-        env: parse_permission_setting(
-            guc_value(crate::ALLOW_ENV_GUC.get()),
-            "GUC typescript.allow_env",
-        ),
-        run: parse_permission_setting(
-            guc_value(crate::ALLOW_RUN_GUC.get()),
-            "GUC typescript.allow_run",
-        ),
-        ffi: parse_permission_setting(
-            guc_value(crate::ALLOW_FFI_GUC.get()),
-            "GUC typescript.allow_ffi",
-        ),
-        sys: parse_permission_setting(
-            guc_value(crate::ALLOW_SYS_GUC.get()),
-            "GUC typescript.allow_sys",
-        ),
-        import: parse_permission_setting(
-            guc_value(crate::ALLOW_IMPORT_GUC.get()),
-            "GUC typescript.allow_import",
-        ),
+        read: crate::ALLOW_READ_GUC.parse_setting("GUC typescript.allow_read")?,
+        write: crate::ALLOW_WRITE_GUC.parse_setting("GUC typescript.allow_write")?,
+        net: crate::ALLOW_NET_GUC.parse_setting("GUC typescript.allow_net")?,
+        env: crate::ALLOW_ENV_GUC.parse_setting("GUC typescript.allow_env")?,
+        run: crate::ALLOW_RUN_GUC.parse_setting("GUC typescript.allow_run")?,
+        ffi: crate::ALLOW_FFI_GUC.parse_setting("GUC typescript.allow_ffi")?,
+        sys: crate::ALLOW_SYS_GUC.parse_setting("GUC typescript.allow_sys")?,
+        import: crate::ALLOW_IMPORT_GUC.parse_setting("GUC typescript.allow_import")?,
     };
 
-    let max = read_max_permissions();
-    enforce_all_caps(&requested, &max, "GUC typescript");
-    effective_permissions(requested, max)
+    let max = read_max_permissions()?;
+    enforce_all_caps(&requested, &max, "GUC typescript")?;
+    Ok(effective_permissions(requested, max))
 }
 
-fn read_max_permissions() -> PermissionSpec {
-    PermissionSpec {
-        read: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_READ_GUC.get()),
-            "GUC typescript.max_allow_read",
-        ),
-        write: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_WRITE_GUC.get()),
-            "GUC typescript.max_allow_write",
-        ),
-        net: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_NET_GUC.get()),
-            "GUC typescript.max_allow_net",
-        ),
-        env: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_ENV_GUC.get()),
-            "GUC typescript.max_allow_env",
-        ),
-        run: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_RUN_GUC.get()),
-            "GUC typescript.max_allow_run",
-        ),
-        ffi: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_FFI_GUC.get()),
-            "GUC typescript.max_allow_ffi",
-        ),
-        sys: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_SYS_GUC.get()),
-            "GUC typescript.max_allow_sys",
-        ),
-        import: parse_permission_setting(
-            guc_value(crate::MAX_ALLOW_IMPORT_GUC.get()),
-            "GUC typescript.max_allow_import",
-        ),
-    }
-}
-
-fn guc_value(value: Option<std::ffi::CString>) -> Option<String> {
-    value
-        .and_then(|cstr| cstr.to_str().ok().map(|s| s.trim().to_string()))
-        .filter(|s| !s.is_empty())
-}
-
-fn parse_permission_setting(raw: Option<String>, source: &str) -> PermissionValue {
-    let Some(value) = raw else {
-        return PermissionValue::Deny;
-    };
-
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "off" | "none" | "deny" | "false" | "0" => PermissionValue::Deny,
-        "*" | "all" | "on" | "true" | "1" => PermissionValue::AllowAll,
-        _ => PermissionValue::AllowList(parse_permission_list(&value, source)),
-    }
-}
-
-fn parse_permission_list(value: &str, source: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-
-    for raw in value.split(',') {
-        let item = raw.trim();
-        if item.is_empty() {
-            continue;
-        }
-        if seen.insert(item.to_string()) {
-            out.push(item.to_string());
-        }
-    }
-
-    if out.is_empty() {
-        pgrx::error!("pg_typescript: invalid empty permission list in {source}");
-    }
-
-    out
+fn read_max_permissions() -> Result<PermissionSpec, String> {
+    Ok(PermissionSpec {
+        read: crate::MAX_ALLOW_READ_GUC.parse_setting("GUC typescript.max_allow_read")?,
+        write: crate::MAX_ALLOW_WRITE_GUC.parse_setting("GUC typescript.max_allow_write")?,
+        net: crate::MAX_ALLOW_NET_GUC.parse_setting("GUC typescript.max_allow_net")?,
+        env: crate::MAX_ALLOW_ENV_GUC.parse_setting("GUC typescript.max_allow_env")?,
+        run: crate::MAX_ALLOW_RUN_GUC.parse_setting("GUC typescript.max_allow_run")?,
+        ffi: crate::MAX_ALLOW_FFI_GUC.parse_setting("GUC typescript.max_allow_ffi")?,
+        sys: crate::MAX_ALLOW_SYS_GUC.parse_setting("GUC typescript.max_allow_sys")?,
+        import: crate::MAX_ALLOW_IMPORT_GUC.parse_setting("GUC typescript.max_allow_import")?,
+    })
 }
 
 fn effective_permissions(requested: PermissionSpec, max: PermissionSpec) -> RuntimePermissions {
@@ -209,17 +124,20 @@ fn enforce_permission_cap(
     max: &PermissionValue,
     requested_source: &str,
     max_source: &str,
-) {
+) -> Result<(), String> {
     if let Some(detail) = unfulfillable_detail(requested, max) {
-        pgrx::error!("pg_typescript: {requested_source} cannot be fulfilled by {max_source}: {detail}");
+        return Err(format!(
+            "{requested_source} cannot be fulfilled by {max_source}: {detail}"
+        ));
     }
+    Ok(())
 }
 
-/// Enforce max caps for all 8 permission kinds at once.
-///
-/// `requested_prefix` is prepended to each permission name in error messages,
-/// e.g. `"function setting typescript"` or `"GUC typescript"`.
-fn enforce_all_caps(requested: &PermissionSpec, max: &PermissionSpec, requested_prefix: &str) {
+fn enforce_all_caps(
+    requested: &PermissionSpec,
+    max: &PermissionSpec,
+    requested_prefix: &str,
+) -> Result<(), String> {
     let fields: &[(&PermissionValue, &PermissionValue, &str)] = &[
         (&requested.read, &max.read, "allow_read"),
         (&requested.write, &max.write, "allow_write"),
@@ -236,8 +154,9 @@ fn enforce_all_caps(requested: &PermissionSpec, max: &PermissionSpec, requested_
             cap,
             &format!("{requested_prefix}.{name}"),
             &format!("GUC typescript.max_{name}"),
-        );
+        )?;
     }
+    Ok(())
 }
 
 fn unfulfillable_detail(requested: &PermissionValue, max: &PermissionValue) -> Option<String> {
@@ -321,9 +240,14 @@ fn to_runtime_allowlist(value: PermissionValue) -> Option<Vec<String>> {
 #[cfg(test)]
 mod unit_tests {
     use super::*;
+    use crate::guc::PermissionParser;
 
     fn allow_list(values: &[&str]) -> PermissionValue {
         PermissionValue::AllowList(values.iter().map(|v| (*v).to_string()).collect())
+    }
+
+    fn parse_setting_for_test(raw: Option<String>) -> PermissionValue {
+        PermissionParser::new().parse_raw(raw, "test").unwrap()
     }
 
     #[test]
@@ -380,15 +304,15 @@ mod unit_tests {
     #[test]
     fn parse_setting_understands_aliases_and_dedupes_lists() {
         assert_eq!(
-            parse_permission_setting(Some("on".to_string()), "test"),
+            parse_setting_for_test(Some("on".to_string())),
             PermissionValue::AllowAll
         );
         assert_eq!(
-            parse_permission_setting(Some("none".to_string()), "test"),
+            parse_setting_for_test(Some("none".to_string())),
             PermissionValue::Deny
         );
         assert_eq!(
-            parse_permission_setting(Some(" PATH , PATH , USER ".to_string()), "test"),
+            parse_setting_for_test(Some(" PATH , PATH , USER ".to_string())),
             allow_list(&["PATH", "USER"])
         );
     }

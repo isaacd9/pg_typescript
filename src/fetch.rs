@@ -1,72 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use serde_json::Value;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum ImportUrlCap {
-    Deny,
-    #[default]
-    AllowAll,
-    AllowList(Vec<String>),
-}
-
-pub fn parse_max_imports_setting(raw: Option<String>, source: &str) -> Result<ImportUrlCap, String> {
-    let Some(value) = raw else {
-        return Ok(ImportUrlCap::AllowAll);
-    };
-
-    let normalized = value.trim().to_ascii_lowercase();
-    match normalized.as_str() {
-        "off" | "none" | "deny" | "false" | "0" => Ok(ImportUrlCap::Deny),
-        "*" | "all" | "on" | "true" | "1" => Ok(ImportUrlCap::AllowAll),
-        _ => parse_import_prefix_list(&value, source).map(ImportUrlCap::AllowList),
-    }
-}
-
-pub fn import_url_allowed(url: &str, cap: &ImportUrlCap) -> Result<bool, String> {
-    match cap {
-        ImportUrlCap::AllowAll => Ok(true),
-        ImportUrlCap::Deny => Ok(false),
-        ImportUrlCap::AllowList(prefixes) => {
-            let normalized = normalize_http_url(url, "import URL")?;
-            Ok(prefixes.iter().any(|prefix| normalized.starts_with(prefix)))
-        }
-    }
-}
-
-fn parse_import_prefix_list(value: &str, source: &str) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
-    let mut seen = HashSet::new();
-
-    for raw in value.split(',') {
-        let item = raw.trim();
-        if item.is_empty() {
-            continue;
-        }
-        let normalized = normalize_http_url(item, source)?;
-        if seen.insert(normalized.clone()) {
-            out.push(normalized);
-        }
-    }
-
-    if out.is_empty() {
-        return Err(format!("invalid empty max_imports list in {source}"));
-    }
-
-    Ok(out)
-}
-
-fn normalize_http_url(url: &str, source: &str) -> Result<String, String> {
-    use deno_core::ModuleSpecifier;
-    let parsed =
-        ModuleSpecifier::parse(url).map_err(|e| format!("invalid URL '{url}' in {source}: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(parsed.to_string()),
-        scheme => Err(format!(
-            "invalid URL '{url}' in {source}: unsupported scheme '{scheme}' (only http/https allowed)"
-        )),
-    }
-}
+use crate::guc::{import_url_allowed, ImportUrlCap};
 
 // ---------------------------------------------------------------------------
 // ModuleStore trait
@@ -238,71 +172,6 @@ impl Fetcher for UreqFetcher {
 }
 
 // ---------------------------------------------------------------------------
-// Import map parsing (pure Rust, no Postgres)
-// ---------------------------------------------------------------------------
-
-/// Parse and validate a Deno-style import map JSON string into a `{specifier -> url}` map.
-///
-/// Expected format: `{"imports": {"lodash": "https://esm.sh/lodash@4.17.23"}}`
-///
-/// Returns an error if the JSON is malformed, if any key is not a valid JS
-/// identifier, or if any URL is not an http/https URL.
-pub fn parse_import_map(json: &str) -> Result<HashMap<String, String>, String> {
-    let v: Value =
-        serde_json::from_str(json).map_err(|e| format!("invalid import_map JSON: {e}"))?;
-
-    let imports = match v.get("imports").and_then(|i| i.as_object()) {
-        Some(obj) => obj,
-        None => return Ok(HashMap::new()),
-    };
-
-    let mut map = HashMap::new();
-    for (key, val) in imports {
-        validate_js_identifier(key)?;
-        let url = val
-            .as_str()
-            .ok_or_else(|| format!("import_map: value for '{key}' is not a string"))?;
-        validate_http_url(url)?;
-        map.insert(key.clone(), url.to_string());
-    }
-    Ok(map)
-}
-
-fn validate_js_identifier(name: &str) -> Result<(), String> {
-    let mut chars = name.chars();
-    let first = chars
-        .next()
-        .ok_or_else(|| "import_map key is empty".to_string())?;
-    if !(first.is_ascii_alphabetic() || first == '_' || first == '$') {
-        return Err(format!(
-            "import_map key '{name}' is not a valid JS identifier \
-             (must start with a letter, '_', or '$')"
-        ));
-    }
-    for ch in chars {
-        if !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '$') {
-            return Err(format!(
-                "import_map key '{name}' is not a valid JS identifier \
-                 (invalid character '{ch}')"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_http_url(url: &str) -> Result<(), String> {
-    use deno_core::ModuleSpecifier;
-    let parsed = ModuleSpecifier::parse(url)
-        .map_err(|e| format!("import_map URL '{url}' is invalid: {e}"))?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(()),
-        scheme => Err(format!(
-            "import_map URL '{url}' has unsupported scheme '{scheme}' (only http/https allowed)"
-        )),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Fetching and caching
 // ---------------------------------------------------------------------------
 
@@ -415,6 +284,15 @@ pub(crate) fn make_import_map(entries: &[(&str, &str)]) -> HashMap<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::guc::{GucParser, ImportMapParser, MaxImportsParser};
+
+    fn parse_import_map_for_test(json: &str) -> Result<HashMap<String, String>, String> {
+        ImportMapParser::new().parse_raw(Some(json.to_string()), "test import_map")
+    }
+
+    fn parse_max_imports_for_test(raw: Option<String>) -> Result<ImportUrlCap, String> {
+        MaxImportsParser::new().parse_raw(raw, "test")
+    }
 
     macro_rules! make_fetcher {
         ($( $url:expr => $src:expr ),* $(,)?) => {{
@@ -481,7 +359,7 @@ mod tests {
         ];
 
         for (name, input, expected) in cases {
-            let result = parse_import_map(input);
+            let result = parse_import_map_for_test(input);
             match expected {
                 Ok(Some((key, url))) => {
                     let map =
@@ -679,7 +557,7 @@ mod tests {
     #[test]
     fn parse_max_imports_default_is_allow_all() {
         assert_eq!(
-            parse_max_imports_setting(None, "test").unwrap(),
+            parse_max_imports_for_test(None).unwrap(),
             ImportUrlCap::AllowAll
         );
     }
@@ -687,11 +565,11 @@ mod tests {
     #[test]
     fn parse_max_imports_keywords() {
         assert_eq!(
-            parse_max_imports_setting(Some("*".to_string()), "test").unwrap(),
+            parse_max_imports_for_test(Some("*".to_string())).unwrap(),
             ImportUrlCap::AllowAll
         );
         assert_eq!(
-            parse_max_imports_setting(Some("none".to_string()), "test").unwrap(),
+            parse_max_imports_for_test(Some("none".to_string())).unwrap(),
             ImportUrlCap::Deny
         );
     }
@@ -699,10 +577,9 @@ mod tests {
     #[test]
     fn parse_max_imports_url_list_normalizes_and_deduplicates() {
         assert_eq!(
-            parse_max_imports_setting(
-                Some(" https://esm.sh , https://esm.sh/ , https://deno.land/x/ ".to_string()),
-                "test",
-            )
+            parse_max_imports_for_test(Some(
+                " https://esm.sh , https://esm.sh/ , https://deno.land/x/ ".to_string(),
+            ))
             .unwrap(),
             ImportUrlCap::AllowList(vec![
                 "https://esm.sh/".to_string(),
@@ -713,8 +590,7 @@ mod tests {
 
     #[test]
     fn parse_max_imports_rejects_non_http_scheme() {
-        let err =
-            parse_max_imports_setting(Some("file:///tmp".to_string()), "test").unwrap_err();
+        let err = parse_max_imports_for_test(Some("file:///tmp".to_string())).unwrap_err();
         assert!(err.contains("unsupported scheme"), "err={err}");
     }
 
