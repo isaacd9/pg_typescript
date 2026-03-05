@@ -13,7 +13,15 @@ mod runtime;
 /// GUC for DO-block import maps. Use `SET LOCAL typescript.import_map = '{"imports": {...}}'`
 /// before a DO block so the setting reverts automatically at transaction end.
 /// Per-function import maps are stored in proconfig via `CREATE FUNCTION … SET`.
+/// Default: unset (`None`), treated as no import map.
 pub(crate) static IMPORT_MAP_GUC: GucSetting<Option<std::ffi::CString>> =
+    GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Superuser cap for allowed import-map URL prefixes. Values:
+/// - `off|none|deny|false` => deny all imports
+/// - `*|all|on|true` => allow all imports
+/// - `a,b,c` => allowlist of URL prefixes
+/// Default: unset (`None`), treated as allow all imports.
+pub(crate) static MAX_IMPORTS_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 
 /// Userset permission request knobs (function-level via `CREATE FUNCTION ... SET`, or
@@ -21,44 +29,61 @@ pub(crate) static IMPORT_MAP_GUC: GucSetting<Option<std::ffi::CString>> =
 /// - `off|none|deny|false` => deny
 /// - `*|all|on|true` => allow all
 /// - `a,b,c` => allowlist
+/// Default for each `allow_*` GUC: unset (`None`), treated as deny.
 pub(crate) static ALLOW_READ_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_WRITE_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_NET_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_ENV_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_RUN_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_FFI_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_SYS_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_IMPORT_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 
 /// Superuser caps for each permission. `allow_*` requests must be fully
 /// satisfiable by `max_allow_*`; otherwise execution fails with an error.
+/// Default for each `max_allow_*` GUC: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_READ_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_WRITE_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_NET_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_ENV_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_RUN_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_FFI_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_SYS_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
+/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_IMPORT_GUC: GucSetting<Option<std::ffi::CString>> =
     GucSetting::<Option<std::ffi::CString>>::new(None);
 
 /// If enabled, eagerly initialize the per-backend Deno runtime in `_PG_init`.
 /// This shifts cold-start latency from first function execution to extension load.
+/// Default: `true`.
 pub(crate) static PREWARM_RUNTIME_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 // Register the GUC for per-function import maps.
@@ -70,6 +95,14 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         c"",
         &IMPORT_MAP_GUC,
         GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.max_imports",
+        c"Superuser max import URL cap: off|*|comma-list of http(s) URL prefixes",
+        c"",
+        &MAX_IMPORTS_GUC,
+        GucContext::Suset,
         GucFlags::default(),
     );
 

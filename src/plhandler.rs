@@ -65,7 +65,7 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
     let arg_types = proc.proargtypes();
     let nargs = proc.pronargs();
     let param_names = build_param_names(&proc.proargnames(), nargs);
-    let import_map = read_import_map(&proc);
+    let (import_map, _max_imports) = read_import_map(&proc);
     let permissions = read_function_permissions(&proc);
 
     let args: Vec<PgDatum> = (0..nargs)
@@ -119,7 +119,7 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     let nargs = proc.pronargs();
     let param_names = build_param_names(&proc.proargnames(), nargs);
     let params = param_names.join(", ");
-    let import_map = read_import_map(&proc);
+    let (import_map, _max_imports) = read_import_map(&proc);
     let permissions = read_function_permissions(&proc);
 
     // If the function declares an import map, fetch all dependencies now.
@@ -130,7 +130,9 @@ pub unsafe extern "C-unwind" fn typescript_validator(
             &import_map,
             &mut fetch::PgModuleStore,
             &fetch::UreqFetcher,
-        );
+            &_max_imports,
+        )
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
     }
 
     // Assemble the same module source the call handler will use so that the
@@ -204,7 +206,7 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             .unwrap_or("")
             .to_string();
 
-        let import_map = read_inline_import_map();
+        let (import_map, _max_imports) = read_inline_import_map();
         let permissions = read_inline_permissions();
 
         // Fetch and cache all dependencies before execution — network access
@@ -216,7 +218,9 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
                 &import_map,
                 &mut fetch::PgModuleStore,
                 &fetch::UreqFetcher,
-            );
+                &_max_imports,
+            )
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
         }
 
         execute_inline_block(&source, &import_map, &permissions, make_module_store());
@@ -489,29 +493,80 @@ where
 // Import map helpers
 // ---------------------------------------------------------------------------
 
+/// Read `typescript.max_imports` from GUC and parse it into an import-URL cap.
+fn read_max_imports_cap() -> fetch::ImportUrlCap {
+    let raw = crate::MAX_IMPORTS_GUC
+        .get()
+        .and_then(|cstr| cstr.to_str().ok().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty());
+    fetch::parse_max_imports_setting(raw, "GUC typescript.max_imports")
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+}
+
+fn format_import_urls(values: &[String]) -> String {
+    format!("[{}]", values.join(","))
+}
+
+fn enforce_import_map_cap(
+    import_map: &HashMap<String, String>,
+    max_imports: &fetch::ImportUrlCap,
+    requested_source: &str,
+) {
+    let mut requested: Vec<String> = import_map.values().cloned().collect();
+    requested.sort();
+    requested.dedup();
+
+    let mut disallowed = Vec::new();
+    for url in &requested {
+        match fetch::import_url_allowed(url, max_imports) {
+            Ok(true) => {}
+            Ok(false) => disallowed.push(url.clone()),
+            Err(e) => pgrx::error!("pg_typescript: {e}"),
+        }
+    }
+
+    if !disallowed.is_empty() {
+        pgrx::error!(
+            "pg_typescript: {requested_source} cannot be fulfilled by GUC typescript.max_imports: requested {} includes disallowed values {}",
+            format_import_urls(&requested),
+            format_import_urls(&disallowed),
+        );
+    }
+}
+
 /// Read the `typescript.import_map` value from a function's proconfig and
-/// parse it into a specifier → URL map.
-fn read_import_map(proc: &PgProc) -> HashMap<String, String> {
-    match read_function_config(proc, "typescript.import_map") {
+/// parse it into a specifier → URL map, enforcing `typescript.max_imports`.
+fn read_import_map(proc: &PgProc) -> (HashMap<String, String>, fetch::ImportUrlCap) {
+    let max_imports = read_max_imports_cap();
+    let map = match read_function_config(proc, "typescript.import_map") {
         Some(j) => {
             fetch::parse_import_map(&j).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
         }
         None => HashMap::new(),
-    }
+    };
+    enforce_import_map_cap(
+        &map,
+        &max_imports,
+        "function setting typescript.import_map",
+    );
+    (map, max_imports)
 }
 
 /// Read the `typescript.import_map` GUC (set via `SET LOCAL typescript.import_map = '...'`)
-/// and parse it for use by DO blocks.
-fn read_inline_import_map() -> HashMap<String, String> {
+/// and parse it for use by DO blocks, enforcing `typescript.max_imports`.
+fn read_inline_import_map() -> (HashMap<String, String>, fetch::ImportUrlCap) {
+    let max_imports = read_max_imports_cap();
     let json = crate::IMPORT_MAP_GUC
         .get()
         .and_then(|cstr| cstr.to_str().ok().map(|s| s.to_string()));
-    match json.as_deref() {
+    let map = match json.as_deref() {
         Some(j) if !j.is_empty() => {
             fetch::parse_import_map(j).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
         }
         _ => HashMap::new(),
-    }
+    };
+    enforce_import_map_cap(&map, &max_imports, "GUC typescript.import_map");
+    (map, max_imports)
 }
 
 // ---------------------------------------------------------------------------

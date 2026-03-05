@@ -86,5 +86,26 @@ SELECT ts_perm_stmt_fails_with(
   'cannot be fulfilled by'
 ) AS env_exec_rejects_after_cap_tightened;
 
+SET typescript.max_imports = 'https://deno.land/x/';
+SELECT ts_perm_stmt_fails_with($sql$
+  CREATE OR REPLACE FUNCTION ts_perm_import_map_disallowed() RETURNS int
+  LANGUAGE typescript
+  SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
+  AS $fn$
+    return 1;
+  $fn$;
+$sql$, 'cannot be fulfilled by') AS import_map_create_rejects_outside_max;
+
+SET typescript.max_imports = 'none';
+SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}';
+SELECT ts_perm_stmt_fails_with($sql$
+  DO $do$
+    const x = 40 + 2;
+    if (x !== 42) throw new Error('bad math');
+  $do$ LANGUAGE typescript;
+$sql$, 'cannot be fulfilled by') AS inline_import_map_rejects_when_cap_none;
+RESET typescript.import_map;
+
 RESET typescript.max_allow_net;
 RESET typescript.max_allow_env;
+RESET typescript.max_imports;

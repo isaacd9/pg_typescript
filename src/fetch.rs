@@ -1,6 +1,72 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ImportUrlCap {
+    Deny,
+    #[default]
+    AllowAll,
+    AllowList(Vec<String>),
+}
+
+pub fn parse_max_imports_setting(raw: Option<String>, source: &str) -> Result<ImportUrlCap, String> {
+    let Some(value) = raw else {
+        return Ok(ImportUrlCap::AllowAll);
+    };
+
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "off" | "none" | "deny" | "false" | "0" => Ok(ImportUrlCap::Deny),
+        "*" | "all" | "on" | "true" | "1" => Ok(ImportUrlCap::AllowAll),
+        _ => parse_import_prefix_list(&value, source).map(ImportUrlCap::AllowList),
+    }
+}
+
+pub fn import_url_allowed(url: &str, cap: &ImportUrlCap) -> Result<bool, String> {
+    match cap {
+        ImportUrlCap::AllowAll => Ok(true),
+        ImportUrlCap::Deny => Ok(false),
+        ImportUrlCap::AllowList(prefixes) => {
+            let normalized = normalize_http_url(url, "import URL")?;
+            Ok(prefixes.iter().any(|prefix| normalized.starts_with(prefix)))
+        }
+    }
+}
+
+fn parse_import_prefix_list(value: &str, source: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
+    for raw in value.split(',') {
+        let item = raw.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let normalized = normalize_http_url(item, source)?;
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+
+    if out.is_empty() {
+        return Err(format!("invalid empty max_imports list in {source}"));
+    }
+
+    Ok(out)
+}
+
+fn normalize_http_url(url: &str, source: &str) -> Result<String, String> {
+    use deno_core::ModuleSpecifier;
+    let parsed =
+        ModuleSpecifier::parse(url).map_err(|e| format!("invalid URL '{url}' in {source}: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed.to_string()),
+        scheme => Err(format!(
+            "invalid URL '{url}' in {source}: unsupported scheme '{scheme}' (only http/https allowed)"
+        )),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // ModuleStore trait
@@ -247,15 +313,23 @@ pub fn fetch_and_cache<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
     import_map: &HashMap<String, String>,
     store: &mut S,
     fetcher: &F,
-) {
-    use std::collections::HashSet;
+    max_imports: &ImportUrlCap,
+) -> Result<(), String> {
+    for url in import_map.values() {
+        if !import_url_allowed(url, max_imports)? {
+            return Err(format!(
+                "import URL '{url}' is not allowed by GUC typescript.max_imports"
+            ));
+        }
+    }
 
     store.clear_for_fn(fn_oid_raw);
 
     let mut visited: HashSet<String> = HashSet::new();
     for url in import_map.values() {
-        fetch_recursive(fn_oid_raw, url, &mut visited, store, fetcher);
+        fetch_recursive(fn_oid_raw, url, &mut visited, store, fetcher, max_imports)?;
     }
+    Ok(())
 }
 
 fn fetch_recursive<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
@@ -264,9 +338,16 @@ fn fetch_recursive<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
     visited: &mut std::collections::HashSet<String>,
     store: &mut S,
     fetcher: &F,
-) {
+    max_imports: &ImportUrlCap,
+) -> Result<(), String> {
+    if !import_url_allowed(url, max_imports)? {
+        return Err(format!(
+            "import URL '{url}' is not allowed by GUC typescript.max_imports"
+        ));
+    }
+
     if visited.contains(url) {
-        return;
+        return Ok(());
     }
     visited.insert(url.to_string());
 
@@ -275,9 +356,10 @@ fn fetch_recursive<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
 
     for dep_specifier in extract_imports(&source) {
         if let Some(dep_url) = resolve_specifier(&dep_specifier, url) {
-            fetch_recursive(fn_oid_raw, &dep_url, visited, store, fetcher);
+            fetch_recursive(fn_oid_raw, &dep_url, visited, store, fetcher, max_imports)?;
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -431,7 +513,9 @@ mod tests {
             &make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
             &mut store,
             &fetcher,
-        );
+            &ImportUrlCap::AllowAll,
+        )
+        .unwrap();
 
         assert_eq!(
             store.load(42, "https://esm.sh/lodash@4"),
@@ -450,7 +534,9 @@ mod tests {
             &make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
             &mut store,
             &fetcher,
-        );
+            &ImportUrlCap::AllowAll,
+        )
+        .unwrap();
 
         assert_eq!(store.load(42, "https://esm.sh/stale"), Ok(None));
         assert!(store.load(42, "https://esm.sh/lodash@4").unwrap().is_some());
@@ -467,7 +553,9 @@ mod tests {
             &make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
             &mut store,
             &fetcher,
-        );
+            &ImportUrlCap::AllowAll,
+        )
+        .unwrap();
 
         assert_eq!(
             store.load(99, "https://esm.sh/other"),
@@ -489,7 +577,9 @@ mod tests {
             &make_import_map(&[("pkg", "https://esm.sh/pkg@1")]),
             &mut store,
             &fetcher,
-        );
+            &ImportUrlCap::AllowAll,
+        )
+        .unwrap();
 
         assert!(store.load(0, "https://esm.sh/pkg@1").unwrap().is_some());
         assert!(store.load(0, "https://esm.sh/utils.js").unwrap().is_some());
@@ -509,7 +599,9 @@ mod tests {
             ]),
             &mut store,
             &fetcher,
-        );
+            &ImportUrlCap::AllowAll,
+        )
+        .unwrap();
 
         // Would panic inside HashMapFetcher if fetched more than once and we
         // hadn't inserted it — but the visited set prevents duplicate fetches.
@@ -579,6 +671,74 @@ mod tests {
         assert_eq!(
             resolve_specifier("/v135/lodash@4/index.js", "https://esm.sh/pkg"),
             Some("https://esm.sh/v135/lodash@4/index.js".to_string())
+        );
+    }
+
+    // --- max_imports --------------------------------------------------------
+
+    #[test]
+    fn parse_max_imports_default_is_allow_all() {
+        assert_eq!(
+            parse_max_imports_setting(None, "test").unwrap(),
+            ImportUrlCap::AllowAll
+        );
+    }
+
+    #[test]
+    fn parse_max_imports_keywords() {
+        assert_eq!(
+            parse_max_imports_setting(Some("*".to_string()), "test").unwrap(),
+            ImportUrlCap::AllowAll
+        );
+        assert_eq!(
+            parse_max_imports_setting(Some("none".to_string()), "test").unwrap(),
+            ImportUrlCap::Deny
+        );
+    }
+
+    #[test]
+    fn parse_max_imports_url_list_normalizes_and_deduplicates() {
+        assert_eq!(
+            parse_max_imports_setting(
+                Some(" https://esm.sh , https://esm.sh/ , https://deno.land/x/ ".to_string()),
+                "test",
+            )
+            .unwrap(),
+            ImportUrlCap::AllowList(vec![
+                "https://esm.sh/".to_string(),
+                "https://deno.land/x/".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn parse_max_imports_rejects_non_http_scheme() {
+        let err =
+            parse_max_imports_setting(Some("file:///tmp".to_string()), "test").unwrap_err();
+        assert!(err.contains("unsupported scheme"), "err={err}");
+    }
+
+    #[test]
+    fn fetch_rejects_disallowed_transitive_url() {
+        let fetcher = make_fetcher![
+            "https://esm.sh/pkg@1" => "export { x } from 'https://deno.land/x/mod.ts';",
+            "https://deno.land/x/mod.ts" => "export const x = 1;",
+        ];
+        let mut store = HashMapModuleStore::new();
+        let cap = ImportUrlCap::AllowList(vec!["https://esm.sh/".to_string()]);
+
+        let err = fetch_and_cache(
+            0,
+            &make_import_map(&[("pkg", "https://esm.sh/pkg@1")]),
+            &mut store,
+            &fetcher,
+            &cap,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.contains("not allowed by GUC typescript.max_imports"),
+            "err={err}"
         );
     }
 }
