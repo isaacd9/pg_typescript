@@ -1,4 +1,4 @@
-use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
+use pgrx::guc::{GucContext, GucFlags, GucRegistry};
 use pgrx::prelude::*;
 
 pgrx::pg_module_magic!(name, version);
@@ -65,11 +65,6 @@ pub(crate) static MAX_ALLOW_FFI_GUC: PermissionParser = PermissionParser::new();
 pub(crate) static MAX_ALLOW_SYS_GUC: PermissionParser = PermissionParser::new();
 /// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_IMPORT_GUC: PermissionParser = PermissionParser::new();
-
-/// If enabled, eagerly initialize the per-backend Deno runtime in `_PG_init`.
-/// This shifts cold-start latency from first function execution to extension load.
-/// Default: `true`.
-pub(crate) static PREWARM_RUNTIME_GUC: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 // Register the GUC for per-function import maps.
 #[pg_guard]
@@ -221,16 +216,8 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
 
-    GucRegistry::define_bool_guc(
-        c"typescript.prewarm_runtime",
-        c"Eagerly initialize pg_typescript runtime in each backend",
-        c"",
-        &PREWARM_RUNTIME_GUC,
-        GucContext::Userset,
-        GucFlags::default(),
-    );
     // Don't initialize V8 in the postmaster process.
-    if PREWARM_RUNTIME_GUC.get() && unsafe { pg_sys::IsUnderPostmaster } {
+    if unsafe { pg_sys::IsUnderPostmaster } {
         runtime::prewarm_runtime();
     }
 }

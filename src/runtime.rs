@@ -158,8 +158,8 @@ where
 
 /// Eagerly initialize the per-connection runtime.
 ///
-/// This is used by `_PG_init` when `typescript.prewarm_runtime` is enabled so
-/// first function execution does not pay runtime bootstrap latency.
+/// This is called from `_PG_init` in backend processes so first function
+/// execution does not pay runtime bootstrap latency.
 pub fn prewarm_runtime() {
     with_runtime(|_| ());
 }
