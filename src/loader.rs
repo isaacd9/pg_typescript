@@ -419,7 +419,10 @@ mod tests {
                 ResolutionKind::Import,
             )
             .unwrap();
-        assert_eq!(url.as_str(), "file:///pg_typescript/fn_1_deadbeefdeadbeef.ts");
+        assert_eq!(
+            url.as_str(),
+            "file:///pg_typescript/fn_1_deadbeefdeadbeef.ts"
+        );
     }
 
     #[test]

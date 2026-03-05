@@ -139,11 +139,15 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
     fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
         let datum = match self.oid {
             pg_sys::INT2OID => i16::try_from(v)
-                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int2: {v}")))?
+                .map_err(|_| {
+                    E::custom(format!("pg_typescript: integer out of range for int2: {v}"))
+                })?
                 .into_datum()
                 .unwrap(),
             pg_sys::INT4OID => i32::try_from(v)
-                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int4: {v}")))?
+                .map_err(|_| {
+                    E::custom(format!("pg_typescript: integer out of range for int4: {v}"))
+                })?
                 .into_datum()
                 .unwrap(),
             pg_sys::INT8OID => v.into_datum().unwrap(),
@@ -158,15 +162,21 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
     fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
         let datum = match self.oid {
             pg_sys::INT2OID => i16::try_from(v)
-                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int2: {v}")))?
+                .map_err(|_| {
+                    E::custom(format!("pg_typescript: integer out of range for int2: {v}"))
+                })?
                 .into_datum()
                 .unwrap(),
             pg_sys::INT4OID => i32::try_from(v)
-                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int4: {v}")))?
+                .map_err(|_| {
+                    E::custom(format!("pg_typescript: integer out of range for int4: {v}"))
+                })?
                 .into_datum()
                 .unwrap(),
             pg_sys::INT8OID => i64::try_from(v)
-                .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int8: {v}")))?
+                .map_err(|_| {
+                    E::custom(format!("pg_typescript: integer out of range for int8: {v}"))
+                })?
                 .into_datum()
                 .unwrap(),
             pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
@@ -189,7 +199,9 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
                     E::custom(format!("pg_typescript: integer out of range for int2: {v}"))
                 })?;
                 i16::try_from(iv)
-                    .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int2: {v}")))?
+                    .map_err(|_| {
+                        E::custom(format!("pg_typescript: integer out of range for int2: {v}"))
+                    })?
                     .into_datum()
                     .unwrap()
             }
@@ -203,7 +215,9 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
                     E::custom(format!("pg_typescript: integer out of range for int4: {v}"))
                 })?;
                 i32::try_from(iv)
-                    .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int4: {v}")))?
+                    .map_err(|_| {
+                        E::custom(format!("pg_typescript: integer out of range for int4: {v}"))
+                    })?
                     .into_datum()
                     .unwrap()
             }
@@ -213,8 +227,9 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
                         "pg_typescript: expected integral number for int8, got {v}"
                     )));
                 }
-                let iv = i64::try_from(v as i128)
-                    .map_err(|_| E::custom(format!("pg_typescript: integer out of range for int8: {v}")))?;
+                let iv = i64::try_from(v as i128).map_err(|_| {
+                    E::custom(format!("pg_typescript: integer out of range for int8: {v}"))
+                })?;
                 iv.into_datum().unwrap()
             }
             pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
@@ -231,7 +246,9 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
             pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID => {
                 v.into_datum().unwrap()
             }
-            pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::String(v.to_owned())).into_datum().unwrap(),
+            pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::String(v.to_owned()))
+                .into_datum()
+                .unwrap(),
             oid if classify_oid(oid) != OidCategory::Scalar => input_fn_call(v, oid),
             _ => return Err(E::custom(type_mismatch_message(self.oid, "string"))),
         };
@@ -267,7 +284,9 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
         let value = Value::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
         let datum = match self.oid {
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(value).into_datum().unwrap(),
-            oid if classify_oid(oid) != OidCategory::Scalar => input_fn_call(&value.to_string(), oid),
+            oid if classify_oid(oid) != OidCategory::Scalar => {
+                input_fn_call(&value.to_string(), oid)
+            }
             _ => return Err(A::Error::custom(type_mismatch_message(self.oid, "array"))),
         };
         Ok((datum, false))
@@ -360,8 +379,7 @@ unsafe fn build_heap_tuple(
         }
     }
 
-    let tuple =
-        pg_sys::heap_form_tuple(tupdesc.as_ptr(), datums.as_mut_ptr(), nulls.as_mut_ptr());
+    let tuple = pg_sys::heap_form_tuple(tupdesc.as_ptr(), datums.as_mut_ptr(), nulls.as_mut_ptr());
 
     // HeapTupleGetDatum: PointerGetDatum(tuple->t_data)
     Ok(pg_sys::Datum::from((*tuple).t_data as usize))
@@ -373,7 +391,9 @@ unsafe fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String 
     let mut is_varlena: bool = false;
     pg_sys::getTypeOutputInfo(type_oid, &mut output_fn, &mut is_varlena);
     let cstr = pg_sys::OidOutputFunctionCall(output_fn, datum);
-    let result = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+    let result = std::ffi::CStr::from_ptr(cstr)
+        .to_string_lossy()
+        .into_owned();
     pg_sys::pfree(cstr.cast());
     result
 }

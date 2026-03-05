@@ -351,16 +351,17 @@ mod unit_tests {
                 &allow_list(&["USER", "PATH", "SHELL"]),
                 &allow_list(&["PATH", "HOME", "USER"])
             ),
-            Some(
-                "requested [USER,PATH,SHELL] includes disallowed values [SHELL]".to_string()
-            )
+            Some("requested [USER,PATH,SHELL] includes disallowed values [SHELL]".to_string())
         );
     }
 
     #[test]
     fn unfulfillable_detail_accepts_subset() {
         assert_eq!(
-            unfulfillable_detail(&allow_list(&["USER", "PATH"]), &allow_list(&["PATH", "USER"])),
+            unfulfillable_detail(
+                &allow_list(&["USER", "PATH"]),
+                &allow_list(&["PATH", "USER"])
+            ),
             None
         );
     }

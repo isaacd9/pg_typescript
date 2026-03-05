@@ -13,7 +13,9 @@ use crate::convert::{PgDatum, PgDatumSeed};
 use crate::fetch;
 use crate::guc::{import_url_allowed, GucParser, ImportUrlCap};
 use crate::loader;
-use crate::permissions::{read_function_config, read_function_permissions, read_inline_permissions};
+use crate::permissions::{
+    read_function_config, read_function_permissions, read_inline_permissions,
+};
 use crate::runtime::{
     block_on, ensure_console_hook, set_runtime_permissions, with_runtime, with_tokio_context,
     RuntimePermissions,
@@ -267,9 +269,13 @@ fn build_param_names(arg_names: &[Option<String>], nargs: usize) -> Vec<String> 
 /// Return a module store appropriate for the current build target.
 fn make_module_store() -> Box<dyn fetch::ModuleStore> {
     #[cfg(not(test))]
-    { Box::new(fetch::PgModuleStore) }
+    {
+        Box::new(fetch::PgModuleStore)
+    }
     #[cfg(test)]
-    { Box::new(fetch::HashMapModuleStore::new()) }
+    {
+        Box::new(fetch::HashMapModuleStore::new())
+    }
 }
 
 /// Look up `(oid, hash)` in `FN_CACHE`, or load, evaluate, and cache the module.
@@ -413,7 +419,11 @@ fn assemble_module(body: &str, import_map: &HashMap<String, String>, params: &st
     for key in import_map.keys() {
         write!(module, "import * as {key} from \"{key}\";\n").unwrap();
     }
-    write!(module, "\nexport default async function({params}) {{\n{body}\n}}\n").unwrap();
+    write!(
+        module,
+        "\nexport default async function({params}) {{\n{body}\n}}\n"
+    )
+    .unwrap();
     module
 }
 
@@ -542,11 +552,7 @@ fn read_import_map(proc: &PgProc) -> (HashMap<String, String>, ImportUrlCap) {
             "function setting typescript.import_map",
         )
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
-    enforce_import_map_cap(
-        &map,
-        &max_imports,
-        "function setting typescript.import_map",
-    );
+    enforce_import_map_cap(&map, &max_imports, "function setting typescript.import_map");
     (map, max_imports)
 }
 
