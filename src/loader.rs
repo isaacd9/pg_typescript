@@ -22,7 +22,7 @@ struct LoaderContext {
 }
 
 thread_local! {
-    static LOADER_CTX: RefCell<Option<LoaderContext>> = RefCell::new(None);
+    static LOADER_CTX: RefCell<Option<LoaderContext>> = const { RefCell::new(None) };
 }
 
 /// RAII guard returned by [`set_loader_context`].

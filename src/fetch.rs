@@ -64,14 +64,14 @@ impl ModuleStore for PgModuleStore {
 
         let pg_oid = pg_sys::Oid::from(fn_oid);
         Spi::connect(|client| {
-            let rows = client.select(
+            let mut rows = client.select(
                 "SELECT source \
                  FROM deno_internal.deno_package_modules \
                  WHERE function_oid = $1 AND url = $2",
                 None,
                 &[pg_oid.into(), url.to_string().into()],
             )?;
-            for row in rows {
+            if let Some(row) = rows.next() {
                 let src: Option<String> = row["source"].value()?;
                 return Ok(src);
             }

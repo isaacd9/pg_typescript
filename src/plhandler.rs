@@ -419,7 +419,7 @@ fn assemble_module(body: &str, import_map: &HashMap<String, String>, params: &st
     use std::fmt::Write as _;
     let mut module = String::new();
     for key in import_map.keys() {
-        write!(module, "import * as {key} from \"{key}\";\n").unwrap();
+        writeln!(module, "import * as {key} from \"{key}\";").unwrap();
     }
     write!(
         module,

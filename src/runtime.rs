@@ -20,8 +20,8 @@ const STARTUP_SNAPSHOT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pg_typescript_runtime.snap"));
 
 thread_local! {
-    static JS_RT: RefCell<Option<MainWorker>> = RefCell::new(None);
-    static TOKIO_RT: RefCell<Option<tokio::runtime::Runtime>> = RefCell::new(None);
+    static JS_RT: RefCell<Option<MainWorker>> = const { RefCell::new(None) };
+    static TOKIO_RT: RefCell<Option<tokio::runtime::Runtime>> = const { RefCell::new(None) };
 }
 
 static RUSTLS_PROVIDER_INIT: Once = Once::new();

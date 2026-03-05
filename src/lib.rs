@@ -22,6 +22,7 @@ pub(crate) static IMPORT_MAP_GUC: ImportMapParser = ImportMapParser::new();
 /// - `off|none|deny|false` => deny all imports
 /// - `*|all|on|true` => allow all imports
 /// - `a,b,c` => allowlist of URL prefixes
+///
 /// Default: unset (`None`), treated as allow all imports.
 pub(crate) static MAX_IMPORTS_GUC: MaxImportsParser = MaxImportsParser::new();
 
@@ -30,6 +31,7 @@ pub(crate) static MAX_IMPORTS_GUC: MaxImportsParser = MaxImportsParser::new();
 /// - `off|none|deny|false` => deny
 /// - `*|all|on|true` => allow all
 /// - `a,b,c` => allowlist
+///
 /// Default for each `allow_*` GUC: unset (`None`), treated as deny.
 pub(crate) static ALLOW_READ_GUC: PermissionParser = PermissionParser::new();
 /// Default: unset (`None`), treated as deny.
