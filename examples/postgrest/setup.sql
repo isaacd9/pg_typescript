@@ -1,8 +1,6 @@
 LOAD 'pg_typescript';
 
 CREATE EXTENSION IF NOT EXISTS pg_typescript;
-GRANT USAGE ON SCHEMA deno_internal TO PUBLIC;
-GRANT SELECT ON TABLE deno_internal.deno_package_modules TO PUBLIC;
 
 CREATE OR REPLACE FUNCTION public.ts_generate_fun_payload()
 RETURNS jsonb

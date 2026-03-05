@@ -44,4 +44,4 @@ echo "Starting PostgREST on http://${PGRST_SERVER_HOST}:${PGRST_SERVER_PORT}"
 echo "Using schemas: ${PGRST_DB_SCHEMAS}"
 echo "Anon role: ${PGRST_DB_ANON_ROLE}"
 
-exec postgrest "${postgrest_args[@]}"
+exec postgrest ${postgrest_args[@]+"${postgrest_args[@]}"}

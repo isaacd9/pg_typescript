@@ -132,7 +132,7 @@ const CONSOLE_HOOK_JS: &str = r#"
 "#;
 
 fn install_console_hook(rt: &mut JsRuntime) {
-    rt.execute_script("pg_typescript:console_hook", CONSOLE_HOOK_JS.to_string())
+    rt.execute_script("pg_typescript:console_hook", CONSOLE_HOOK_JS)
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to install console hook: {e}"));
 }
 
@@ -172,9 +172,7 @@ pub fn set_runtime_permissions(rt: &mut JsRuntime, permissions: &RuntimePermissi
         .put::<PermissionsContainer>(container);
 }
 
-/// Block the current thread on an async future, using a per-connection
-/// single-threaded Tokio runtime.
-pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+fn ensure_tokio_rt() {
     TOKIO_RT.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if borrow.is_none() {
@@ -186,7 +184,12 @@ pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
             );
         }
     });
+}
 
+/// Block the current thread on an async future, using a per-connection
+/// single-threaded Tokio runtime.
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    ensure_tokio_rt();
     TOKIO_RT.with(|cell| cell.borrow().as_ref().unwrap().block_on(future))
 }
 
@@ -198,18 +201,7 @@ pub fn with_tokio_context<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    TOKIO_RT.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        if borrow.is_none() {
-            *borrow = Some(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("pg_typescript: failed to create tokio runtime"),
-            );
-        }
-    });
-
+    ensure_tokio_rt();
     TOKIO_RT.with(|cell| {
         let borrow = cell.borrow();
         let _guard = borrow.as_ref().unwrap().enter();

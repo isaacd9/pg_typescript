@@ -26,6 +26,13 @@ impl HashMapModuleStore {
     }
 }
 
+#[allow(dead_code)]
+impl Default for HashMapModuleStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ModuleStore for HashMapModuleStore {
     fn load(&self, fn_oid: u32, url: &str) -> Result<Option<String>, String> {
         Ok(self.0.get(&(fn_oid, url.to_string())).cloned())
@@ -126,6 +133,13 @@ impl HashMapFetcher {
     #[allow(dead_code)]
     pub fn insert(&mut self, url: impl Into<String>, source: impl Into<String>) {
         self.0.insert(url.into(), source.into());
+    }
+}
+
+#[allow(dead_code)]
+impl Default for HashMapFetcher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

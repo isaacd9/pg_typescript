@@ -24,7 +24,7 @@ struct PermissionSpec {
     import: PermissionValue,
 }
 
-fn read_function_config(proc: &PgProc, key: &str) -> Option<String> {
+pub(crate) fn read_function_config(proc: &PgProc, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
     proc.proconfig()
         .unwrap_or_default()
@@ -69,55 +69,7 @@ pub(crate) fn read_function_permissions(proc: &PgProc) -> RuntimePermissions {
     };
 
     let max = read_max_permissions();
-    enforce_permission_cap(
-        &requested.read,
-        &max.read,
-        "function setting typescript.allow_read",
-        "GUC typescript.max_allow_read",
-    );
-    enforce_permission_cap(
-        &requested.write,
-        &max.write,
-        "function setting typescript.allow_write",
-        "GUC typescript.max_allow_write",
-    );
-    enforce_permission_cap(
-        &requested.net,
-        &max.net,
-        "function setting typescript.allow_net",
-        "GUC typescript.max_allow_net",
-    );
-    enforce_permission_cap(
-        &requested.env,
-        &max.env,
-        "function setting typescript.allow_env",
-        "GUC typescript.max_allow_env",
-    );
-    enforce_permission_cap(
-        &requested.run,
-        &max.run,
-        "function setting typescript.allow_run",
-        "GUC typescript.max_allow_run",
-    );
-    enforce_permission_cap(
-        &requested.ffi,
-        &max.ffi,
-        "function setting typescript.allow_ffi",
-        "GUC typescript.max_allow_ffi",
-    );
-    enforce_permission_cap(
-        &requested.sys,
-        &max.sys,
-        "function setting typescript.allow_sys",
-        "GUC typescript.max_allow_sys",
-    );
-    enforce_permission_cap(
-        &requested.import,
-        &max.import,
-        "function setting typescript.allow_import",
-        "GUC typescript.max_allow_import",
-    );
-
+    enforce_all_caps(&requested, &max, "function setting typescript");
     effective_permissions(requested, max)
 }
 
@@ -158,55 +110,7 @@ pub(crate) fn read_inline_permissions() -> RuntimePermissions {
     };
 
     let max = read_max_permissions();
-    enforce_permission_cap(
-        &requested.read,
-        &max.read,
-        "GUC typescript.allow_read",
-        "GUC typescript.max_allow_read",
-    );
-    enforce_permission_cap(
-        &requested.write,
-        &max.write,
-        "GUC typescript.allow_write",
-        "GUC typescript.max_allow_write",
-    );
-    enforce_permission_cap(
-        &requested.net,
-        &max.net,
-        "GUC typescript.allow_net",
-        "GUC typescript.max_allow_net",
-    );
-    enforce_permission_cap(
-        &requested.env,
-        &max.env,
-        "GUC typescript.allow_env",
-        "GUC typescript.max_allow_env",
-    );
-    enforce_permission_cap(
-        &requested.run,
-        &max.run,
-        "GUC typescript.allow_run",
-        "GUC typescript.max_allow_run",
-    );
-    enforce_permission_cap(
-        &requested.ffi,
-        &max.ffi,
-        "GUC typescript.allow_ffi",
-        "GUC typescript.max_allow_ffi",
-    );
-    enforce_permission_cap(
-        &requested.sys,
-        &max.sys,
-        "GUC typescript.allow_sys",
-        "GUC typescript.max_allow_sys",
-    );
-    enforce_permission_cap(
-        &requested.import,
-        &max.import,
-        "GUC typescript.allow_import",
-        "GUC typescript.max_allow_import",
-    );
-
+    enforce_all_caps(&requested, &max, "GUC typescript");
     effective_permissions(requested, max)
 }
 
@@ -249,8 +153,7 @@ fn read_max_permissions() -> PermissionSpec {
 
 fn guc_value(value: Option<std::ffi::CString>) -> Option<String> {
     value
-        .and_then(|cstr| cstr.to_str().ok().map(|s| s.to_string()))
-        .map(|s| s.trim().to_string())
+        .and_then(|cstr| cstr.to_str().ok().map(|s| s.trim().to_string()))
         .filter(|s| !s.is_empty())
 }
 
@@ -312,6 +215,31 @@ fn enforce_permission_cap(
     }
 }
 
+/// Enforce max caps for all 8 permission kinds at once.
+///
+/// `requested_prefix` is prepended to each permission name in error messages,
+/// e.g. `"function setting typescript"` or `"GUC typescript"`.
+fn enforce_all_caps(requested: &PermissionSpec, max: &PermissionSpec, requested_prefix: &str) {
+    let fields: &[(&PermissionValue, &PermissionValue, &str)] = &[
+        (&requested.read, &max.read, "allow_read"),
+        (&requested.write, &max.write, "allow_write"),
+        (&requested.net, &max.net, "allow_net"),
+        (&requested.env, &max.env, "allow_env"),
+        (&requested.run, &max.run, "allow_run"),
+        (&requested.ffi, &max.ffi, "allow_ffi"),
+        (&requested.sys, &max.sys, "allow_sys"),
+        (&requested.import, &max.import, "allow_import"),
+    ];
+    for (req, cap, name) in fields {
+        enforce_permission_cap(
+            req,
+            cap,
+            &format!("{requested_prefix}.{name}"),
+            &format!("GUC typescript.max_{name}"),
+        );
+    }
+}
+
 fn unfulfillable_detail(requested: &PermissionValue, max: &PermissionValue) -> Option<String> {
     match requested {
         PermissionValue::Deny => None,
@@ -330,12 +258,11 @@ fn unfulfillable_detail(requested: &PermissionValue, max: &PermissionValue) -> O
                 format_permission_values(req_list),
             )),
             PermissionValue::AllowList(max_list) => {
-                let cap: HashSet<String> = max_list.iter().cloned().collect();
+                let cap: HashSet<&str> = max_list.iter().map(String::as_str).collect();
                 let mut disallowed = Vec::new();
-                let mut seen = HashSet::new();
 
                 for item in req_list {
-                    if !cap.contains(item) && seen.insert(item.clone()) {
+                    if !cap.contains(item.as_str()) {
                         disallowed.push(item.clone());
                     }
                 }
@@ -368,9 +295,8 @@ fn intersect_permission(requested: PermissionValue, max: PermissionValue) -> Per
             PermissionValue::AllowList(req_list) => {
                 let cap: HashSet<String> = max_list.into_iter().collect();
                 let mut out = Vec::new();
-                let mut seen = HashSet::new();
                 for item in req_list {
-                    if cap.contains(&item) && seen.insert(item.clone()) {
+                    if cap.contains(&item) {
                         out.push(item);
                     }
                 }

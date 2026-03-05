@@ -40,6 +40,7 @@ impl Drop for LoaderContextGuard {
 /// Set the loader context for the current function call.
 ///
 /// Returns a [`LoaderContextGuard`] that clears the context on drop.
+#[cfg(test)]
 pub fn set_loader_context(
     fn_oid: u32,
     import_map: HashMap<String, String>,
@@ -108,9 +109,9 @@ impl ModuleLoader for PgModuleLoader {
         _maybe_referrer: Option<&ModuleLoadReferrer>,
         _options: ModuleLoadOptions,
     ) -> ModuleLoadResponse {
-        let url = module_specifier.as_str().to_string();
+        let url = module_specifier.as_str();
 
-        let source: String = match load_module_source(url.clone()) {
+        let source: String = match load_module_source(url) {
             Ok(Some(s)) => s,
             Ok(None) => {
                 return ModuleLoadResponse::Sync(Err(JsErrorBox::generic(format!(
@@ -222,13 +223,13 @@ fn resolve_from_dep(specifier: &str, referrer: &str) -> Result<ModuleSpecifier, 
 // Module source retrieval
 // ---------------------------------------------------------------------------
 
-fn load_module_source(url: String) -> Result<Option<String>, String> {
+fn load_module_source(url: &str) -> Result<Option<String>, String> {
     LOADER_CTX.with(|c| match c.borrow().as_ref() {
         Some(ctx) => {
-            if let Some(source) = ctx.inline_modules.get(&url) {
+            if let Some(source) = ctx.inline_modules.get(url) {
                 return Ok(Some(source.clone()));
             }
-            ctx.store.load(ctx.fn_oid, &url)
+            ctx.store.load(ctx.fn_oid, url)
         }
         None => Err("no loader context set".to_string()),
     })
@@ -291,7 +292,7 @@ mod tests {
         let _ctx = make_ctx(&[("lodash", "https://esm.sh/lodash@4")], store);
 
         assert_eq!(
-            super::load_module_source("https://esm.sh/lodash@4".to_string()),
+            super::load_module_source("https://esm.sh/lodash@4"),
             Ok(Some("export default 42;".to_string()))
         );
     }
@@ -301,7 +302,7 @@ mod tests {
         let _ctx = make_ctx(&[], HashMapModuleStore::new());
 
         assert_eq!(
-            super::load_module_source("https://esm.sh/missing".to_string()),
+            super::load_module_source("https://esm.sh/missing"),
             Ok(None)
         );
     }
@@ -309,7 +310,7 @@ mod tests {
     #[test]
     fn load_no_context() {
         // No context set — must return Err.
-        let result = super::load_module_source("https://esm.sh/x".to_string());
+        let result = super::load_module_source("https://esm.sh/x");
         assert!(result.is_err());
     }
 

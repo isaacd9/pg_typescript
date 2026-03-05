@@ -307,15 +307,13 @@ fn is_strict_scalar_oid(oid: pg_sys::Oid) -> bool {
 
 /// Call the type's output function to convert a datum to a string.
 unsafe fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String {
-    unsafe {
-        let mut output_fn: pg_sys::Oid = pg_sys::InvalidOid;
-        let mut is_varlena: bool = false;
-        pg_sys::getTypeOutputInfo(type_oid, &mut output_fn, &mut is_varlena);
-        let cstr = pg_sys::OidOutputFunctionCall(output_fn, datum);
-        let result = std::ffi::CStr::from_ptr(cstr).to_string_lossy().to_string();
-        pg_sys::pfree(cstr.cast());
-        result
-    }
+    let mut output_fn: pg_sys::Oid = pg_sys::InvalidOid;
+    let mut is_varlena: bool = false;
+    pg_sys::getTypeOutputInfo(type_oid, &mut output_fn, &mut is_varlena);
+    let cstr = pg_sys::OidOutputFunctionCall(output_fn, datum);
+    let result = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+    pg_sys::pfree(cstr.cast());
+    result
 }
 
 /// Call the type's input function to parse a string into a Datum.
