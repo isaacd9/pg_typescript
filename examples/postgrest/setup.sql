@@ -7,22 +7,38 @@ RETURNS jsonb
 LANGUAGE typescript
 SET typescript.import_map = '{"imports":{"faker":"https://esm.sh/@faker-js/faker@9.9.0"}}'
 AS $$
+  interface Stats {
+    sparkle: number;
+    chaos: number;
+    luck: number;
+  }
+
+  interface Payload {
+    title: string;
+    vibe: string;
+    color: string;
+    by: string;
+    quote: string;
+    tags: string[];
+    stats: Stats;
+  }
+
   const f = faker.faker;
 
-  const title = `${f.word.adjective()} ${f.word.noun()}`;
-  const vibe = f.helpers.arrayElement([
+  const title: string = `${f.word.adjective()} ${f.word.noun()}`;
+  const vibe: string = f.helpers.arrayElement([
     "space disco",
     "underwater rave",
     "cabin synth",
     "desert neon",
     "cloud city",
   ]);
-  const tags = f.helpers.arrayElements(
+  const tags: string[] = f.helpers.arrayElements(
     ["postgres", "typescript", "postgrest", "json", "demo", "fun"],
     { min: 2, max: 4 },
   );
 
-  return {
+  const payload: Payload = {
     title,
     vibe,
     color: f.color.human(),
@@ -35,6 +51,8 @@ AS $$
       luck: f.number.int({ min: 1, max: 99 }),
     },
   };
+
+  return payload;
 $$;
 
 DROP TABLE IF EXISTS public.postgrest_notes;
