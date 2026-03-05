@@ -130,7 +130,7 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
         let datum = match self.oid {
             pg_sys::BOOLOID => v.into_datum().unwrap(),
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::Bool(v)).into_datum().unwrap(),
-            oid if !is_strict_scalar_oid(oid) => input_fn_call(&v.to_string(), oid),
+            oid if classify_oid(oid) != OidCategory::Scalar => input_fn_call(&v.to_string(), oid),
             _ => return Err(E::custom(type_mismatch_message(self.oid, "boolean"))),
         };
         Ok((datum, false))
@@ -150,7 +150,7 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
             pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
             pg_sys::FLOAT8OID => (v as f64).into_datum().unwrap(),
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::from(v)).into_datum().unwrap(),
-            oid if !is_strict_scalar_oid(oid) => input_fn_call(&v.to_string(), oid),
+            oid if classify_oid(oid) != OidCategory::Scalar => input_fn_call(&v.to_string(), oid),
             _ => return Err(E::custom(type_mismatch_message(self.oid, "number"))),
         };
         Ok((datum, false))
@@ -172,7 +172,7 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
             pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
             pg_sys::FLOAT8OID => (v as f64).into_datum().unwrap(),
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::from(v)).into_datum().unwrap(),
-            oid if !is_strict_scalar_oid(oid) => input_fn_call(&v.to_string(), oid),
+            oid if classify_oid(oid) != OidCategory::Scalar => input_fn_call(&v.to_string(), oid),
             _ => return Err(E::custom(type_mismatch_message(self.oid, "number"))),
         };
         Ok((datum, false))
@@ -220,7 +220,7 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
             pg_sys::FLOAT4OID => (v as f32).into_datum().unwrap(),
             pg_sys::FLOAT8OID => v.into_datum().unwrap(),
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::from(v)).into_datum().unwrap(),
-            oid if !is_strict_scalar_oid(oid) => input_fn_call(&v.to_string(), oid),
+            oid if classify_oid(oid) != OidCategory::Scalar => input_fn_call(&v.to_string(), oid),
             _ => return Err(E::custom(type_mismatch_message(self.oid, "number"))),
         };
         Ok((datum, false))
@@ -232,7 +232,7 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
                 v.into_datum().unwrap()
             }
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(Value::String(v.to_owned())).into_datum().unwrap(),
-            oid if !is_strict_scalar_oid(oid) => input_fn_call(v, oid),
+            oid if classify_oid(oid) != OidCategory::Scalar => input_fn_call(v, oid),
             _ => return Err(E::custom(type_mismatch_message(self.oid, "string"))),
         };
         Ok((datum, false))
@@ -246,7 +246,19 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
         let value = Value::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
         let datum = match self.oid {
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(value).into_datum().unwrap(),
-            oid if !is_strict_scalar_oid(oid) => input_fn_call(&value.to_string(), oid),
+            oid if classify_oid(oid) == OidCategory::Composite => {
+                return match value {
+                    Value::Object(obj) => unsafe { build_heap_tuple(obj, oid) }
+                        .map(|d| (d, false))
+                        .map_err(A::Error::custom),
+                    _ => Err(A::Error::custom(
+                        "pg_typescript: composite return type requires a JS object",
+                    )),
+                };
+            }
+            oid if classify_oid(oid) == OidCategory::Other => {
+                input_fn_call(&value.to_string(), oid)
+            }
             _ => return Err(A::Error::custom(type_mismatch_message(self.oid, "object"))),
         };
         Ok((datum, false))
@@ -255,7 +267,7 @@ impl<'de> Visitor<'de> for PgDatumVisitor {
         let value = Value::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
         let datum = match self.oid {
             pg_sys::JSONOID | pg_sys::JSONBOID => pgrx::JsonB(value).into_datum().unwrap(),
-            oid if !is_strict_scalar_oid(oid) => input_fn_call(&value.to_string(), oid),
+            oid if classify_oid(oid) != OidCategory::Scalar => input_fn_call(&value.to_string(), oid),
             _ => return Err(A::Error::custom(type_mismatch_message(self.oid, "array"))),
         };
         Ok((datum, false))
@@ -287,22 +299,72 @@ fn type_mismatch_message(oid: pg_sys::Oid, got: &str) -> String {
     )
 }
 
-fn is_strict_scalar_oid(oid: pg_sys::Oid) -> bool {
-    matches!(
-        oid,
+/// Categorise a Postgres OID so callers can decide how to convert a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OidCategory {
+    /// A well-known scalar type handled with dedicated conversion logic.
+    Scalar,
+    /// A composite (row) type — convert JS object fields to tuple columns.
+    Composite,
+    /// Anything else — fall back to the type's input/output functions.
+    Other,
+}
+
+fn classify_oid(oid: pg_sys::Oid) -> OidCategory {
+    match oid {
         pg_sys::BOOLOID
-            | pg_sys::INT2OID
-            | pg_sys::INT4OID
-            | pg_sys::INT8OID
-            | pg_sys::FLOAT4OID
-            | pg_sys::FLOAT8OID
-            | pg_sys::TEXTOID
-            | pg_sys::VARCHAROID
-            | pg_sys::BPCHAROID
-            | pg_sys::NAMEOID
-            | pg_sys::JSONOID
-            | pg_sys::JSONBOID
-    )
+        | pg_sys::INT2OID
+        | pg_sys::INT4OID
+        | pg_sys::INT8OID
+        | pg_sys::FLOAT4OID
+        | pg_sys::FLOAT8OID
+        | pg_sys::TEXTOID
+        | pg_sys::VARCHAROID
+        | pg_sys::BPCHAROID
+        | pg_sys::NAMEOID
+        | pg_sys::JSONOID
+        | pg_sys::JSONBOID => OidCategory::Scalar,
+        oid if unsafe { pg_sys::get_typtype(oid) == b'c' as i8 } => OidCategory::Composite,
+        _ => OidCategory::Other,
+    }
+}
+
+/// Build a composite (row) datum from a JSON object typed by `type_oid`.
+///
+/// Fields absent from the object become SQL NULL; extra fields are ignored.
+unsafe fn build_heap_tuple(
+    obj: serde_json::Map<String, Value>,
+    type_oid: pg_sys::Oid,
+) -> Result<pg_sys::Datum, String> {
+    // PgTupleDesc handles PG-version differences in attribute layout and
+    // decrements the refcount automatically on drop.
+    let tupdesc = pgrx::PgTupleDesc::for_composite_type_by_oid(type_oid)
+        .ok_or_else(|| format!("pg_typescript: OID {type_oid:?} is not a composite type"))?;
+    let natts = tupdesc.len();
+
+    let mut datums = vec![pg_sys::Datum::from(0usize); natts];
+    let mut nulls = vec![true; natts]; // default all columns to NULL
+
+    for i in 0..natts {
+        let attr = tupdesc.get(i).unwrap();
+        if attr.attisdropped {
+            continue;
+        }
+
+        if let Some(field_val) = obj.get(attr.name()) {
+            let (datum, isnull) = PgDatumSeed { oid: attr.atttypid }
+                .deserialize(field_val.clone())
+                .map_err(|e: serde_json::Error| e.to_string())?;
+            datums[i] = datum;
+            nulls[i] = isnull;
+        }
+    }
+
+    let tuple =
+        pg_sys::heap_form_tuple(tupdesc.as_ptr(), datums.as_mut_ptr(), nulls.as_mut_ptr());
+
+    // HeapTupleGetDatum: PointerGetDatum(tuple->t_data)
+    Ok(pg_sys::Datum::from((*tuple).t_data as usize))
 }
 
 /// Call the type's output function to convert a datum to a string.
