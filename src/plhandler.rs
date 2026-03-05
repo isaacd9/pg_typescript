@@ -82,15 +82,18 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
         })
         .collect();
 
-    let (datum, is_null) = execute_typescript_fn(
-        fn_oid,
-        &source,
-        &import_map,
-        &permissions,
-        &param_names,
+    let artifact = ModuleInputs {
+        cache_oid: u32::from(fn_oid),
+        source: &source,
+        param_names: &param_names,
+        import_map: &import_map,
+        specifier_prefix: "fn",
+    }
+    .prepare();
+    let (datum, is_null) = artifact.execute(
+        ExecutionConfig::new(permissions, make_module_store()),
         &args,
         PgDatumSeed { oid: ret_type },
-        make_module_store(),
     );
 
     if is_null {
@@ -121,7 +124,6 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     let source = proc.prosrc();
     let nargs = proc.pronargs();
     let param_names = build_param_names(&proc.proargnames(), nargs);
-    let params = param_names.join(", ");
     let (import_map, _max_imports) = read_import_map(&proc);
     let permissions = read_function_permissions(&proc);
 
@@ -138,53 +140,17 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
     }
 
-    // Assemble the same module source the call handler will use so that the
-    // specifier and hash match and we can pre-warm FN_CACHE.
-    let module_source = assemble_module(&source, &import_map, &params);
-    let source_hash = hash_str(&module_source);
-    let oid_raw = u32::from(fn_oid);
-    let store = make_module_store();
-
-    // Use the same fn_ specifier as the call handler. Loading as a side module
-    // (not main) lets multiple functions coexist in the same long-lived runtime.
-    // V8 always eagerly parses ES module bodies, so syntax errors are caught here.
-    // Pre-warming FN_CACHE means the first SELECT call skips module loading entirely.
-    let specifier_str = format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.ts");
-    let specifier = deno_core::resolve_url(&specifier_str)
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
-
-    with_runtime(|rt| {
-        ensure_console_hook(rt);
-        set_runtime_permissions(rt, &permissions);
-        let mut inline_modules = HashMap::new();
-        inline_modules.insert(specifier_str.clone(), module_source.clone());
-        let _ctx = loader::set_loader_context_with_inline(
-            oid_raw,
-            import_map.clone(),
-            store,
-            inline_modules,
-        );
-
-        let module_id = block_on(rt.load_side_es_module(&specifier)).unwrap_or_else(|e| {
-            // Only report the first line — the rest is a V8 stack trace that
-            // contains an unstable OID/hash (e.g. "at file:///pg_typescript/fn_NNNN_...").
-            let msg = e.to_string();
-            let first_line = msg.lines().next().unwrap_or(&msg);
-            let normalized = normalize_syntax_error_line(first_line);
-            pgrx::error!("pg_typescript: syntax error: {normalized}");
-        });
-
-        let evaluate = rt.mod_evaluate(module_id);
-        block_on(rt.with_event_loop_promise(evaluate, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
-
-        let namespace = rt
-            .get_module_namespace(module_id)
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
-        let f = extract_default_export(rt, namespace);
-
-        FN_CACHE.with(|c| c.borrow_mut().insert((oid_raw, source_hash), f));
-    });
+    // Prepare the same artifact the call handler will execute so the cache key
+    // and synthetic specifier match exactly across validation and execution.
+    let artifact = ModuleInputs {
+        cache_oid: u32::from(fn_oid),
+        source: &source,
+        param_names: &param_names,
+        import_map: &import_map,
+        specifier_prefix: "fn",
+    }
+    .prepare();
+    artifact.preload(ExecutionConfig::new(permissions, make_module_store()));
 
     fcinfo::pg_return_void()
 }
@@ -226,7 +192,16 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
         }
 
-        execute_inline_block(&source, &import_map, &permissions, make_module_store());
+        let param_names: &[String] = &[];
+        let artifact = ModuleInputs {
+            cache_oid: DO_BLOCK_OID,
+            source: &source,
+            param_names,
+            import_map: &import_map,
+            specifier_prefix: "do",
+        }
+        .prepare();
+        artifact.execute_void(ExecutionConfig::new(permissions, make_module_store()));
         fcinfo::pg_return_void()
     }
 }
@@ -267,135 +242,162 @@ fn build_param_names(arg_names: &[Option<String>], nargs: usize) -> Vec<String> 
 }
 
 /// Return a module store appropriate for the current build target.
-fn make_module_store() -> Box<dyn fetch::ModuleStore> {
+fn make_module_store() -> impl fetch::ModuleStore {
     #[cfg(not(test))]
     {
-        Box::new(fetch::PgModuleStore)
+        fetch::PgModuleStore
     }
     #[cfg(test)]
     {
-        Box::new(fetch::HashMapModuleStore::new())
+        fetch::HashMapModuleStore::new()
     }
 }
 
-/// Look up `(oid, hash)` in `FN_CACHE`, or load, evaluate, and cache the module.
+struct ExecutionConfig {
+    permissions: RuntimePermissions,
+    store: Box<dyn fetch::ModuleStore>,
+}
+
+impl ExecutionConfig {
+    fn new(permissions: RuntimePermissions, store: impl fetch::ModuleStore + 'static) -> Self {
+        Self {
+            permissions,
+            store: Box::new(store),
+        }
+    }
+}
+
+struct ModuleInputs<'a> {
+    cache_oid: u32,
+    source: &'a str,
+    param_names: &'a [String],
+    import_map: &'a HashMap<String, String>,
+    specifier_prefix: &'static str,
+}
+
+impl<'a> ModuleInputs<'a> {
+    fn prepare(self) -> ModuleArtifact {
+        let params = self.param_names.join(", ");
+        let module_source = assemble_module(self.source, self.import_map, &params);
+        let source_hash = hash_str(&module_source);
+        let specifier = format!(
+            "file:///pg_typescript/{}_{source_hash:016x}.ts",
+            self.specifier_prefix
+        );
+
+        ModuleArtifact {
+            cache_oid: self.cache_oid,
+            source_hash,
+            specifier,
+            module_source,
+            import_map: self.import_map.clone(),
+        }
+    }
+}
+
+/// Prepared module artifact shared by validation and execution.
 ///
-/// This is the common path for both named functions and DO blocks.
-fn get_or_load_fn(
-    rt: &mut deno_core::JsRuntime,
-    oid: u32,
+/// This captures the synthetic entrypoint source, cache key, and loader inputs.
+struct ModuleArtifact {
+    cache_oid: u32,
     source_hash: u64,
-    specifier_str: String,
+    specifier: String,
     module_source: String,
     import_map: HashMap<String, String>,
-    store: Box<dyn fetch::ModuleStore>,
-) -> v8::Global<v8::Value> {
-    if let Some(f) = FN_CACHE.with(|c| c.borrow().get(&(oid, source_hash)).cloned()) {
-        return f;
+}
+
+impl ModuleArtifact {
+    fn preload(self, exec: ExecutionConfig) {
+        self.with_loaded_fn(exec, |_rt, _fn_global| ());
     }
 
-    let specifier = deno_core::resolve_url(&specifier_str)
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
-    let mut inline_modules = HashMap::new();
-    inline_modules.insert(specifier_str, module_source);
-    let _ctx = loader::set_loader_context_with_inline(oid, import_map, store, inline_modules);
+    fn execute<A, S, R>(self, exec: ExecutionConfig, args: &[A], seed: S) -> R
+    where
+        A: serde::Serialize,
+        S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
+    {
+        self.with_loaded_fn(exec, |rt, fn_global| {
+            let promise_global = with_tokio_context(|| call_fn_with_args(rt, fn_global, args));
+            let resolve_fut = rt.resolve(promise_global);
+            let resolved = block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
 
-    let module_id = block_on(rt.load_side_es_module(&specifier))
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module load error: {e}"));
+            global_to(rt, resolved, seed)
+        })
+    }
 
-    let evaluate = rt.mod_evaluate(module_id);
-    block_on(rt.with_event_loop_promise(evaluate, Default::default()))
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+    fn execute_void(self, exec: ExecutionConfig) {
+        self.with_loaded_fn(exec, |rt, fn_global| {
+            let no_args: &[serde_json::Value] = &[];
+            let promise_global = call_fn_with_args(rt, fn_global, no_args);
+            let resolve_fut = rt.resolve(promise_global);
+            block_on(rt.with_event_loop_promise(resolve_fut, Default::default())).unwrap_or_else(
+                |e| pgrx::error!("pg_typescript: event loop error in DO block: {e}"),
+            );
+        });
+    }
 
-    let namespace = rt
-        .get_module_namespace(module_id)
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
-    let f = extract_default_export(rt, namespace);
-    FN_CACHE.with(|c| c.borrow_mut().insert((oid, source_hash), f.clone()));
-    f
-}
+    fn with_loaded_fn<F, R>(self, exec: ExecutionConfig, f: F) -> R
+    where
+        F: FnOnce(&mut deno_core::JsRuntime, v8::Global<v8::Value>) -> R,
+    {
+        let ExecutionConfig { permissions, store } = exec;
+        with_runtime(|rt| {
+            ensure_console_hook(rt);
+            set_runtime_permissions(rt, &permissions);
+            let fn_global = self.load_or_get_cached(rt, store);
+            f(rt, fn_global)
+        })
+    }
 
-/// Execute a TypeScript function body as an ES module.
-///
-/// The import map (possibly empty) is used to:
-/// 1. Generate `import * as <key> from "<key>"` statements.
-/// 2. Configure the module loader so it can resolve bare specifiers and
-///    fetch sources from `deno_internal.deno_package_modules`.
-fn execute_typescript_fn<A, S, R>(
-    fn_oid: pg_sys::Oid,
-    source: &str,
-    import_map: &HashMap<String, String>,
-    permissions: &RuntimePermissions,
-    param_names: &[String],
-    args: &[A],
-    seed: S,
-    store: Box<dyn fetch::ModuleStore>,
-) -> R
-where
-    A: serde::Serialize,
-    S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
-{
-    let params = param_names.join(", ");
-    let module_source = assemble_module(source, import_map, &params);
-    let source_hash = hash_str(&module_source);
-    let oid_raw = u32::from(fn_oid);
-    // Specifier is stable per (function, source version): ALTER FUNCTION changes the source,
-    // which changes the hash and therefore triggers a fresh module load.
-    let specifier_str = format!("file:///pg_typescript/fn_{fn_oid}_{source_hash:016x}.ts");
+    fn load_or_get_cached(
+        self,
+        rt: &mut deno_core::JsRuntime,
+        store: Box<dyn fetch::ModuleStore>,
+    ) -> v8::Global<v8::Value> {
+        if let Some(f) =
+            FN_CACHE.with(|c| c.borrow().get(&(self.cache_oid, self.source_hash)).cloned())
+        {
+            return f;
+        }
 
-    with_runtime(|rt| {
-        ensure_console_hook(rt);
-        set_runtime_permissions(rt, permissions);
-        let fn_global = get_or_load_fn(
-            rt,
-            oid_raw,
+        self.load_and_cache(rt, store)
+    }
+
+    fn load_and_cache(
+        self,
+        rt: &mut deno_core::JsRuntime,
+        store: Box<dyn fetch::ModuleStore>,
+    ) -> v8::Global<v8::Value> {
+        let Self {
+            cache_oid,
             source_hash,
-            specifier_str,
+            specifier,
             module_source,
-            import_map.clone(),
-            store,
-        );
+            import_map,
+        } = self;
 
-        let promise_global = with_tokio_context(|| call_fn_with_args(rt, fn_global, args));
-        let resolve_fut = rt.resolve(promise_global);
-        let resolved = block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+        let specifier_url = deno_core::resolve_url(&specifier)
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
+        let mut inline_modules = HashMap::new();
+        inline_modules.insert(specifier.clone(), module_source);
+        let _ctx =
+            loader::set_loader_context_with_inline(cache_oid, import_map, store, inline_modules);
 
-        global_to(rt, resolved, seed)
-    })
-}
+        let module_id = block_on(rt.load_side_es_module(&specifier_url))
+            .unwrap_or_else(|e| report_module_load_error(e));
 
-/// Execute a DO block as an ES module. Follows the same load/cache/call path
-/// as regular functions, using `DO_BLOCK_OID` as the synthetic key in FN_CACHE.
-fn execute_inline_block(
-    source: &str,
-    import_map: &HashMap<String, String>,
-    permissions: &RuntimePermissions,
-    store: Box<dyn fetch::ModuleStore>,
-) {
-    let module_source = assemble_module(source, import_map, "");
-    let source_hash = hash_str(&module_source);
-    let specifier_str = format!("file:///pg_typescript/do_{source_hash:016x}.ts");
+        let evaluate = rt.mod_evaluate(module_id);
+        block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
 
-    with_runtime(|rt| {
-        ensure_console_hook(rt);
-        set_runtime_permissions(rt, permissions);
-        let fn_global = get_or_load_fn(
-            rt,
-            DO_BLOCK_OID,
-            source_hash,
-            specifier_str,
-            module_source,
-            import_map.clone(),
-            store,
-        );
-
-        let no_args: &[serde_json::Value] = &[];
-        let promise_global = call_fn_with_args(rt, fn_global, no_args);
-        let resolve_fut = rt.resolve(promise_global);
-        block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: event loop error in DO block: {e}"));
-    });
+        let namespace = rt
+            .get_module_namespace(module_id)
+            .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+        let f = extract_default_export(rt, namespace);
+        FN_CACHE.with(|c| c.borrow_mut().insert((cache_oid, source_hash), f.clone()));
+        f
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -442,6 +444,23 @@ fn normalize_syntax_error_line(line: &str) -> String {
     }
 
     out
+}
+
+fn format_module_load_error(msg: &str) -> String {
+    let first_line = msg.lines().next().unwrap_or(msg);
+    if first_line.starts_with("Uncaught SyntaxError: ")
+        || (first_line.contains(" at file:///pg_typescript/") && first_line.contains(".ts:"))
+    {
+        let normalized = normalize_syntax_error_line(first_line);
+        return format!("pg_typescript: syntax error: {normalized}");
+    }
+
+    format!("pg_typescript: module load error: {msg}")
+}
+
+fn report_module_load_error<E: std::fmt::Display>(error: E) -> ! {
+    let msg = error.to_string();
+    pgrx::error!("{}", format_module_load_error(&msg));
 }
 
 /// Extract the `default` export from a module namespace object.
@@ -603,15 +622,18 @@ mod unit_tests {
     ) -> (Value, bool) {
         let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
         let fn_oid = pgrx::pg_sys::Oid::from(0u32);
-        super::execute_typescript_fn(
-            fn_oid,
+        let artifact = super::ModuleInputs {
+            cache_oid: u32::from(fn_oid),
             source,
-            &import_map,
-            &permissions,
-            &param_names,
+            param_names: &param_names,
+            import_map: &import_map,
+            specifier_prefix: "fn",
+        }
+        .prepare();
+        artifact.execute(
+            super::ExecutionConfig::new(permissions, store),
             args,
             JsonSeed,
-            Box::new(store),
         )
     }
 
@@ -652,15 +674,22 @@ mod unit_tests {
         let fn_oid = pgrx::pg_sys::Oid::from(0u32);
         let params: Vec<String> = vec![];
         let args: Vec<Value> = vec![];
-        super::execute_typescript_fn(
-            fn_oid,
+        let import_map = Default::default();
+        let artifact = super::ModuleInputs {
+            cache_oid: u32::from(fn_oid),
             source,
-            &Default::default(),
-            &super::RuntimePermissions::default(),
-            &params,
+            param_names: &params,
+            import_map: &import_map,
+            specifier_prefix: "fn",
+        }
+        .prepare();
+        artifact.execute(
+            super::ExecutionConfig::new(
+                super::RuntimePermissions::default(),
+                crate::fetch::HashMapModuleStore::new(),
+            ),
             &args,
             crate::convert::PgDatumSeed { oid: ret_oid },
-            Box::new(crate::fetch::HashMapModuleStore::new()),
         )
     }
 
@@ -756,6 +785,15 @@ mod unit_tests {
         );
     }
 
+    #[test]
+    fn format_module_load_error_recognizes_syntax_without_uncaught_prefix() {
+        let msg = "Expression expected at file:///pg_typescript/fn_1573d7cbfe76600e.ts:4:13\n\n  const x = ;\n            ~";
+        assert_eq!(
+            super::format_module_load_error(msg),
+            "pg_typescript: syntax error: Expression expected at file:///pg_typescript/input.ts:4:13"
+        );
+    }
+
     // --- assemble_module ----------------------------------------------------
 
     #[test]
@@ -782,16 +820,24 @@ mod unit_tests {
         assert!(out.contains("return math.add(1, 2);"));
     }
 
-    // --- execute_inline_block -----------------------------------------------
+    // --- ModuleArtifact::execute_void ---------------------------------------
 
     #[test]
     fn inline_block_runs() {
-        super::execute_inline_block(
-            "const x = 1 + 1;",
-            &Default::default(),
-            &super::RuntimePermissions::default(),
-            Box::new(crate::fetch::HashMapModuleStore::new()),
-        );
+        let param_names: &[String] = &[];
+        let import_map = Default::default();
+        let artifact = super::ModuleInputs {
+            cache_oid: super::DO_BLOCK_OID,
+            source: "const x = 1 + 1;",
+            param_names,
+            import_map: &import_map,
+            specifier_prefix: "do",
+        }
+        .prepare();
+        artifact.execute_void(super::ExecutionConfig::new(
+            super::RuntimePermissions::default(),
+            crate::fetch::HashMapModuleStore::new(),
+        ));
     }
 
     #[test]
@@ -803,12 +849,19 @@ mod unit_tests {
             "https://esm.sh/math@1",
             "export function add(a, b) { return a + b; }",
         );
-        super::execute_inline_block(
-            "const result = math.add(1, 2);",
-            &import_map,
-            &super::RuntimePermissions::default(),
-            Box::new(store),
-        );
+        let param_names: &[String] = &[];
+        let artifact = super::ModuleInputs {
+            cache_oid: super::DO_BLOCK_OID,
+            source: "const result = math.add(1, 2);",
+            param_names,
+            import_map: &import_map,
+            specifier_prefix: "do",
+        }
+        .prepare();
+        artifact.execute_void(super::ExecutionConfig::new(
+            super::RuntimePermissions::default(),
+            store,
+        ));
     }
 
     // --- sync / async execution ---------------------------------------------
