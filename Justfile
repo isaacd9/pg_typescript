@@ -28,3 +28,9 @@ profile pg_version="pg18":
 postgrest pg_version="pg18" api_port="3000" db_name="postgrest_demo":
   cd "{{justfile_directory()}}"
   ./examples/postgrest/run.sh "{{pg_version}}" "{{api_port}}" "{{db_name}}"
+
+# Set up the streaming demo and continuously print inserted rows plus trigger output.
+# Example: just streaming
+streaming pg_version="pg18" db_name="streaming_demo":
+  cd "{{justfile_directory()}}"
+  ./examples/streaming/run.sh "{{pg_version}}" "{{db_name}}"

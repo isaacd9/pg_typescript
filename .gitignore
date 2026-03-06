@@ -24,3 +24,5 @@ tests/pg_regress/regression.out
 # Claude
 .claude/
 traces
+
+__pycache__

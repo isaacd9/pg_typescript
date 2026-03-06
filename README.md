@@ -39,6 +39,24 @@ the demo roles (`web_anon`, `postgrest_authenticator`), applies
 See `examples/postgrest/README.md` for curl commands to insert rows and read
 auto-generated JSON payloads.
 
+## Streaming Example
+
+```bash
+just streaming
+```
+
+This starts local `pg18`, recreates a fresh `streaming_demo` database, applies
+`examples/streaming/setup.sql`, continuously inserts random notes from the
+vendored EFF short wordlist, waits about 100ms after each insert, and prints
+the derived summary row written by the trigger.
+
+The trigger calls a TypeScript function that returns a named composite type
+(`public.stream_note_summary`) directly, so the demo shows single-row
+structured returns rather than a JSONB recordset expansion.
+
+See `examples/streaming/README.md` for the exact shape of the demo output and
+the manual SQL behind it.
+
 ## Profile (Setup vs Execution)
 
 ```bash

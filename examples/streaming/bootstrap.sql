@@ -1,0 +1,1 @@
+-- No extra bootstrap is required for this example.
