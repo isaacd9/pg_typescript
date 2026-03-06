@@ -40,7 +40,7 @@ impl Drop for LoaderContextGuard {
 /// Set the loader context for the current function call.
 ///
 /// Returns a [`LoaderContextGuard`] that clears the context on drop.
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pg_test")))]
 pub fn set_loader_context(
     fn_oid: u32,
     import_map: HashMap<String, String>,
@@ -268,7 +268,7 @@ fn should_transpile(name: &str) -> bool {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pg_test")))]
 mod tests {
     use deno_core::{ModuleLoader, ResolutionKind};
 

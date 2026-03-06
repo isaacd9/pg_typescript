@@ -237,7 +237,7 @@ fn to_runtime_allowlist(value: PermissionValue) -> Option<Vec<String>> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pg_test")))]
 mod unit_tests {
     use super::*;
     use crate::guc::PermissionParser;

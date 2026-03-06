@@ -74,7 +74,7 @@ fn op_pg_console_log(#[string] level: &str, #[string] msg: &str) {
     emit_console_line(level, msg);
 }
 
-#[cfg(not(test))]
+#[cfg(any(not(test), feature = "pg_test"))]
 fn emit_console_line(level: &str, msg: &str) {
     match level {
         "warn" | "error" => pgrx::warning!("[pg_typescript:{level}] {msg}"),
@@ -83,7 +83,7 @@ fn emit_console_line(level: &str, msg: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pg_test")))]
 fn emit_console_line(level: &str, msg: &str) {
     eprintln!("[pg_typescript:{level}] {msg}");
 }

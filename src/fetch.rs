@@ -269,7 +269,7 @@ fn resolve_specifier(specifier: &str, referrer: &str) -> Option<String> {
 // Test utilities
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pg_test")))]
 pub(crate) fn make_import_map(entries: &[(&str, &str)]) -> HashMap<String, String> {
     entries
         .iter()
@@ -281,7 +281,7 @@ pub(crate) fn make_import_map(entries: &[(&str, &str)]) -> HashMap<String, Strin
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pg_test")))]
 mod tests {
     use super::*;
     use crate::guc::{GucParser, ImportMapParser, MaxImportsParser};

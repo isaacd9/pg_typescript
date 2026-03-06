@@ -343,7 +343,7 @@ fn classify_oid(oid: pg_sys::Oid) -> OidCategory {
         | pg_sys::NAMEOID
         | pg_sys::JSONOID
         | pg_sys::JSONBOID => OidCategory::Scalar,
-        oid if unsafe { pg_sys::get_typtype(oid) == b'c' as i8 } => OidCategory::Composite,
+        oid if unsafe { (pg_sys::get_typtype(oid) as u8) == b'c' } => OidCategory::Composite,
         _ => OidCategory::Other,
     }
 }

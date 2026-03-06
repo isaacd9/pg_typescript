@@ -243,11 +243,11 @@ fn build_param_names(arg_names: &[Option<String>], nargs: usize) -> Vec<String> 
 
 /// Return a module store appropriate for the current build target.
 fn make_module_store() -> impl fetch::ModuleStore {
-    #[cfg(not(test))]
+    #[cfg(any(not(test), feature = "pg_test"))]
     {
         fetch::PgModuleStore
     }
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "pg_test")))]
     {
         fetch::HashMapModuleStore::new()
     }
@@ -590,7 +590,7 @@ fn read_inline_import_map() -> (HashMap<String, String>, ImportUrlCap) {
 // Tests
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "pg_test")))]
 mod unit_tests {
     use crate::fetch::ModuleStore;
     use pgrx::FromDatum;

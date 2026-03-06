@@ -14,11 +14,30 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             cargo
-            python3
             rustc
+            cargo-pgrx
+            just
             uv
-            postgresql
+            python3
+            pkg-config
+            clang
+            llvmPackages.libclang
+            openssl
+            zlib
+            readline
+            flex
+            bison
+            libxml2
+            libxslt
+            ccache
+            icu
+            perl
+            gnumake
+            git
+            curl
           ];
+
+          LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
         };
       });
 }
