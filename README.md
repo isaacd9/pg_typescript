@@ -1,10 +1,11 @@
 # pg_typescript
 
-This is a postgres extension, build with `pgrx` in Rust that allows users to run
-TypeScript functions in PostgreSQL via Deno/V8.
+This is a postgres extension, built with `pgrx` in Rust that allows users to
+run TypeScript functions in PostgreSQL via Deno/V8.
 
 ## Run
 
+With Postgres 18:
 ```bash
 cargo pgrx run pg18
 ```
@@ -21,8 +22,16 @@ SELECT add(1, 2);
 
 ## Test
 
+Unit tests:
+
 ```bash
 cargo pgrx test pg18
+```
+
+
+Regression tests:
+```bash
+just regress
 ```
 
 ## PostgREST Example
