@@ -14,8 +14,10 @@
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             cargo
+            python3
             rustc
             uv
+            postgresql
           ];
         };
       });
