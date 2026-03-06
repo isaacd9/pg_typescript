@@ -26,3 +26,6 @@ tests/pg_regress/regression.out
 traces
 
 __pycache__
+
+# direnv
+.direnv/
