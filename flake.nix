@@ -18,10 +18,14 @@
             cargo-pgrx
             just
             uv
+            postgrest
+            postgresql_18
             python3
             pkg-config
             clang
+            binutils
             llvmPackages.libclang
+            llvmPackages.lld
             openssl
             zlib
             readline
@@ -29,6 +33,7 @@
             bison
             libxml2
             libxslt
+            glib
             ccache
             icu
             perl
