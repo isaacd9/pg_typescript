@@ -47,10 +47,15 @@
         } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
           # V8's prebuilt static library uses local-exec TLS, which is
           # incompatible with shared objects (like PG extensions).  Build
-          # V8 from source with initial-exec TLS so it can be linked into
-          # a .so on Linux.
+          # V8 from source with v8_monolithic_for_shared_library, which
+          # switches TLS to local-dynamic model via V8_TLS_USED_IN_LIBRARY.
           V8_FROM_SOURCE = "1";
-          GN_ARGS = ''extra_cflags=["-ftls-model=initial-exec"]'';
+          GN_ARGS = "v8_monolithic=true v8_monolithic_for_shared_library=true";
+          # Use gcc instead of clang for V8 build — avoids needing to
+          # assemble a clang+compiler-rt directory tree that matches
+          # Chromium's expected layout, and avoids Chromium's clang
+          # download (which only ships x86_64 binaries).
+          DISABLE_CLANG = "1";
         });
       });
 }
