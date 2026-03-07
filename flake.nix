@@ -11,7 +11,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
       in {
-        devShells.default = pkgs.mkShell {
+        devShells.default = pkgs.mkShell ({
           packages = with pkgs; [
             cargo
             rustc
@@ -37,12 +37,20 @@
             ccache
             icu
             perl
+            ninja
             gnumake
             git
             curl
           ];
 
           LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-        };
+        } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          # V8's prebuilt static library uses local-exec TLS, which is
+          # incompatible with shared objects (like PG extensions).  Build
+          # V8 from source with initial-exec TLS so it can be linked into
+          # a .so on Linux.
+          V8_FROM_SOURCE = "1";
+          GN_ARGS = ''extra_cflags=["-ftls-model=initial-exec"]'';
+        });
       });
 }

@@ -9,7 +9,7 @@ use pgrx::pg_catalog::pg_proc::PgProc;
 use pgrx::prelude::*;
 use pgrx::{fcinfo, pg_sys};
 
-use crate::convert::{PgDatum, PgDatumSeed};
+use crate::convert::{PgDatum, PgDatumSeed, VoidSeed};
 use crate::fetch;
 use crate::guc::{import_url_allowed, GucParser, ImportUrlCap};
 use crate::loader;
@@ -140,8 +140,9 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
     }
 
-    // Prepare the same artifact the call handler will execute so the cache key
-    // and synthetic specifier match exactly across validation and execution.
+    // Pre-warm FN_CACHE for this backend so that if the caller immediately
+    // invokes the function (same connection) the first SELECT skips module
+    // loading.  Other backends will populate their own cache on first call.
     let artifact = ModuleInputs {
         cache_oid: u32::from(fn_oid),
         source: &source,
@@ -213,9 +214,21 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
 // Synthetic OID used as the FN_CACHE key for DO $$ ... $$ blocks (which have no pg OID).
 const DO_BLOCK_OID: u32 = 0;
 
-// Per-connection cache: (fn_oid, source_hash) → compiled default-export function.
-// Keying on source_hash means ALTER FUNCTION (which changes the source) automatically
-// gets a fresh entry, while repeated calls reuse the already-compiled module.
+// Per-backend cache: (fn_oid, source_hash) → compiled default-export function.
+//
+// Each PostgreSQL connection runs in its own backend process with a separate
+// thread-local JsRuntime, so there is no shared V8 state between connections.
+// When a backend first calls a function it must load the ES module into *its*
+// runtime; FN_CACHE keeps the extracted default export so subsequent calls in
+// the same connection skip module loading entirely.
+//
+// The validator (CREATE FUNCTION) pre-warms this cache as an optimisation for
+// the common "create then immediately call" path, but that only helps the
+// backend that ran the DDL — every other backend populates its own cache on
+// first invocation.
+//
+// Keying on source_hash means ALTER FUNCTION (which changes the source)
+// automatically gets a fresh entry.
 thread_local! {
     static FN_CACHE: RefCell<HashMap<(u32, u64), v8::Global<v8::Value>>> =
         RefCell::new(HashMap::new());
@@ -327,14 +340,8 @@ impl ModuleArtifact {
     }
 
     fn execute_void(self, exec: ExecutionConfig) {
-        self.with_loaded_fn(exec, |rt, fn_global| {
-            let no_args: &[serde_json::Value] = &[];
-            let promise_global = call_fn_with_args(rt, fn_global, no_args);
-            let resolve_fut = rt.resolve(promise_global);
-            block_on(rt.with_event_loop_promise(resolve_fut, Default::default())).unwrap_or_else(
-                |e| pgrx::error!("pg_typescript: event loop error in DO block: {e}"),
-            );
-        });
+        let no_args: &[serde_json::Value] = &[];
+        self.execute(exec, no_args, VoidSeed);
     }
 
     fn with_loaded_fn<F, R>(self, exec: ExecutionConfig, f: F) -> R

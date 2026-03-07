@@ -56,6 +56,21 @@ impl Serialize for PgDatum {
 }
 
 // ---------------------------------------------------------------------------
+// DeserializeSeed implementations
+// ---------------------------------------------------------------------------
+
+/// A [`DeserializeSeed`] that discards the deserialized value.
+pub struct VoidSeed;
+
+impl<'de> DeserializeSeed<'de> for VoidSeed {
+    type Value = ();
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        serde::de::IgnoredAny::deserialize(deserializer)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DeserializeSeed for direct V8 → Datum conversion (no JSON intermediary)
 // ---------------------------------------------------------------------------
 
