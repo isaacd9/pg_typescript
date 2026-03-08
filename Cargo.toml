@@ -39,10 +39,10 @@ pgrx-tests = "=0.17.0"
 [build-dependencies]
 deno_runtime = { version = "0.242.0", features = ["snapshot"] }
 
-# Use the git repo for v8 so that V8_FROM_SOURCE=1 has the complete
-# source tree (crates.io tarball is missing Chromium build submodules).
+# Use the local rusty_v8 fork so Linux source builds can pick up local
+# Chromium build submodule changes while iterating.
 [patch.crates-io]
-v8 = { git = "https://github.com/denoland/rusty_v8", tag = "v145.0.0" }
+v8 = { path = "../rusty_v8" }
 
 [profile.dev]
 panic = "unwind"
