@@ -1,0 +1,72 @@
+name: Build V8 Prebuilt
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUSTY_V8_REPOSITORY: isaacd9/rusty_v8
+  RUSTY_V8_REF: main
+
+jobs:
+  build:
+    name: build-${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout pg_deno
+        uses: actions/checkout@v4
+        with:
+          path: pg_deno
+
+      - name: Checkout rusty_v8 fork
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RUSTY_V8_REPOSITORY }}
+          ref: ${{ env.RUSTY_V8_REF }}
+          path: rusty_v8
+          submodules: recursive
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+
+      - name: Build custom rusty_v8 prebuilt
+        working-directory: pg_deno
+        env:
+          V8_TARGET: ${{ matrix.target }}
+        run: |
+          nix develop .#v8-builder -c bash -lc "
+            set -euo pipefail
+            export PATH=\"\$HOME/.cargo/bin:\$PATH\"
+            export CARGO_TARGET_DIR=\"$RUNNER_TEMP/rusty_v8-target\"
+            cargo build --manifest-path \"$GITHUB_WORKSPACE/rusty_v8/Cargo.toml\" --release --target \"$V8_TARGET\"
+            mkdir -p \"$RUNNER_TEMP/rusty-v8/$V8_TARGET\"
+            cp \"$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/obj/librusty_v8.a\" \"$RUNNER_TEMP/rusty-v8/$V8_TARGET/librusty_v8.a\"
+            cp \"$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/src_binding.rs\" \"$RUNNER_TEMP/rusty-v8/$V8_TARGET/src_binding.rs\"
+          "
+
+      - name: Upload custom rusty_v8 prebuilt
+        uses: actions/upload-artifact@v4
+        with:
+          name: rusty-v8-${{ matrix.target }}
+          path: ${{ runner.temp }}/rusty-v8/${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 7
