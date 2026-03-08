@@ -41,8 +41,12 @@
           pkg-config
           clang
           binutils
+          # Chromium's downloaded clang still needs host libc headers and GCC
+          # crt/libgcc objects visible from the FHS /usr sysroot.
+          gcc.cc
           llvmPackages.libclang
           llvmPackages.lld
+          glibc.dev
           openssl
           zlib
           readline
@@ -75,7 +79,9 @@
             ''
               export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
               export V8_FROM_SOURCE=1
-              export CLANG_BASE_PATH=/usr
+              # Let rusty_v8 download Chromium's pinned clang toolchain instead
+              # of forcing the system /usr layout, which may expose a different
+              # LLVM major and miss the expected compiler-rt builtins archive.
               export GN_ARGS="is_component_build=false v8_monolithic=true v8_monolithic_for_shared_library=true"
             ''
             + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isx86_64 ''
