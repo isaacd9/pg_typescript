@@ -52,15 +52,21 @@ jobs:
         working-directory: pg_deno
         env:
           V8_TARGET: ${{ matrix.target }}
+          RUSTY_V8_TARGET_DIR: ${{ runner.temp }}/rusty_v8-target
+          RUSTY_V8_ARTIFACT_DIR: ${{ runner.temp }}/rusty-v8
         run: |
           nix develop .#v8-builder -c bash -lc "
             set -euo pipefail
             export PATH=\"\$HOME/.cargo/bin:\$PATH\"
-            export CARGO_TARGET_DIR=\"$RUNNER_TEMP/rusty_v8-target\"
+            export CARGO_TARGET_DIR=\"$RUSTY_V8_TARGET_DIR\"
+            if [ \"$V8_TARGET\" = \"aarch64-unknown-linux-gnu\" ]; then
+              export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=\"--target=$V8_TARGET --sysroot=$GITHUB_WORKSPACE/rusty_v8/build/linux/debian_sid_arm64-sysroot\"
+            fi
             cargo build --manifest-path \"$GITHUB_WORKSPACE/rusty_v8/Cargo.toml\" --release --target \"$V8_TARGET\"
-            mkdir -p \"$RUNNER_TEMP/rusty-v8/$V8_TARGET\"
-            cp \"$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/obj/librusty_v8.a\" \"$RUNNER_TEMP/rusty-v8/$V8_TARGET/librusty_v8.a\"
-            cp \"$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/src_binding.rs\" \"$RUNNER_TEMP/rusty-v8/$V8_TARGET/src_binding.rs\"
+            mkdir -p \"\$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out\"
+            mkdir -p \"$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET\"
+            cp \"\$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/obj/librusty_v8.a\" \"$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET/librusty_v8.a\"
+            cp \"\$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/src_binding.rs\" \"$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET/src_binding.rs\"
           "
 
       - name: Upload custom rusty_v8 prebuilt
