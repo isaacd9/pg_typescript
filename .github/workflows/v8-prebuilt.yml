@@ -48,6 +48,10 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
 
+      - name: Enable unprivileged user namespaces (needed by bubblewrap/buildFHSEnv)
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: Build custom rusty_v8 prebuilt
         working-directory: pg_deno
         env:
@@ -55,13 +59,11 @@ jobs:
           RUSTY_V8_TARGET_DIR: ${{ runner.temp }}/rusty_v8-target
           RUSTY_V8_ARTIFACT_DIR: ${{ runner.temp }}/rusty-v8
         run: |
-          nix develop .#v8-builder -c bash -lc "
+          nix run .#v8-builder -- -lc "
             set -euo pipefail
             export PATH=\"\$HOME/.cargo/bin:\$PATH\"
             export CARGO_TARGET_DIR=\"$RUSTY_V8_TARGET_DIR\"
-            if [ \"$V8_TARGET\" = \"aarch64-unknown-linux-gnu\" ]; then
-              export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=\"--target=$V8_TARGET --sysroot=$GITHUB_WORKSPACE/rusty_v8/build/linux/debian_sid_arm64-sysroot\"
-            fi
+
             cargo build --manifest-path \"$GITHUB_WORKSPACE/rusty_v8/Cargo.toml\" --release --target \"$V8_TARGET\"
             mkdir -p \"\$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out\"
             mkdir -p \"$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET\"

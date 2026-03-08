@@ -10,6 +10,9 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        aarch64CrossCc = pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc;
+        aarch64CrossGcc = "${aarch64CrossCc}/bin/aarch64-unknown-linux-gnu-gcc";
+        aarch64CrossLibc = aarch64CrossCc.libc;
 
         runtimePackages = with pkgs; [
           cargo
@@ -48,6 +51,7 @@
           libxml2
           libxslt
           glib
+          glib.dev
           icu
           perl
           ninja
@@ -55,7 +59,59 @@
           git
           curl
         ];
+
+        v8BuilderFhs = pkgs.buildFHSEnv {
+          name = "pg-deno-v8-builder";
+          runScript = "bash";
+
+          targetPkgs = _:
+            v8BuilderPackages
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
+              pkgs.qemu
+              aarch64CrossCc
+            ];
+
+          profile =
+            ''
+              export LIBCLANG_PATH=${pkgs.llvmPackages.libclang.lib}/lib
+              export V8_FROM_SOURCE=1
+              export CLANG_BASE_PATH=/usr
+              export GN_ARGS="is_component_build=false v8_monolithic=true v8_monolithic_for_shared_library=true"
+            ''
+            + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isx86_64 ''
+              export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=${aarch64CrossGcc}
+              export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
+            '';
+
+          extraBuildCommands =
+            pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isx86_64 ''
+              if [ ! -x "${aarch64CrossGcc}" ]; then
+                echo "could not find aarch64 cross gcc at ${aarch64CrossGcc}" >&2
+                exit 1
+              fi
+
+              if [ ! -d "${aarch64CrossLibc}/lib" ]; then
+                echo "missing aarch64 cross libc lib dir at ${aarch64CrossLibc}/lib" >&2
+                exit 1
+              fi
+
+              if [ ! -d "${aarch64CrossLibc.dev}/include" ]; then
+                echo "missing aarch64 cross libc include dir at ${aarch64CrossLibc.dev}/include" >&2
+                exit 1
+              fi
+
+              mkdir -p "$out/usr/aarch64-linux-gnu"
+              ln -sfn ${aarch64CrossLibc}/lib "$out/usr/aarch64-linux-gnu/lib"
+              ln -sfn ${aarch64CrossLibc.dev}/include "$out/usr/aarch64-linux-gnu/include"
+              ln -sfn /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 \
+                "$out/usr/lib64/ld-linux-aarch64.so.1"
+            '';
+        };
       in {
+        packages = pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          v8-builder = v8BuilderFhs;
+        };
+
         devShells =
           {
             default = pkgs.mkShell {
@@ -86,13 +142,7 @@
               '';
             };
           } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-            v8-builder = pkgs.mkShell {
-              packages = v8BuilderPackages;
-
-              LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-              V8_FROM_SOURCE = "1";
-              GN_ARGS = "is_component_build=false v8_monolithic=true v8_monolithic_for_shared_library=true";
-            };
+            v8-builder = v8BuilderFhs.env;
           };
       });
 }
