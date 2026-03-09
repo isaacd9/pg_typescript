@@ -70,6 +70,10 @@ jobs:
               bindgen_args=\"--target=\$V8_TARGET --sysroot=\$arm64_sysroot -isystem\$arm64_sysroot/usr/include -isystem\$arm64_sysroot/usr/include/aarch64-linux-gnu\"
               export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=\"\$bindgen_args\"
               bindgen_env=(\"BINDGEN_EXTRA_CLANG_ARGS_\$V8_TARGET=\$bindgen_args\")
+              sed -i \
+                -e 's/^    env = os\\.environ$/    env = os.environ.copy()/' \
+                -e '/^    env = os\\.environ.copy()$/a\\    env.pop(\"TARGET\", None)' \
+                \"$GITHUB_WORKSPACE/rusty_v8/build/rust/gni_impl/run_bindgen.py\"
             fi
 
             env \"\${bindgen_env[@]}\" \
