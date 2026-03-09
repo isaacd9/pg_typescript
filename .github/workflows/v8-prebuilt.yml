@@ -64,6 +64,10 @@ jobs:
             export PATH=\"\$HOME/.cargo/bin:\$PATH\"
             export CARGO_TARGET_DIR=\"$RUSTY_V8_TARGET_DIR\"
 
+            if [ \"$V8_TARGET\" = \"aarch64-unknown-linux-gnu\" ]; then
+              export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=\"--sysroot=\$GITHUB_WORKSPACE/rusty_v8/build/linux/debian_sid_arm64-sysroot\"
+            fi
+
             cargo build --manifest-path \"$GITHUB_WORKSPACE/rusty_v8/Cargo.toml\" --release --target \"$V8_TARGET\"
             mkdir -p \"\$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out\"
             mkdir -p \"$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET\"
