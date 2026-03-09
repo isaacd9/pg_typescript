@@ -59,10 +59,17 @@ jobs:
           python-version: 3.11.x
           architecture: x64
 
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -yq --no-install-suggests --no-install-recommends \
+            binutils bison curl flex git libglib2.0-dev libicu-dev \
+            libreadline-dev libssl-dev libxml2-dev libxslt1-dev make \
+            ninja-build perl pkg-config zlib1g-dev
+
       - name: Install cross compilation toolchain
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo apt update
           sudo apt install -yq --no-install-suggests --no-install-recommends \
             binfmt-support g++-10-aarch64-linux-gnu g++-10-multilib \
             gcc-10-aarch64-linux-gnu libc6-arm64-cross qemu-user \
