@@ -65,7 +65,8 @@ jobs:
             export CARGO_TARGET_DIR=\"$RUSTY_V8_TARGET_DIR\"
 
             if [ \"$V8_TARGET\" = \"aarch64-unknown-linux-gnu\" ]; then
-              export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=\"--sysroot=\$GITHUB_WORKSPACE/rusty_v8/build/linux/debian_sid_arm64-sysroot\"
+              arm64_sysroot=\"\$GITHUB_WORKSPACE/rusty_v8/build/linux/debian_sid_arm64-sysroot\"
+              export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=\"--sysroot=\$arm64_sysroot -isystem\$arm64_sysroot/usr/include -isystem\$arm64_sysroot/usr/include/aarch64-linux-gnu\"
             fi
 
             cargo build --manifest-path \"$GITHUB_WORKSPACE/rusty_v8/Cargo.toml\" --release --target \"$V8_TARGET\"
