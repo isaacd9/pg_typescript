@@ -16,6 +16,8 @@ jobs:
   build:
     name: build-${{ matrix.target }}
     runs-on: ubuntu-24.04
+    env:
+      V8_FROM_SOURCE: true
     strategy:
       fail-fast: false
       matrix:
@@ -24,6 +26,9 @@ jobs:
           - aarch64-unknown-linux-gnu
 
     steps:
+      - name: Configure git
+        run: git config --global core.symlinks true
+
       - name: Checkout pg_deno
         uses: actions/checkout@v4
         with:
@@ -48,41 +53,57 @@ jobs:
         with:
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
 
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: 3.11.x
+          architecture: x64
+
+      - name: Install cross compilation toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt update
+          sudo apt install -yq --no-install-suggests --no-install-recommends \
+            binfmt-support g++-10-aarch64-linux-gnu g++-10-multilib \
+            gcc-10-aarch64-linux-gnu libc6-arm64-cross qemu-user \
+            qemu-user-binfmt
+
+          if [ ! -e /lib/ld-linux-aarch64.so.1 ]; then
+            sudo ln -s /usr/aarch64-linux-gnu/lib/ld-linux-aarch64.so.1 \
+              /lib/ld-linux-aarch64.so.1
+          fi
+
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=/usr/bin/aarch64-linux-gnu-gcc-10" >> "$GITHUB_ENV"
+          echo "QEMU_LD_PREFIX=/usr/aarch64-linux-gnu" >> "$GITHUB_ENV"
+
+      - name: Install Clang
+        run: |
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-19 main" | sudo dd of=/etc/apt/sources.list.d/llvm-toolchain-noble-19.list
+          curl https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor | sudo dd of=/etc/apt/trusted.gpg.d/llvm-snapshot.gpg
+          sudo apt-get update
+          sudo apt-get -qq remove 'clang-*'
+          sudo apt-get install -y lld-19 clang-19 clang-tools-19 clang-tidy-19 clang-format-19 libclang-19-dev
+          echo "LIBCLANG_PATH=/usr/lib/llvm-19/lib" >> "$GITHUB_ENV"
+
       - name: Enable unprivileged user namespaces (needed by bubblewrap/buildFHSEnv)
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Build custom rusty_v8 prebuilt
-        working-directory: pg_deno
         env:
           V8_TARGET: ${{ matrix.target }}
           RUSTY_V8_TARGET_DIR: ${{ runner.temp }}/rusty_v8-target
           RUSTY_V8_ARTIFACT_DIR: ${{ runner.temp }}/rusty-v8
         run: |
-          nix run .#v8-builder -- -lc "
-            set -euo pipefail
-            export PATH=\"\$HOME/.cargo/bin:\$PATH\"
-            export CARGO_TARGET_DIR=\"$RUSTY_V8_TARGET_DIR\"
+          set -euo pipefail
+          export CARGO_TARGET_DIR="$RUSTY_V8_TARGET_DIR"
 
-            bindgen_env=()
-            if [ \"$V8_TARGET\" = \"aarch64-unknown-linux-gnu\" ]; then
-              arm64_sysroot=\"\$GITHUB_WORKSPACE/rusty_v8/build/linux/debian_bullseye_arm64-sysroot\"
-              bindgen_args=\"--target=\$V8_TARGET --sysroot=\$arm64_sysroot -isystem\$arm64_sysroot/usr/include -isystem\$arm64_sysroot/usr/include/aarch64-linux-gnu\"
-              export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu=\"\$bindgen_args\"
-              bindgen_env=(\"BINDGEN_EXTRA_CLANG_ARGS_\$V8_TARGET=\$bindgen_args\")
-              sed -i \
-                -e 's/^    env = os\\.environ$/    env = os.environ.copy()/' \
-                -e '/^    env = os\\.environ.copy()$/a\\    env.pop(\"TARGET\", None)' \
-                \"$GITHUB_WORKSPACE/rusty_v8/build/rust/gni_impl/run_bindgen.py\"
-            fi
+          cargo build --manifest-path "$GITHUB_WORKSPACE/rusty_v8/Cargo.toml" --release --target "$V8_TARGET"
 
-            env \"\${bindgen_env[@]}\" \
-              cargo build --manifest-path \"$GITHUB_WORKSPACE/rusty_v8/Cargo.toml\" --release --target \"$V8_TARGET\"
-            mkdir -p \"\$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out\"
-            mkdir -p \"$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET\"
-            cp \"\$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/obj/librusty_v8.a\" \"$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET/librusty_v8.a\"
-            cp \"\$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/src_binding.rs\" \"$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET/src_binding.rs\"
-          "
+          mkdir -p "$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out"
+          mkdir -p "$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET"
+          cp "$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/obj/librusty_v8.a" "$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET/librusty_v8.a"
+          cp "$CARGO_TARGET_DIR/$V8_TARGET/release/gn_out/src_binding.rs" "$RUSTY_V8_ARTIFACT_DIR/$V8_TARGET/src_binding.rs"
 
       - name: Upload custom rusty_v8 prebuilt
         uses: actions/upload-artifact@v4
