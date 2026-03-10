@@ -21,6 +21,9 @@ jobs:
       V8_FROM_SOURCE: true
       # Build a V8 static archive that can be linked into a PG extension .so.
       GN_ARGS: is_component_build=false v8_monolithic=true v8_monolithic_for_shared_library=true
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_CACHE_SIZE: 3G
+      RUSTC_WRAPPER: sccache
     strategy:
       fail-fast: false
       matrix:
@@ -55,6 +58,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-gnu,aarch64-unknown-linux-gnu
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            rusty_v8
+          shared-key: v8-prebuilt-${{ matrix.target }}-${{ env.RUSTY_V8_REF }}
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install Python
         uses: actions/setup-python@v5
@@ -122,3 +135,7 @@ jobs:
           path: ${{ runner.temp }}/rusty-v8/${{ matrix.target }}
           if-no-files-found: error
           retention-days: 7
+
+      - name: Show sccache stats
+        if: always()
+        run: ${SCCACHE_PATH} --show-stats
