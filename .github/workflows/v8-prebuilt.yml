@@ -9,8 +9,9 @@ permissions:
   contents: read
 
 env:
-  RUSTY_V8_REPOSITORY: isaacd9/rusty_v8
-  RUSTY_V8_REF: main
+  RUSTY_V8_REPOSITORY: denoland/rusty_v8
+  # Matches the v8 = 145.0.0 crate used by deno_core 0.386.0.
+  RUSTY_V8_REF: v145.0.0
 
 jobs:
   build:
@@ -18,6 +19,8 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       V8_FROM_SOURCE: true
+      # Build a V8 static archive that can be linked into a PG extension .so.
+      GN_ARGS: is_component_build=false v8_monolithic=true v8_monolithic_for_shared_library=true
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +37,7 @@ jobs:
         with:
           path: pg_deno
 
-      - name: Checkout rusty_v8 fork
+      - name: Checkout rusty_v8
         uses: actions/checkout@v4
         with:
           repository: ${{ env.RUSTY_V8_REPOSITORY }}

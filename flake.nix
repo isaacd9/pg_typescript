@@ -32,6 +32,7 @@
           libxml2
           libxslt
           glib
+          llvmPackages.libclang
           # `cargo pgrx init` configures PostgreSQL with ICU enabled by default.
           icu
         ];
@@ -132,6 +133,7 @@
 
                 if [ "$(uname -s)" = "Linux" ]; then
                   unset V8_FROM_SOURCE GN_ARGS CLANG_BASE_PATH RUSTC_BOOTSTRAP
+                  export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib"
 
                   case "$(uname -m)" in
                     x86_64) rusty_v8_target="x86_64-unknown-linux-gnu" ;;
