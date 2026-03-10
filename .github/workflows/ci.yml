@@ -1,102 +1,102 @@
 name: CI
 
 on:
-  workflow_run:
-    workflows: ["Build V8 Prebuilt"]
-    types: [completed]
-  workflow_dispatch:
-    inputs:
-      v8_run_id:
-        description: Workflow run ID from "Build V8 Prebuilt"
-        required: true
-        type: string
+    workflow_run:
+        workflows: ["Build V8 Prebuilt"]
+        types: [completed]
+    workflow_dispatch:
+        inputs:
+            v8_run_id:
+                description: Workflow run ID from "Build V8 Prebuilt"
+                required: true
+                type: string
 
 permissions:
-  actions: read
-  contents: read
+    actions: read
+    contents: read
 
 env:
-  RUSTY_V8_REPOSITORY: isaacd9/rusty_v8
-  RUSTY_V8_REF: main
+    RUSTY_V8_REPOSITORY: isaacd9/rusty_v8
+    RUSTY_V8_REF: main
 
 jobs:
-  test:
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
-    name: test-${{ matrix.pg }}-${{ matrix.arch }}
-    runs-on: ${{ matrix.runs_on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runs_on: ubuntu-24.04
-            pg: 16
-            v8_target: x86_64-unknown-linux-gnu
-          - arch: x64
-            runs_on: ubuntu-24.04
-            pg: 17
-            v8_target: x86_64-unknown-linux-gnu
-          - arch: x64
-            runs_on: ubuntu-24.04
-            pg: 18
-            v8_target: x86_64-unknown-linux-gnu
-          - arch: arm64
-            runs_on: ubuntu-24.04-arm
-            pg: 16
-            v8_target: aarch64-unknown-linux-gnu
-          - arch: arm64
-            runs_on: ubuntu-24.04-arm
-            pg: 17
-            v8_target: aarch64-unknown-linux-gnu
-          - arch: arm64
-            runs_on: ubuntu-24.04-arm
-            pg: 18
-            v8_target: aarch64-unknown-linux-gnu
-    env:
-      CARGO_TERM_COLOR: always
-      PGRX_HOME: ${{ github.workspace }}/pg_deno/.pgrx
-      NIX_CONFIG: experimental-features = nix-command flakes
+    test:
+        if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+        name: test-${{ matrix.pg }}-${{ matrix.arch }}
+        runs-on: ${{ matrix.runs_on }}
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: x86_64
+                      runs_on: ubuntu-24.04
+                      pg: 16
+                      v8_target: x86_64-unknown-linux-gnu
+                    - arch: x86_64
+                      runs_on: ubuntu-24.04
+                      pg: 17
+                      v8_target: x86_64-unknown-linux-gnu
+                    - arch: x86_64
+                      runs_on: ubuntu-24.04
+                      pg: 18
+                      v8_target: x86_64-unknown-linux-gnu
+                    - arch: aarch64
+                      runs_on: ubuntu-24.04-arm
+                      pg: 16
+                      v8_target: aarch64-unknown-linux-gnu
+                    - arch: aarch64
+                      runs_on: ubuntu-24.04-arm
+                      pg: 17
+                      v8_target: aarch64-unknown-linux-gnu
+                    - arch: aarch64
+                      runs_on: ubuntu-24.04-arm
+                      pg: 18
+                      v8_target: aarch64-unknown-linux-gnu
+        env:
+            CARGO_TERM_COLOR: always
+            PGRX_HOME: ${{ github.workspace }}/pg_deno/.pgrx
+            NIX_CONFIG: experimental-features = nix-command flakes
 
-    steps:
-      - name: Checkout pg_deno
-        uses: actions/checkout@v4
-        with:
-          path: pg_deno
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+        steps:
+            - name: Checkout pg_deno
+              uses: actions/checkout@v4
+              with:
+                  path: pg_deno
+                  ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
-      - name: Checkout rusty_v8 fork
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.RUSTY_V8_REPOSITORY }}
-          ref: ${{ env.RUSTY_V8_REF }}
-          path: rusty_v8
+            - name: Checkout rusty_v8 fork
+              uses: actions/checkout@v4
+              with:
+                  repository: ${{ env.RUSTY_V8_REPOSITORY }}
+                  ref: ${{ env.RUSTY_V8_REF }}
+                  path: rusty_v8
 
-      - name: Download Linux V8 prebuilt
-        uses: actions/download-artifact@v4
-        with:
-          name: rusty-v8-${{ matrix.v8_target }}
-          path: pg_deno/.rusty_v8-prebuilt/${{ matrix.v8_target }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          run-id: ${{ github.event.workflow_run.id || inputs.v8_run_id }}
+            - name: Download Linux V8 prebuilt
+              uses: actions/download-artifact@v4
+              with:
+                  name: rusty-v8-${{ matrix.v8_target }}
+                  path: pg_deno/.rusty_v8-prebuilt/${{ matrix.v8_target }}
+                  github-token: ${{ secrets.GITHUB_TOKEN }}
+                  run-id: ${{ github.event.workflow_run.id || inputs.v8_run_id }}
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@v31
-        with:
-          extra_nix_config: |
-            experimental-features = nix-command flakes
+            - name: Install Nix
+              uses: cachix/install-nix-action@v31
+              with:
+                  extra_nix_config: |
+                      experimental-features = nix-command flakes
 
-      - name: Initialize pgrx (pg${{ matrix.pg }})
-        working-directory: pg_deno
-        run: nix develop -c cargo pgrx init "--pg${{ matrix.pg }}" download
+            - name: Initialize pgrx (pg${{ matrix.pg }})
+              working-directory: pg_deno
+              run: nix develop -c cargo pgrx init "--pg${{ matrix.pg }}" download
 
-      - name: Cargo check (pg${{ matrix.pg }})
-        working-directory: pg_deno
-        run: nix develop -c cargo check --no-default-features --features "pg${{ matrix.pg }}"
+            - name: Cargo check (pg${{ matrix.pg }})
+              working-directory: pg_deno
+              run: nix develop -c cargo check --no-default-features --features "pg${{ matrix.pg }}"
 
-      - name: Run tests (pg${{ matrix.pg }})
-        working-directory: pg_deno
-        run: nix develop -c cargo pgrx test "pg${{ matrix.pg }}"
+            - name: Run tests (pg${{ matrix.pg }})
+              working-directory: pg_deno
+              run: nix develop -c cargo pgrx test "pg${{ matrix.pg }}"
 
-      - name: Run regress (pg${{ matrix.pg }})
-        working-directory: pg_deno
-        run: nix develop -c just regress "pg${{ matrix.pg }}"
+            - name: Run regress (pg${{ matrix.pg }})
+              working-directory: pg_deno
+              run: nix develop -c just regress "pg${{ matrix.pg }}"

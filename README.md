@@ -3,6 +3,53 @@
 This is a postgres extension, built with `pgrx` in Rust that allows users to
 run TypeScript functions in PostgreSQL via Deno/V8.
 
+## Build
+
+All commands below assume you're running inside the dev shell:
+
+```bash
+$ nix develop
+```
+
+You can also set up [`direnv`](https://direnv.net/) to automatically load the
+development environment when you enter the repo.
+
+### macOS
+
+macOS uses the default upstream `rusty_v8` prebuilt.
+
+```bash
+$ cargo build
+```
+
+### Linux
+
+Linux needs a custom `rusty_v8` prebuilt built with
+`v8_monolithic_for_shared_library=true`, because the stock upstream prebuilt
+does not link into a Postgres extension shared library. Both x86_64 and aarch64
+targets are supported, but they're cross-compiled onx86_64 Linux.
+
+There's a github workflow in this repository that produces the prebuilt
+artifact. You can download it from the latest successful run with `gh run
+download`. Place it under `.rusty_v8-prebuilt/`. 
+
+```bash
+$ gh run download <run-id> -n rusty-v8-x86_64-unknown-linux-gnu
+$ gh run download <run-id> -n rusty-v8-aarch64-unknown-linux-gnu
+
+$ mkdir -p .rusty_v8-prebuilt
+$ mv rusty-v8-x86_64-unknown-linux-gnu .rusty_v8-prebuilt/x86_64-unknown-linux-gnu
+$ mv rusty-v8-aarch64-unknown-linux-gnu .rusty_v8-prebuilt/aarch64-unknown-linux-gnu
+```
+
+If you replace an existing prebuilt in place, run `cargo clean` first so Cargo
+does not keep linking an older copied archive from `target/`.
+
+```bash
+$ cargo clean
+$ cargo build
+```
+
 ## Run
 
 With Postgres 18:
