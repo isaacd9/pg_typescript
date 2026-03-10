@@ -39,8 +39,6 @@ pgrx-tests = "=0.17.0"
 [build-dependencies]
 deno_runtime = { version = "0.242.0", features = ["snapshot"] }
 
-# Use a sibling rusty_v8 checkout while iterating locally; CI checks out the
-# same fork next to this repo and feeds it a custom prebuilt archive.
 [profile.dev]
 panic = "unwind"
 
