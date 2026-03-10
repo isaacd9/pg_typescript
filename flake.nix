@@ -32,6 +32,8 @@
           libxml2
           libxslt
           glib
+          # `cargo pgrx init` configures PostgreSQL with ICU enabled by default.
+          icu
         ];
 
         v8BuilderPackages = with pkgs; [
