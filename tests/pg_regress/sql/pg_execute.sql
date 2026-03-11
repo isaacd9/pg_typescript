@@ -26,6 +26,112 @@ SELECT (ts_pg_execute_select(1)->>'rowCount')::int = 1 AS select_row_count_ok;
 SELECT ts_pg_execute_select(1)->'rows'->0->>'name' = 'Ada' AS select_name_ok;
 SELECT ts_pg_execute_select(1)->'rows'->0->'meta'->>'role' = 'admin' AS select_json_ok;
 
+CREATE OR REPLACE FUNCTION ts_pg_execute_numeric_results() RETURNS bool
+LANGUAGE typescript AS $$
+  const result = _pg.execute(
+    `
+      SELECT
+        $1::int2 AS smallint_value,
+        $2::int4 AS integer_value,
+        $3::int8 AS bigint_value,
+        $4::float4 AS real_value,
+        $5::float8 AS double_value
+    `,
+    7,
+    42,
+    900719925474099,
+    1.25,
+    3.5,
+  );
+  const row = result.rows[0];
+  return (
+    result.command === "SELECT"
+    && result.rowCount === 1
+    && row.smallint_value === 7
+    && row.integer_value === 42
+    && row.bigint_value === 900719925474099
+    && Math.abs(row.real_value - 1.25) < 0.0001
+    && row.double_value === 3.5
+  );
+$$;
+
+SELECT ts_pg_execute_numeric_results() AS numeric_results_ok;
+
+CREATE OR REPLACE FUNCTION ts_pg_execute_scalar_results() RETURNS bool
+LANGUAGE typescript AS $$
+  const result = _pg.execute(
+    `
+      SELECT
+        $1::bool AS bool_value,
+        $2::text AS text_value,
+        $3::varchar AS varchar_value
+    `,
+    true,
+    "hello",
+    "world",
+  );
+  const row = result.rows[0];
+  return (
+    result.command === "SELECT"
+    && result.rowCount === 1
+    && row.bool_value === true
+    && row.text_value === "hello"
+    && row.varchar_value === "world"
+  );
+$$;
+
+SELECT ts_pg_execute_scalar_results() AS scalar_results_ok;
+
+CREATE OR REPLACE FUNCTION ts_pg_execute_json_and_text_fallbacks() RETURNS bool
+LANGUAGE typescript AS $$
+  const uuid = "550e8400-e29b-41d4-a716-446655440000";
+  const result = _pg.execute(
+    `
+      SELECT
+        $1::jsonb AS json_value,
+        $2::uuid AS uuid_value,
+        $3::numeric AS numeric_value,
+        $4::date AS date_value
+    `,
+    { role: "admin", count: 2 },
+    { type: "uuid", value: uuid },
+    { type: "numeric", value: "12345.6789" },
+    { type: "date", value: "2024-01-02" },
+  );
+  const row = result.rows[0];
+  return (
+    result.command === "SELECT"
+    && result.rowCount === 1
+    && typeof row.json_value === "object"
+    && row.json_value !== null
+    && row.json_value.role === "admin"
+    && row.json_value.count === 2
+    && row.uuid_value === uuid
+    && row.numeric_value === "12345.6789"
+    && row.date_value === "2024-01-02"
+  );
+$$;
+
+SELECT ts_pg_execute_json_and_text_fallbacks() AS json_and_text_fallbacks_ok;
+
+CREATE OR REPLACE FUNCTION ts_pg_execute_result_nulls() RETURNS bool
+LANGUAGE typescript AS $$
+  const result = _pg.execute(
+    "SELECT NULL::text AS nullable_text, NULL::jsonb AS nullable_json, $1::int4 AS present_value",
+    9,
+  );
+  const row = result.rows[0];
+  return (
+    result.command === "SELECT"
+    && result.rowCount === 1
+    && row.nullable_text === null
+    && row.nullable_json === null
+    && row.present_value === 9
+  );
+$$;
+
+SELECT ts_pg_execute_result_nulls() AS result_nulls_ok;
+
 CREATE OR REPLACE FUNCTION ts_pg_execute_json_param() RETURNS int
 LANGUAGE typescript AS $$
   const result = _pg.execute(
