@@ -9,10 +9,7 @@
     if (typeof value === "string") {
       return { kind: "name", value };
     }
-    if (typeof value === "number" && Number.isInteger(value) && value > 0) {
-      return { kind: "oid", value };
-    }
-    throw new TypeError("_pg.execute typed parameters require a string or positive integer type");
+    throw new TypeError("_pg.execute typed parameters require a string type name");
   };
 
   const isPlainObject = (value) => {

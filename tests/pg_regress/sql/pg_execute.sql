@@ -49,6 +49,22 @@ $$;
 SELECT ts_pg_execute_typed('550e8400-e29b-41d4-a716-446655440000') =
   '550e8400-e29b-41d4-a716-446655440000' AS typed_param_ok;
 
+CREATE OR REPLACE FUNCTION ts_pg_execute_invalid_type_ref() RETURNS text
+LANGUAGE typescript AS $$
+  try {
+    _pg.execute(
+      "SELECT $1::int4 AS value",
+      { type: 23, value: 1 },
+    );
+    return 'no error';
+  } catch (err) {
+    return String(err.message ?? err);
+  }
+$$;
+
+SELECT ts_pg_execute_invalid_type_ref() =
+  '_pg.execute typed parameters require a string type name' AS numeric_type_ref_rejected_ok;
+
 CREATE OR REPLACE FUNCTION ts_pg_execute_insert(message text) RETURNS jsonb
 LANGUAGE typescript AS $$
   return _pg.execute(

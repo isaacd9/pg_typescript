@@ -12,41 +12,51 @@ use serde_json::Value as JsonValue;
 
 const PG_HOOK_JS: &str = include_str!("../js/pg_hook.js");
 
+// `_pg.execute()` is only valid while we are inside a TS function body. Module
+// loading reuses the same runtime, so this flag prevents top-level imports from
+// issuing SQL during validation or preload.
 #[derive(Clone, Copy, Default)]
 pub struct PgExecuteAllowed(pub bool);
 
+// The JS hook rewrites each user argument into one of these tagged parameter
+// forms before calling the Rust op. `Inferred` means Rust picks a Postgres type
+// from the JS value, while `Typed` carries an explicit SQL type override.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum WireParam {
+enum InputParam {
     Inferred {
-        value: WireValue,
+        value: InputValue,
     },
     Typed {
         #[serde(rename = "type")]
-        type_ref: WireTypeRef,
-        value: WireValue,
+        type_ref: InputTypeRef,
+        value: InputValue,
     },
 }
 
+// A typed parameter names the target Postgres type (`uuid`, `jsonb`, `int4`).
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum WireTypeRef {
+enum InputTypeRef {
     Name { value: String },
-    Oid { value: u32 },
 }
 
+// Serde-friendly mirror of the JS values `_pg.execute()` accepts after the JS
+// hook has normalized them. This is still input data, not the final SPI form.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum WireValue {
+enum InputValue {
     Null,
     Bool { value: bool },
     Number { value: f64 },
     String { value: String },
     Bigint { value: String },
-    Array { value: Vec<WireValue> },
-    Object { value: BTreeMap<String, WireValue> },
+    Array { value: Vec<InputValue> },
+    Object { value: BTreeMap<String, InputValue> },
 }
 
+// Postgres SPI expects parallel arrays of OIDs, Datums, and null flags. This
+// struct is the bound form of a single parameter after inference/parsing.
 #[derive(Debug)]
 struct SpiParam {
     oid: pg_sys::Oid,
@@ -54,6 +64,9 @@ struct SpiParam {
     is_null: bool,
 }
 
+// Rust-side result object that gets serialized back into the JS
+// `{ rows, command, rowCount }` shape. `row_count` stays as `f64` because it
+// crosses into JS as a normal Number.
 #[derive(Debug)]
 pub struct PgExecuteResult {
     rows: Vec<PgExecuteRow>,
@@ -61,9 +74,13 @@ pub struct PgExecuteResult {
     row_count: f64,
 }
 
+// One fully owned result row copied out of `SPI_tuptable`. We keep the row as
+// ordered `(column_name, value)` pairs and serialize it into a JS object later.
 #[derive(Debug)]
 struct PgExecuteRow(Vec<(String, OwnedPgValue)>);
 
+// Values copied out of SPI into owned Rust data before returning to JS. This
+// avoids exposing raw Postgres memory past the lifetime of the SPI call.
 #[derive(Debug)]
 enum OwnedPgValue {
     Null,
@@ -82,7 +99,7 @@ enum OwnedPgValue {
 pub fn op_pg_execute(
     state: &mut OpState,
     #[string] sql: &str,
-    #[serde] params: Vec<WireParam>,
+    #[serde] params: Vec<InputParam>,
 ) -> Result<PgExecuteResult, JsErrorBox> {
     if !state.borrow::<PgExecuteAllowed>().0 {
         return Err(JsErrorBox::generic(
@@ -90,6 +107,8 @@ pub fn op_pg_execute(
         ));
     }
 
+    // SPI can throw PostgreSQL errors via ereport/longjmp, so we translate that
+    // boundary into a normal JS exception before returning into V8.
     PgTryBuilder::new(|| execute_sql(sql, params))
         .catch_others(|cause| {
             let message = match cause {
@@ -104,11 +123,13 @@ pub fn op_pg_execute(
         .execute()
 }
 
-fn execute_sql(sql: &str, params: Vec<WireParam>) -> Result<PgExecuteResult, JsErrorBox> {
+fn execute_sql(sql: &str, params: Vec<InputParam>) -> Result<PgExecuteResult, JsErrorBox> {
+    // The JS hook normalizes each argument into a tagged input value so Rust can
+    // bind parameters without reparsing arbitrary JS objects here.
     let spi_params = params
         .into_iter()
         .enumerate()
-        .map(|(idx, param)| bind_param(param).map_err(|err| param_error(idx, err)))
+        .map(|(idx, param)| param.into_spi_param().map_err(|err| param_error(idx, err)))
         .collect::<Result<Vec<_>, _>>()?;
 
     Spi::connect(|_client| {
@@ -128,136 +149,10 @@ fn execute_sql(sql: &str, params: Vec<WireParam>) -> Result<PgExecuteResult, JsE
     })
 }
 
-fn bind_param(param: WireParam) -> Result<SpiParam, JsErrorBox> {
-    match param {
-        WireParam::Inferred { value } => bind_inferred_value(value),
-        WireParam::Typed { type_ref, value } => bind_typed_value(type_ref, value),
-    }
-}
-
-fn bind_inferred_value(value: WireValue) -> Result<SpiParam, JsErrorBox> {
-    match value {
-        WireValue::Null => Ok(SpiParam {
-            oid: pg_sys::UNKNOWNOID,
-            datum: pg_sys::Datum::from(0usize),
-            is_null: true,
-        }),
-        WireValue::Bool { value } => Ok(SpiParam {
-            oid: pg_sys::BOOLOID,
-            datum: value
-                .into_datum()
-                .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode boolean"))?,
-            is_null: false,
-        }),
-        WireValue::Number { value } => bind_inferred_number(value),
-        WireValue::String { value } => Ok(SpiParam {
-            oid: pg_sys::TEXTOID,
-            datum: value
-                .into_datum()
-                .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode text"))?,
-            is_null: false,
-        }),
-        WireValue::Bigint { value } => {
-            let parsed = value.parse::<i64>().map_err(|_| {
-                JsErrorBox::range_error(format!(
-                    "pg_typescript: bigint parameter is out of range for int8: {value}"
-                ))
-            })?;
-            Ok(SpiParam {
-                oid: pg_sys::INT8OID,
-                datum: parsed
-                    .into_datum()
-                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode int8"))?,
-                is_null: false,
-            })
-        }
-        complex @ (WireValue::Array { .. } | WireValue::Object { .. }) => {
-            let json = complex.to_json_value()?;
-            Ok(SpiParam {
-                oid: pg_sys::JSONBOID,
-                datum: JsonB(json)
-                    .into_datum()
-                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode jsonb"))?,
-                is_null: false,
-            })
-        }
-    }
-}
-
-fn bind_inferred_number(value: f64) -> Result<SpiParam, JsErrorBox> {
-    if value.fract() == 0.0 && value >= i32::MIN as f64 && value <= i32::MAX as f64 {
-        let parsed = value as i32;
-        return Ok(SpiParam {
-            oid: pg_sys::INT4OID,
-            datum: parsed
-                .into_datum()
-                .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode int4"))?,
-            is_null: false,
-        });
-    }
-
-    if value.fract() == 0.0 {
-        let parsed = value as i64;
-        return Ok(SpiParam {
-            oid: pg_sys::INT8OID,
-            datum: parsed
-                .into_datum()
-                .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode int8"))?,
-            is_null: false,
-        });
-    }
-
-    Ok(SpiParam {
-        oid: pg_sys::FLOAT8OID,
-        datum: value
-            .into_datum()
-            .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode float8"))?,
-        is_null: false,
-    })
-}
-
-fn bind_typed_value(type_ref: WireTypeRef, value: WireValue) -> Result<SpiParam, JsErrorBox> {
-    let oid = resolve_type_ref(type_ref);
-
-    match value {
-        WireValue::Null => Ok(SpiParam {
-            oid,
-            datum: pg_sys::Datum::from(0usize),
-            is_null: true,
-        }),
-        complex @ (WireValue::Array { .. } | WireValue::Object { .. })
-            if oid == pg_sys::JSONOID || oid == pg_sys::JSONBOID =>
-        {
-            let text = serde_json::to_string(&complex.to_json_value()?)
-                .map_err(|e| JsErrorBox::generic(format!("pg_typescript: {e}")))?;
-            Ok(SpiParam {
-                oid,
-                datum: input_fn_call(&text, oid),
-                is_null: false,
-            })
-        }
-        WireValue::Array { .. } | WireValue::Object { .. } => Err(JsErrorBox::type_error(
-            "pg_typescript: array/object typed parameters are only supported for json/jsonb",
-        )),
-        primitive => {
-            let text = primitive.to_text()?;
-            Ok(SpiParam {
-                oid,
-                datum: input_fn_call(&text, oid),
-                is_null: false,
-            })
-        }
-    }
-}
-
-fn resolve_type_ref(type_ref: WireTypeRef) -> pg_sys::Oid {
-    match type_ref {
-        WireTypeRef::Oid { value } => pg_sys::Oid::from(value),
-        WireTypeRef::Name { value } => pgrx::regtypein(&value),
-    }
-}
-
 fn execute_spi(query: &CString, params: &[SpiParam]) -> i32 {
+    // `SPI_tuptable` is a process-global pointer to the last SPI result. Clear
+    // it first so a utility statement with no rows does not accidentally reuse
+    // a previous table.
     unsafe {
         pg_sys::SPI_tuptable = std::ptr::null_mut();
     }
@@ -294,6 +189,8 @@ fn execute_spi(query: &CString, params: &[SpiParam]) -> i32 {
 }
 
 fn extract_rows() -> Result<Vec<PgExecuteRow>, JsErrorBox> {
+    // SPI stores the most recent result set in `SPI_tuptable`; by the time we
+    // return to JS we need to have copied out every row into owned Rust values.
     let Some(table) = (unsafe { pg_sys::SPI_tuptable.as_ref() }) else {
         return Ok(Vec::new());
     };
@@ -373,7 +270,140 @@ fn format_pg_error(err: &pgrx::pg_sys::panic::ErrorReportWithLevel) -> String {
     message
 }
 
-impl WireValue {
+impl InputParam {
+    fn into_spi_param(self) -> Result<SpiParam, JsErrorBox> {
+        match self {
+            Self::Inferred { value } => value.into_inferred_spi_param(),
+            Self::Typed { type_ref, value } => value.into_typed_spi_param(type_ref.into_oid()),
+        }
+    }
+}
+
+impl InputTypeRef {
+    fn into_oid(self) -> pg_sys::Oid {
+        match self {
+            Self::Name { value } => pgrx::regtypein(&value),
+        }
+    }
+}
+
+impl InputValue {
+    fn into_inferred_spi_param(self) -> Result<SpiParam, JsErrorBox> {
+        match self {
+            Self::Null => Ok(SpiParam {
+                oid: pg_sys::UNKNOWNOID,
+                datum: pg_sys::Datum::from(0usize),
+                is_null: true,
+            }),
+            Self::Bool { value } => Ok(SpiParam {
+                oid: pg_sys::BOOLOID,
+                datum: value.into_datum().ok_or_else(|| {
+                    JsErrorBox::generic("pg_typescript: failed to encode boolean")
+                })?,
+                is_null: false,
+            }),
+            Self::Number { value } => Self::inferred_number_into_spi_param(value),
+            Self::String { value } => Ok(SpiParam {
+                oid: pg_sys::TEXTOID,
+                datum: value
+                    .into_datum()
+                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode text"))?,
+                is_null: false,
+            }),
+            Self::Bigint { value } => {
+                let parsed = value.parse::<i64>().map_err(|_| {
+                    JsErrorBox::range_error(format!(
+                        "pg_typescript: bigint parameter is out of range for int8: {value}"
+                    ))
+                })?;
+                Ok(SpiParam {
+                    oid: pg_sys::INT8OID,
+                    datum: parsed.into_datum().ok_or_else(|| {
+                        JsErrorBox::generic("pg_typescript: failed to encode int8")
+                    })?,
+                    is_null: false,
+                })
+            }
+            complex @ (Self::Array { .. } | Self::Object { .. }) => {
+                let json = complex.to_json_value()?;
+                Ok(SpiParam {
+                    oid: pg_sys::JSONBOID,
+                    datum: JsonB(json).into_datum().ok_or_else(|| {
+                        JsErrorBox::generic("pg_typescript: failed to encode jsonb")
+                    })?,
+                    is_null: false,
+                })
+            }
+        }
+    }
+
+    fn into_typed_spi_param(self, oid: pg_sys::Oid) -> Result<SpiParam, JsErrorBox> {
+        match self {
+            Self::Null => Ok(SpiParam {
+                oid,
+                datum: pg_sys::Datum::from(0usize),
+                is_null: true,
+            }),
+            complex @ (Self::Array { .. } | Self::Object { .. })
+                if oid == pg_sys::JSONOID || oid == pg_sys::JSONBOID =>
+            {
+                let text = serde_json::to_string(&complex.to_json_value()?)
+                    .map_err(|e| JsErrorBox::generic(format!("pg_typescript: {e}")))?;
+                Ok(SpiParam {
+                    oid,
+                    datum: input_fn_call(&text, oid),
+                    is_null: false,
+                })
+            }
+            Self::Array { .. } | Self::Object { .. } => Err(JsErrorBox::type_error(
+                "pg_typescript: array/object typed parameters are only supported for json/jsonb",
+            )),
+            primitive => {
+                // For explicitly typed values we let Postgres parse the text form
+                // using the target type's input function instead of hardcoding
+                // per-type encoders on the Rust side.
+                let text = primitive.to_text()?;
+                Ok(SpiParam {
+                    oid,
+                    datum: input_fn_call(&text, oid),
+                    is_null: false,
+                })
+            }
+        }
+    }
+
+    fn inferred_number_into_spi_param(value: f64) -> Result<SpiParam, JsErrorBox> {
+        if value.fract() == 0.0 && value >= i32::MIN as f64 && value <= i32::MAX as f64 {
+            let parsed = value as i32;
+            return Ok(SpiParam {
+                oid: pg_sys::INT4OID,
+                datum: parsed
+                    .into_datum()
+                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode int4"))?,
+                is_null: false,
+            });
+        }
+
+        if value.fract() == 0.0 {
+            let parsed = value as i64;
+            return Ok(SpiParam {
+                oid: pg_sys::INT8OID,
+                datum: parsed
+                    .into_datum()
+                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode int8"))?,
+                is_null: false,
+            });
+        }
+
+        Ok(SpiParam {
+            oid: pg_sys::FLOAT8OID,
+            datum: value
+                .into_datum()
+                .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode float8"))?,
+            is_null: false,
+        })
+    }
+
     fn to_text(&self) -> Result<String, JsErrorBox> {
         match self {
             Self::Null => Err(JsErrorBox::type_error(
@@ -414,7 +444,7 @@ impl WireValue {
             )),
             Self::Array { value } => value
                 .iter()
-                .map(WireValue::to_json_value)
+                .map(InputValue::to_json_value)
                 .collect::<Result<Vec<_>, _>>()
                 .map(JsonValue::Array),
             Self::Object { value } => value
@@ -474,6 +504,8 @@ impl OwnedPgValue {
                             JsErrorBox::generic("pg_typescript: failed to decode json/jsonb")
                         })?,
                 )),
+                // Fall back to the type's text output function so callers still
+                // get a value for types we have not added a native JS mapping for.
                 _ => Ok(Self::String(output_fn_call(datum, oid))),
             }
         }
@@ -569,6 +601,8 @@ pub fn with_pg_execute_allowed<F, R>(rt: &mut JsRuntime, f: F) -> R
 where
     F: FnOnce(&mut JsRuntime) -> R,
 {
+    // Flip the capability on only for the direct TS function invocation and
+    // always restore it, even if user code panics through Rust.
     set_pg_execute_allowed(rt, true);
     let result = catch_unwind(AssertUnwindSafe(|| f(rt)));
     set_pg_execute_allowed(rt, false);
@@ -580,11 +614,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{map_command, WireValue};
+    use super::{map_command, InputValue};
 
     #[test]
     fn wire_value_json_rejects_bigint() {
-        let err = WireValue::Bigint {
+        let err = InputValue::Bigint {
             value: "42".to_string(),
         }
         .to_json_value()
