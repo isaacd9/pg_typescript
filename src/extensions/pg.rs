@@ -288,6 +288,15 @@ impl InputTypeRef {
 }
 
 impl InputValue {
+    // Default JS -> Postgres inference for `_pg.execute(...)` parameters:
+    // - `null` -> `unknown` (caller can cast in SQL)
+    // - `boolean` -> `bool`
+    // - integral `number` in int4 range -> `int4`
+    // - other integral `number` -> `int8`
+    // - non-integral `number` -> `float8`
+    // - `string` -> `text`
+    // - `bigint` -> `int8`
+    // - arrays / plain objects -> `jsonb`
     fn into_inferred_spi_param(self) -> Result<SpiParam, JsErrorBox> {
         match self {
             Self::Null => Ok(SpiParam {
@@ -361,7 +370,8 @@ impl InputValue {
             primitive => {
                 // For explicitly typed values we let Postgres parse the text form
                 // using the target type's input function instead of hardcoding
-                // per-type encoders on the Rust side.
+                // per-type encoders on the Rust side. `input_fn_call()` is the
+                // bridge into that per-type parser.
                 let text = primitive.to_text()?;
                 Ok(SpiParam {
                     oid,
@@ -506,6 +516,8 @@ impl OwnedPgValue {
                 )),
                 // Fall back to the type's text output function so callers still
                 // get a value for types we have not added a native JS mapping for.
+                // `output_fn_call()` asks Postgres to stringify the Datum using
+                // the type's own output function.
                 _ => Ok(Self::String(output_fn_call(datum, oid))),
             }
         }
@@ -548,6 +560,9 @@ impl Serialize for OwnedPgValue {
     }
 }
 
+// Look up the Postgres output function for `type_oid` and use it to turn a raw
+// Datum into its text form. This is the generic fallback path for result types
+// we do not decode into a richer JS value ourselves.
 fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String {
     unsafe {
         let mut output_fn: pg_sys::Oid = pg_sys::InvalidOid;
@@ -560,6 +575,10 @@ fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String {
     }
 }
 
+// Look up the Postgres input function for `type_oid` and let Postgres parse the
+// provided text into the correct Datum representation. This keeps typed params
+// aligned with PostgreSQL's own type parsing rules instead of duplicating them
+// in Rust.
 fn input_fn_call(value: &str, type_oid: pg_sys::Oid) -> pg_sys::Datum {
     unsafe {
         let mut input_fn: pg_sys::Oid = pg_sys::InvalidOid;
