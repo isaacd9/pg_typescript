@@ -162,18 +162,15 @@ fn execute_spi(query: &CString, params: &[SpiParam]) -> i32 {
         nargs => {
             let mut argtypes = params.iter().map(|param| param.oid).collect::<Vec<_>>();
             let mut datums = params.iter().map(|param| param.datum).collect::<Vec<_>>();
-            let nulls = params
-                .iter()
-                .map(|param| {
-                    if param.is_null {
-                        b'n' as c_char
-                    } else {
-                        b' ' as c_char
-                    }
-                })
-                .collect::<Vec<_>>();
+            // SPI expects a parallel null-marker array alongside the Datums:
+            // `'n'` means "this parameter is NULL" and a space means "this
+            // parameter is present". These entries line up with `$1`, `$2`, ...
+            // in the SQL in the same order as `argtypes` and `datums`.
+            let nulls = params.iter().map(SpiParam::null_marker).collect::<Vec<_>>();
 
             unsafe {
+                // This is where PostgreSQL binds the Rust-built parameter arrays
+                // to `$1`, `$2`, ... placeholders in the SQL text.
                 pg_sys::SPI_execute_with_args(
                     query.as_ptr(),
                     nargs as i32,
@@ -275,6 +272,16 @@ impl InputParam {
         match self {
             Self::Inferred { value } => value.into_inferred_spi_param(),
             Self::Typed { type_ref, value } => value.into_typed_spi_param(type_ref.into_oid()),
+        }
+    }
+}
+
+impl SpiParam {
+    fn null_marker(&self) -> c_char {
+        if self.is_null {
+            b'n' as c_char
+        } else {
+            b' ' as c_char
         }
     }
 }
