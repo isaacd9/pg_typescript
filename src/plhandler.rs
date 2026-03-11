@@ -10,13 +10,14 @@ use pgrx::prelude::*;
 use pgrx::{fcinfo, pg_sys};
 
 use crate::convert::{PgDatum, PgDatumSeed, VoidSeed};
+use crate::extensions::console::ensure_console_hook;
+use crate::extensions::pg::{ensure_pg_api, set_pg_execute_allowed, with_pg_execute_allowed};
 use crate::fetch;
 use crate::guc::{import_url_allowed, GucParser, ImportUrlCap};
 use crate::loader;
 use crate::permissions::{
     read_function_config, read_function_permissions, read_inline_permissions,
 };
-use crate::extensions::console::ensure_console_hook;
 use crate::runtime::{
     block_on, set_runtime_permissions, with_runtime, with_tokio_context, RuntimePermissions,
 };
@@ -330,12 +331,15 @@ impl ModuleArtifact {
         S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
     {
         self.with_loaded_fn(exec, |rt, fn_global| {
-            let promise_global = with_tokio_context(|| call_fn_with_args(rt, fn_global, args));
-            let resolve_fut = rt.resolve(promise_global);
-            let resolved = block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
-                .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+            with_pg_execute_allowed(rt, |rt| {
+                let promise_global = with_tokio_context(|| call_fn_with_args(rt, fn_global, args));
+                let resolve_fut = rt.resolve(promise_global);
+                let resolved =
+                    block_on(rt.with_event_loop_promise(resolve_fut, Default::default()))
+                        .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
 
-            global_to(rt, resolved, seed)
+                global_to(rt, resolved, seed)
+            })
         })
     }
 
@@ -351,6 +355,8 @@ impl ModuleArtifact {
         let ExecutionConfig { permissions, store } = exec;
         with_runtime(|rt| {
             ensure_console_hook(rt);
+            ensure_pg_api(rt);
+            set_pg_execute_allowed(rt, false);
             set_runtime_permissions(rt, &permissions);
             let fn_global = self.load_or_get_cached(rt, store);
             f(rt, fn_global)

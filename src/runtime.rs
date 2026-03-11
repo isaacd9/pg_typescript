@@ -15,6 +15,7 @@ use node_resolver::errors::PackageFolderResolveError;
 use node_resolver::{InNpmPackageChecker, NpmPackageFolderResolver, UrlOrPathRef};
 
 use crate::extensions::console::{install_console_hook, pg_typescript_console};
+use crate::extensions::pg::{install_pg_api, pg_typescript_pg};
 use crate::loader::PgModuleLoader;
 
 const STARTUP_SNAPSHOT: &[u8] =
@@ -209,12 +210,14 @@ fn create_runtime() -> MainWorker {
             extensions: vec![
                 pg_typescript_runtime_state::init(),
                 pg_typescript_console::init(),
+                pg_typescript_pg::init(),
             ],
             ..Default::default()
         },
     );
 
     install_console_hook(&mut worker.js_runtime);
+    install_pg_api(&mut worker.js_runtime);
 
     worker
 }
