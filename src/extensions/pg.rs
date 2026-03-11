@@ -393,13 +393,21 @@ impl WireValue {
         match self {
             Self::Null => Ok(JsonValue::Null),
             Self::Bool { value } => Ok(JsonValue::Bool(*value)),
-            Self::Number { value } => serde_json::Number::from_f64(*value)
-                .map(JsonValue::Number)
-                .ok_or_else(|| {
-                    JsErrorBox::type_error(
-                        "pg_typescript: cannot encode NaN or Infinity inside JSON values",
-                    )
-                }),
+            Self::Number { value } => {
+                if value.is_finite() && value.fract() == 0.0 {
+                    if *value >= i64::MIN as f64 && *value <= i64::MAX as f64 {
+                        return Ok(JsonValue::Number((*value as i64).into()));
+                    }
+                }
+
+                serde_json::Number::from_f64(*value)
+                    .map(JsonValue::Number)
+                    .ok_or_else(|| {
+                        JsErrorBox::type_error(
+                            "pg_typescript: cannot encode NaN or Infinity inside JSON values",
+                        )
+                    })
+            }
             Self::String { value } => Ok(JsonValue::String(value.clone())),
             Self::Bigint { .. } => Err(JsErrorBox::type_error(
                 "pg_typescript: bigint values are not supported inside inferred JSON parameters",

@@ -17,15 +17,30 @@ LANGUAGE typescript AS $$
     user_id,
   );
 $$;
-ERROR:  language "typescript" does not exist
 SELECT ts_pg_execute_select(1)->>'command' = 'SELECT' AS select_command_ok;
-ERROR:  function ts_pg_execute_select(integer) does not exist at character 8
+ select_command_ok 
+-------------------
+ t
+(1 row)
+
 SELECT (ts_pg_execute_select(1)->>'rowCount')::int = 1 AS select_row_count_ok;
-ERROR:  function ts_pg_execute_select(integer) does not exist at character 9
+ select_row_count_ok 
+---------------------
+ t
+(1 row)
+
 SELECT ts_pg_execute_select(1)->'rows'->0->>'name' = 'Ada' AS select_name_ok;
-ERROR:  function ts_pg_execute_select(integer) does not exist at character 8
+ select_name_ok 
+----------------
+ t
+(1 row)
+
 SELECT ts_pg_execute_select(1)->'rows'->0->'meta'->>'role' = 'admin' AS select_json_ok;
-ERROR:  function ts_pg_execute_select(integer) does not exist at character 8
+ select_json_ok 
+----------------
+ t
+(1 row)
+
 CREATE OR REPLACE FUNCTION ts_pg_execute_json_param() RETURNS int
 LANGUAGE typescript AS $$
   const result = _pg.execute(
@@ -34,9 +49,12 @@ LANGUAGE typescript AS $$
   );
   return result.rows[0].total;
 $$;
-ERROR:  language "typescript" does not exist
 SELECT ts_pg_execute_json_param() = 42 AS inferred_json_param_ok;
-ERROR:  function ts_pg_execute_json_param() does not exist at character 8
+ inferred_json_param_ok 
+------------------------
+ t
+(1 row)
+
 CREATE OR REPLACE FUNCTION ts_pg_execute_typed(uuid_text text) RETURNS text
 LANGUAGE typescript AS $$
   const result = _pg.execute(
@@ -45,10 +63,13 @@ LANGUAGE typescript AS $$
   );
   return result.rows[0].value;
 $$;
-ERROR:  language "typescript" does not exist
 SELECT ts_pg_execute_typed('550e8400-e29b-41d4-a716-446655440000') =
   '550e8400-e29b-41d4-a716-446655440000' AS typed_param_ok;
-ERROR:  function ts_pg_execute_typed(unknown) does not exist at character 8
+ typed_param_ok 
+----------------
+ t
+(1 row)
+
 CREATE OR REPLACE FUNCTION ts_pg_execute_insert(message text) RETURNS jsonb
 LANGUAGE typescript AS $$
   return _pg.execute(
@@ -56,16 +77,27 @@ LANGUAGE typescript AS $$
     message,
   );
 $$;
-ERROR:  language "typescript" does not exist
 SELECT ts_pg_execute_insert('hello')->>'command' = 'INSERT' AS insert_command_ok;
-ERROR:  function ts_pg_execute_insert(unknown) does not exist at character 8
+ insert_command_ok 
+-------------------
+ t
+(1 row)
+
 SELECT (ts_pg_execute_insert('world')->>'rowCount')::int = 1 AS insert_row_count_ok;
-ERROR:  function ts_pg_execute_insert(unknown) does not exist at character 9
+ insert_row_count_ok 
+---------------------
+ t
+(1 row)
+
 SELECT ts_pg_execute_insert('again')->'rows' = '[]'::jsonb AS insert_rows_empty_ok;
-ERROR:  function ts_pg_execute_insert(unknown) does not exist at character 8
+ insert_rows_empty_ok 
+----------------------
+ t
+(1 row)
+
 SELECT count(*) = 3 AS inserted_rows_ok FROM ts_pg_execute_logs;
  inserted_rows_ok 
 ------------------
- f
+ t
 (1 row)
 
