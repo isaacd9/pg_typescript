@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Once;
 
-use deno_core::{op2, JsRuntime};
+use deno_core::JsRuntime;
 use deno_runtime::deno_permissions::{
     Permissions, PermissionsContainer, PermissionsOptions, RuntimePermissionDescriptorParser,
 };
@@ -14,6 +14,7 @@ use deno_runtime::FeatureChecker;
 use node_resolver::errors::PackageFolderResolveError;
 use node_resolver::{InNpmPackageChecker, NpmPackageFolderResolver, UrlOrPathRef};
 
+use crate::extensions::console::{install_console_hook, pg_typescript_console};
 use crate::loader::PgModuleLoader;
 
 const STARTUP_SNAPSHOT: &[u8] =
@@ -69,31 +70,6 @@ impl NpmPackageFolderResolver for PgNpmPackageFolderResolver {
     }
 }
 
-#[op2(fast)]
-fn op_pg_console_log(#[string] level: &str, #[string] msg: &str) {
-    emit_console_line(level, msg);
-}
-
-#[cfg(any(not(test), feature = "pg_test"))]
-fn emit_console_line(level: &str, msg: &str) {
-    match level {
-        "warn" | "error" => pgrx::warning!("[pg_typescript:{level}] {msg}"),
-        "info" => pgrx::info!("[pg_typescript:{level}] {msg}"),
-        _ => pgrx::log!("[pg_typescript:{level}] {msg}"),
-    }
-}
-
-#[cfg(all(test, not(feature = "pg_test")))]
-fn emit_console_line(level: &str, msg: &str) {
-    eprintln!("[pg_typescript:{level}] {msg}");
-}
-
-deno_core::extension!(
-    pg_typescript_console,
-    ops = [op_pg_console_log],
-    esm_entry_point = "ext:pg_typescript_console/console_bridge.js",
-    esm = [ dir "src/js", "console_bridge.js" ],
-);
 deno_core::extension!(
     pg_typescript_runtime_state,
     state = |state| {
@@ -102,44 +78,6 @@ deno_core::extension!(
         }
     }
 );
-
-const CONSOLE_HOOK_JS: &str = r#"
-(() => {
-  const op = globalThis?.Deno?.core?.ops?.op_pg_console_log
-    ?? globalThis?.__pg_op_console_log;
-  if (typeof op !== "function" || typeof globalThis.console === "undefined") return;
-
-  const stringify = (value) => {
-    if (typeof value === "string") return value;
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
-    }
-  };
-
-  const bind = (level) => (...args) => {
-    const msg = args.map(stringify).join(" ");
-    op(level, msg);
-  };
-
-  console.debug = bind("debug");
-  console.log = bind("log");
-  console.info = bind("info");
-  console.warn = bind("warn");
-  console.error = bind("error");
-})();
-"#;
-
-fn install_console_hook(rt: &mut JsRuntime) {
-    rt.execute_script("pg_typescript:console_hook", CONSOLE_HOOK_JS)
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to install console hook: {e}"));
-}
-
-/// Re-apply the console hook in case runtime bootstrap code replaced console methods.
-pub fn ensure_console_hook(rt: &mut JsRuntime) {
-    install_console_hook(rt);
-}
 
 /// Run `f` with the per-connection runtime, initialising it on first use.
 pub fn with_runtime<F, R>(f: F) -> R

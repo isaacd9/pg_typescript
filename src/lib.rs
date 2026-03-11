@@ -3,6 +3,7 @@ use pgrx::prelude::*;
 
 pgrx::pg_module_magic!(name, version);
 
+mod extensions;
 mod convert;
 mod fetch;
 mod guc;

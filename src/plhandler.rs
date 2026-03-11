@@ -16,9 +16,9 @@ use crate::loader;
 use crate::permissions::{
     read_function_config, read_function_permissions, read_inline_permissions,
 };
+use crate::extensions::console::ensure_console_hook;
 use crate::runtime::{
-    block_on, ensure_console_hook, set_runtime_permissions, with_runtime, with_tokio_context,
-    RuntimePermissions,
+    block_on, set_runtime_permissions, with_runtime, with_tokio_context, RuntimePermissions,
 };
 
 // ---------------------------------------------------------------------------
