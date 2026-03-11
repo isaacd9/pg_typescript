@@ -126,6 +126,8 @@
             default = pkgs.mkShell {
               packages = runtimePackages;
 
+              RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+
               shellHook = ''
                 if [ "$(uname -s)" = "Darwin" ]; then
                   export RUSTY_V8_MIRROR="https://github.com/denoland/rusty_v8/releases/download"
