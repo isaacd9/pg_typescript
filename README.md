@@ -113,6 +113,19 @@ structured returns rather than a JSONB recordset expansion.
 See `examples/streaming/README.md` for the exact shape of the demo output and
 the manual SQL behind it.
 
+## _pg.execute Example
+
+```bash
+just pg-execute
+```
+
+See `examples/pg_execute/README.md` for a small example that uses
+`_pg.execute()` from a TypeScript function to:
+
+- join two tables
+- use the joined rows to drive a second query against a third table
+- return the assembled result as JSONB
+
 ## Profile (Setup vs Execution)
 
 ```bash

@@ -36,3 +36,9 @@ postgrest pg_version="pg18" api_port="3000" db_name="postgrest_demo":
 streaming pg_version="pg18" db_name="streaming_demo":
   cd "{{justfile_directory()}}"
   ./examples/streaming/run.sh "{{pg_version}}" "{{db_name}}"
+
+# Run the _pg.execute example that joins two tables, then queries a third.
+# Example: just pg-execute
+pg-execute pg_version="pg18" db_name="pg_execute_demo":
+  cd "{{justfile_directory()}}"
+  ./examples/pg_execute/run.sh "{{pg_version}}" "{{db_name}}"
