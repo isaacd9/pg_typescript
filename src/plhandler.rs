@@ -431,22 +431,22 @@ impl ModuleArtifact {
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
         let mut inline_modules = HashMap::new();
         inline_modules.insert(specifier.clone(), module_source);
-        let _ctx =
-            loader.set_context_with_inline(cache_oid, import_map, store, inline_modules);
 
-        let module_id = block_on(rt.load_side_es_module(&specifier_url))
-            .unwrap_or_else(|e| report_module_load_error(e));
+        loader.with_context(cache_oid, import_map, store, inline_modules, || {
+            let module_id = block_on(rt.load_side_es_module(&specifier_url))
+                .unwrap_or_else(|e| report_module_load_error(e));
 
-        let evaluate = rt.mod_evaluate(module_id);
-        block_on(rt.with_event_loop_promise(evaluate, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+            let evaluate = rt.mod_evaluate(module_id);
+            block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
 
-        let namespace = rt
-            .get_module_namespace(module_id)
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
-        let f = extract_default_export(rt, namespace);
-        FN_CACHE.with(|c| c.borrow_mut().insert((cache_oid, source_hash), f.clone()));
-        f
+            let namespace = rt
+                .get_module_namespace(module_id)
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+            let f = extract_default_export(rt, namespace);
+            FN_CACHE.with(|c| c.borrow_mut().insert((cache_oid, source_hash), f.clone()));
+            f
+        })
     }
 }
 
@@ -846,12 +846,13 @@ mod unit_tests {
             deno_core::resolve_url(&format!("file:///pg_typescript/test_syntax_{hash:016x}.ts"))
                 .unwrap();
         let result = with_runtime(|rt, loader| {
-            let _ctx = loader.set_context(
+            loader.with_context(
                 0,
                 Default::default(),
                 Box::new(crate::fetch::HashMapModuleStore::new()),
-            );
-            block_on(rt.load_side_es_module_from_code(&specifier, module_source))
+                HashMap::new(),
+                || block_on(rt.load_side_es_module_from_code(&specifier, module_source)),
+            )
         });
         assert!(
             result.is_err(),

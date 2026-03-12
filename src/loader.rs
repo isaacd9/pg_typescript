@@ -31,24 +31,10 @@ struct LoaderContext {
 ///
 /// Per-call state (fn_oid, import_map, store, inline modules) is held behind a
 /// `RefCell` because deno_core's `ModuleLoader` trait only provides `&self`.
-/// Callers swap the context in before each module-load via [`set_context`] and
-/// the returned RAII guard clears it on drop.
+/// Callers install context for the duration of a closure via
+/// [`with_context`], which clears it automatically on return or panic.
 pub struct PgModuleLoader {
     ctx: RefCell<Option<LoaderContext>>,
-}
-
-/// RAII guard returned by [`PgModuleLoader::set_context`].
-///
-/// Clears the loader context when dropped, ensuring that a panic or early
-/// return cannot leave stale state for the next call.
-pub struct LoaderContextGuard<'a> {
-    ctx: &'a RefCell<Option<LoaderContext>>,
-}
-
-impl Drop for LoaderContextGuard<'_> {
-    fn drop(&mut self) {
-        *self.ctx.borrow_mut() = None;
-    }
 }
 
 impl PgModuleLoader {
@@ -58,38 +44,33 @@ impl PgModuleLoader {
         }
     }
 
-    /// Set the loader context for the current function call.
+    /// Run `f` with the loader context set for the duration of the call.
     ///
-    /// Returns a [`LoaderContextGuard`] that clears the context on drop.
-    #[cfg(all(test, not(feature = "pg_test")))]
-    pub fn set_context(
-        &self,
-        fn_oid: u32,
-        import_map: HashMap<String, String>,
-        store: Box<dyn ModuleStore>,
-    ) -> LoaderContextGuard<'_> {
-        self.set_context_with_inline(fn_oid, import_map, store, HashMap::new())
-    }
-
-    /// Set the loader context for the current function call, with optional
-    /// in-memory module sources keyed by absolute specifier URL.
-    pub fn set_context_with_inline(
+    /// The context is installed before `f` runs and unconditionally cleared
+    /// afterwards — even on panic — so stale state cannot leak between calls.
+    pub fn with_context<R>(
         &self,
         fn_oid: u32,
         import_map: HashMap<String, String>,
         store: Box<dyn ModuleStore>,
         inline_modules: HashMap<String, String>,
-    ) -> LoaderContextGuard<'_> {
+        f: impl FnOnce() -> R,
+    ) -> R {
         *self.ctx.borrow_mut() = Some(LoaderContext {
             fn_oid,
             import_map,
             store,
             inline_modules,
         });
-        LoaderContextGuard { ctx: &self.ctx }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        *self.ctx.borrow_mut() = None;
+        match result {
+            Ok(v) => v,
+            Err(e) => std::panic::resume_unwind(e),
+        }
     }
 
-    fn with_context<T>(
+    fn borrow_ctx<T>(
         &self,
         f: impl FnOnce(&LoaderContext) -> Result<T, JsErrorBox>,
     ) -> Result<T, JsErrorBox> {
@@ -101,7 +82,7 @@ impl PgModuleLoader {
     }
 
     fn resolve_from_main(&self, specifier: &str) -> Result<ModuleSpecifier, ModuleLoaderError> {
-        self.with_context(|ctx| {
+        self.borrow_ctx(|ctx| {
             ImportMapResolver::new(&ctx.import_map).resolve_from_main(specifier)
         })
     }
@@ -113,7 +94,7 @@ impl PgModuleLoader {
     ) -> Result<ModuleSpecifier, ModuleLoaderError> {
         let base = ModuleSpecifier::parse(referrer)
             .unwrap_or_else(|_| ModuleSpecifier::parse("file:///").unwrap());
-        self.with_context(|ctx| {
+        self.borrow_ctx(|ctx| {
             ImportMapResolver::new(&ctx.import_map).resolve_from_dependency(specifier, &base)
         })
     }
@@ -321,6 +302,8 @@ mod tests {
 
     use crate::fetch::{make_import_map, HashMapModuleStore, ModuleStore};
 
+    use std::collections::HashMap;
+
     use super::PgModuleLoader;
 
     // --- load_module_source -------------------------------------------------
@@ -330,27 +313,29 @@ mod tests {
         let mut store = HashMapModuleStore::new();
         store.write(0, "https://esm.sh/lodash@4", "export default 42;");
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(
+        loader.with_context(
             0,
             make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
             Box::new(store),
-        );
-
-        assert_eq!(
-            loader.load_module_source("https://esm.sh/lodash@4"),
-            Ok(Some("export default 42;".to_string()))
+            HashMap::new(),
+            || {
+                assert_eq!(
+                    loader.load_module_source("https://esm.sh/lodash@4"),
+                    Ok(Some("export default 42;".to_string()))
+                );
+            },
         );
     }
 
     #[test]
     fn load_miss() {
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
-
-        assert_eq!(
-            loader.load_module_source("https://esm.sh/missing"),
-            Ok(None)
-        );
+        loader.with_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()), HashMap::new(), || {
+            assert_eq!(
+                loader.load_module_source("https://esm.sh/missing"),
+                Ok(None)
+            );
+        });
     }
 
     #[test]
@@ -366,59 +351,57 @@ mod tests {
     #[test]
     fn resolve_main_bare_in_map() {
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(
+        loader.with_context(
             0,
             make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
             Box::new(HashMapModuleStore::new()),
+            HashMap::new(),
+            || {
+                let url = loader.resolve_from_main("lodash").unwrap();
+                assert_eq!(url.as_str(), "https://esm.sh/lodash@4");
+            },
         );
-
-        let url = loader.resolve_from_main("lodash").unwrap();
-        assert_eq!(url.as_str(), "https://esm.sh/lodash@4");
     }
 
     #[test]
     fn resolve_main_bare_not_in_map() {
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
-
-        assert!(loader.resolve_from_main("lodash").is_err());
+        loader.with_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()), HashMap::new(), || {
+            assert!(loader.resolve_from_main("lodash").is_err());
+        });
     }
 
     #[test]
     fn resolve_main_relative_rejected() {
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
-
-        assert!(loader.resolve_from_main("./foo").is_err());
-        assert!(loader.resolve_from_main("../bar").is_err());
-        assert!(loader.resolve_from_main("/abs").is_err());
+        loader.with_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()), HashMap::new(), || {
+            assert!(loader.resolve_from_main("./foo").is_err());
+            assert!(loader.resolve_from_main("../bar").is_err());
+            assert!(loader.resolve_from_main("/abs").is_err());
+        });
     }
 
     #[test]
     fn resolve_main_absolute_declared() {
-        // An absolute URL that appears as a value in the import map is allowed.
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(
+        loader.with_context(
             0,
             make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
             Box::new(HashMapModuleStore::new()),
+            HashMap::new(),
+            || {
+                let url = loader.resolve_from_main("https://esm.sh/lodash@4").unwrap();
+                assert_eq!(url.as_str(), "https://esm.sh/lodash@4");
+            },
         );
-
-        let url = loader
-            .resolve_from_main("https://esm.sh/lodash@4")
-            .unwrap();
-        assert_eq!(url.as_str(), "https://esm.sh/lodash@4");
     }
 
     #[test]
     fn resolve_main_absolute_undeclared() {
-        // An absolute URL not present in the import map must be rejected.
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
-
-        assert!(loader
-            .resolve_from_main("https://esm.sh/undeclared")
-            .is_err());
+        loader.with_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()), HashMap::new(), || {
+            assert!(loader.resolve_from_main("https://esm.sh/undeclared").is_err());
+        });
     }
 
     // --- resolve_from_dep ---------------------------------------------------
@@ -426,59 +409,61 @@ mod tests {
     #[test]
     fn resolve_dep_absolute_passthrough() {
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
-
-        let url = loader
-            .resolve_from_dep("https://esm.sh/other@1", "https://esm.sh/pkg/index.js")
-            .unwrap();
-        assert_eq!(url.as_str(), "https://esm.sh/other@1");
+        loader.with_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()), HashMap::new(), || {
+            let url = loader
+                .resolve_from_dep("https://esm.sh/other@1", "https://esm.sh/pkg/index.js")
+                .unwrap();
+            assert_eq!(url.as_str(), "https://esm.sh/other@1");
+        });
     }
 
     #[test]
     fn resolve_dep_relative() {
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
-
-        let url = loader
-            .resolve_from_dep("./utils.js", "https://esm.sh/pkg/index.js")
-            .unwrap();
-        assert_eq!(url.as_str(), "https://esm.sh/pkg/utils.js");
+        loader.with_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()), HashMap::new(), || {
+            let url = loader
+                .resolve_from_dep("./utils.js", "https://esm.sh/pkg/index.js")
+                .unwrap();
+            assert_eq!(url.as_str(), "https://esm.sh/pkg/utils.js");
+        });
     }
 
     #[test]
     fn resolve_dep_relative_parent() {
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
-
-        let url = loader
-            .resolve_from_dep("../shared.js", "https://esm.sh/pkg/sub/index.js")
-            .unwrap();
-        assert_eq!(url.as_str(), "https://esm.sh/pkg/shared.js");
+        loader.with_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()), HashMap::new(), || {
+            let url = loader
+                .resolve_from_dep("../shared.js", "https://esm.sh/pkg/sub/index.js")
+                .unwrap();
+            assert_eq!(url.as_str(), "https://esm.sh/pkg/shared.js");
+        });
     }
 
     #[test]
     fn resolve_dep_bare_in_map() {
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(
+        loader.with_context(
             0,
             make_import_map(&[("zod", "https://esm.sh/zod@3")]),
             Box::new(HashMapModuleStore::new()),
+            HashMap::new(),
+            || {
+                let url = loader
+                    .resolve_from_dep("zod", "https://esm.sh/some-dep/index.js")
+                    .unwrap();
+                assert_eq!(url.as_str(), "https://esm.sh/zod@3");
+            },
         );
-
-        let url = loader
-            .resolve_from_dep("zod", "https://esm.sh/some-dep/index.js")
-            .unwrap();
-        assert_eq!(url.as_str(), "https://esm.sh/zod@3");
     }
 
     #[test]
     fn resolve_dep_bare_not_in_map() {
         let loader = PgModuleLoader::new();
-        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
-
-        assert!(loader
-            .resolve_from_dep("unknown", "https://esm.sh/pkg/index.js")
-            .is_err());
+        loader.with_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()), HashMap::new(), || {
+            assert!(loader
+                .resolve_from_dep("unknown", "https://esm.sh/pkg/index.js")
+                .is_err());
+        });
     }
 
     #[test]
