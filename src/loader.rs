@@ -168,11 +168,11 @@ impl<'a> ImportMapResolver<'a> {
             )));
         }
 
-        let url = match self.import_map.get(specifier) {
-            Some(url) => url.clone(),
+        let url: &str = match self.import_map.get(specifier) {
+            Some(url) => url,
             None if specifier.starts_with("http://") || specifier.starts_with("https://") => {
                 if self.import_map.values().any(|value| value == specifier) {
-                    specifier.to_string()
+                    specifier
                 } else {
                     return Err(JsErrorBox::generic(format!(
                         "pg_typescript: '{specifier}' is not declared in the import map"
@@ -186,7 +186,7 @@ impl<'a> ImportMapResolver<'a> {
             }
         };
 
-        ModuleSpecifier::parse(&url).map_err(JsErrorBox::from_err)
+        ModuleSpecifier::parse(url).map_err(JsErrorBox::from_err)
     }
 
     pub(crate) fn resolve_from_dependency(
@@ -203,13 +203,13 @@ impl<'a> ImportMapResolver<'a> {
             return referrer.join(specifier).map_err(JsErrorBox::from_err);
         }
 
-        let url = self.import_map.get(specifier).cloned().ok_or_else(|| {
+        let url = self.import_map.get(specifier).ok_or_else(|| {
             JsErrorBox::generic(format!(
                 "pg_typescript: '{specifier}' not found in import map"
             ))
         })?;
 
-        ModuleSpecifier::parse(&url).map_err(JsErrorBox::from_err)
+        ModuleSpecifier::parse(url).map_err(JsErrorBox::from_err)
     }
 }
 
@@ -294,11 +294,11 @@ fn should_transpile(name: &str) -> bool {
     let Ok(specifier) = ModuleSpecifier::parse(name) else {
         return false;
     };
-    let path = specifier.path().to_ascii_lowercase();
-    path.ends_with(".ts")
-        || path.ends_with(".tsx")
-        || path.ends_with(".mts")
-        || path.ends_with(".cts")
+    let path = specifier.path();
+    [".ts", ".tsx", ".mts", ".cts"].iter().any(|ext| {
+        path.len() >= ext.len()
+            && path[path.len() - ext.len()..].eq_ignore_ascii_case(ext)
+    })
 }
 
 // ---------------------------------------------------------------------------

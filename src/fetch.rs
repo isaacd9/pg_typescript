@@ -192,14 +192,6 @@ pub fn fetch_and_cache<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
     fetcher: &F,
     max_imports: &ImportUrlCap,
 ) -> Result<(), String> {
-    for url in import_map.values() {
-        if !import_url_allowed(url, max_imports)? {
-            return Err(format!(
-                "import URL '{url}' is not allowed by GUC typescript.max_imports"
-            ));
-        }
-    }
-
     store.clear_for_fn(fn_oid_raw);
 
     let roots = import_map
