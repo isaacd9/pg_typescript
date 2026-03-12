@@ -16,3 +16,35 @@ LANGUAGE typescript AS $$
 $$;
 
 SELECT ts_async_chain(4);
+
+-- setTimeout callbacks run before the result is returned
+CREATE OR REPLACE FUNCTION ts_async_timeout(n int) RETURNS int
+LANGUAGE typescript AS $$
+  return await new Promise<number>((resolve) => {
+    setTimeout(() => resolve(n * 3), 0);
+  });
+$$;
+
+SELECT ts_async_timeout(7);
+
+-- multiple setTimeout callbacks, including a nested one, are drained in order
+CREATE OR REPLACE FUNCTION ts_async_timeouts() RETURNS text
+LANGUAGE typescript AS $$
+  return await new Promise<string>((resolve) => {
+    const seen: string[] = [];
+
+    setTimeout(() => {
+      seen.push("first");
+    }, 0);
+
+    setTimeout(() => {
+      seen.push("second");
+      setTimeout(() => {
+        seen.push("third");
+        resolve(seen.join(","));
+      }, 0);
+    }, 0);
+  });
+$$;
+
+SELECT ts_async_timeouts();
