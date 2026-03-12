@@ -12,7 +12,7 @@ use deno_graph::source::{ResolveError as GraphResolveError, Resolver as GraphRes
 use crate::fetch::ModuleStore;
 
 // ---------------------------------------------------------------------------
-// Per-call loader context (thread-local)
+// Per-call loader context
 // ---------------------------------------------------------------------------
 
 struct LoaderContext {
@@ -22,60 +22,113 @@ struct LoaderContext {
     inline_modules: HashMap<String, String>,
 }
 
-thread_local! {
-    static LOADER_CTX: RefCell<Option<LoaderContext>> = const { RefCell::new(None) };
-}
-
-/// RAII guard returned by [`set_loader_context`].
-///
-/// Clears the thread-local context when dropped, ensuring that a panic or
-/// early return cannot leave stale state for the next call on the same thread.
-pub struct LoaderContextGuard;
-
-impl Drop for LoaderContextGuard {
-    fn drop(&mut self) {
-        LOADER_CTX.with(|c| *c.borrow_mut() = None);
-    }
-}
-
-/// Set the loader context for the current function call.
-///
-/// Returns a [`LoaderContextGuard`] that clears the context on drop.
-#[cfg(all(test, not(feature = "pg_test")))]
-pub fn set_loader_context(
-    fn_oid: u32,
-    import_map: HashMap<String, String>,
-    store: Box<dyn ModuleStore>,
-) -> LoaderContextGuard {
-    set_loader_context_with_inline(fn_oid, import_map, store, HashMap::new())
-}
-
-/// Set the loader context for the current function call, with optional
-/// in-memory module sources keyed by absolute specifier URL.
-pub fn set_loader_context_with_inline(
-    fn_oid: u32,
-    import_map: HashMap<String, String>,
-    store: Box<dyn ModuleStore>,
-    inline_modules: HashMap<String, String>,
-) -> LoaderContextGuard {
-    LOADER_CTX.with(|c| {
-        *c.borrow_mut() = Some(LoaderContext {
-            fn_oid,
-            import_map,
-            store,
-            inline_modules,
-        });
-    });
-    LoaderContextGuard
-}
-
 // ---------------------------------------------------------------------------
 // PgModuleLoader
 // ---------------------------------------------------------------------------
 
 /// A `ModuleLoader` that resolves bare specifiers via the import map and loads
 /// module source from the active [`ModuleStore`].
-pub struct PgModuleLoader;
+///
+/// Per-call state (fn_oid, import_map, store, inline modules) is held behind a
+/// `RefCell` because deno_core's `ModuleLoader` trait only provides `&self`.
+/// Callers swap the context in before each module-load via [`set_context`] and
+/// the returned RAII guard clears it on drop.
+pub struct PgModuleLoader {
+    ctx: RefCell<Option<LoaderContext>>,
+}
+
+/// RAII guard returned by [`PgModuleLoader::set_context`].
+///
+/// Clears the loader context when dropped, ensuring that a panic or early
+/// return cannot leave stale state for the next call.
+pub struct LoaderContextGuard<'a> {
+    ctx: &'a RefCell<Option<LoaderContext>>,
+}
+
+impl Drop for LoaderContextGuard<'_> {
+    fn drop(&mut self) {
+        *self.ctx.borrow_mut() = None;
+    }
+}
+
+impl PgModuleLoader {
+    pub fn new() -> Self {
+        Self {
+            ctx: RefCell::new(None),
+        }
+    }
+
+    /// Set the loader context for the current function call.
+    ///
+    /// Returns a [`LoaderContextGuard`] that clears the context on drop.
+    #[cfg(all(test, not(feature = "pg_test")))]
+    pub fn set_context(
+        &self,
+        fn_oid: u32,
+        import_map: HashMap<String, String>,
+        store: Box<dyn ModuleStore>,
+    ) -> LoaderContextGuard<'_> {
+        self.set_context_with_inline(fn_oid, import_map, store, HashMap::new())
+    }
+
+    /// Set the loader context for the current function call, with optional
+    /// in-memory module sources keyed by absolute specifier URL.
+    pub fn set_context_with_inline(
+        &self,
+        fn_oid: u32,
+        import_map: HashMap<String, String>,
+        store: Box<dyn ModuleStore>,
+        inline_modules: HashMap<String, String>,
+    ) -> LoaderContextGuard<'_> {
+        *self.ctx.borrow_mut() = Some(LoaderContext {
+            fn_oid,
+            import_map,
+            store,
+            inline_modules,
+        });
+        LoaderContextGuard { ctx: &self.ctx }
+    }
+
+    fn with_context<T>(
+        &self,
+        f: impl FnOnce(&LoaderContext) -> Result<T, JsErrorBox>,
+    ) -> Result<T, JsErrorBox> {
+        let ctx = self.ctx.borrow();
+        let ctx = ctx
+            .as_ref()
+            .ok_or_else(|| JsErrorBox::generic("pg_typescript: no loader context set"))?;
+        f(ctx)
+    }
+
+    fn resolve_from_main(&self, specifier: &str) -> Result<ModuleSpecifier, ModuleLoaderError> {
+        self.with_context(|ctx| {
+            ImportMapResolver::new(&ctx.import_map).resolve_from_main(specifier)
+        })
+    }
+
+    fn resolve_from_dep(
+        &self,
+        specifier: &str,
+        referrer: &str,
+    ) -> Result<ModuleSpecifier, ModuleLoaderError> {
+        let base = ModuleSpecifier::parse(referrer)
+            .unwrap_or_else(|_| ModuleSpecifier::parse("file:///").unwrap());
+        self.with_context(|ctx| {
+            ImportMapResolver::new(&ctx.import_map).resolve_from_dependency(specifier, &base)
+        })
+    }
+
+    fn load_module_source(&self, url: &str) -> Result<Option<String>, String> {
+        let ctx = self.ctx.borrow();
+        let ctx = ctx
+            .as_ref()
+            .ok_or_else(|| "no loader context set".to_string())?;
+        if let Some(source) = ctx.inline_modules.get(url) {
+            return Ok(Some(source.clone()));
+        }
+        ctx.store.load(ctx.fn_oid, url)
+    }
+}
 
 impl ModuleLoader for PgModuleLoader {
     fn resolve(
@@ -98,9 +151,9 @@ impl ModuleLoader for PgModuleLoader {
 
         // Dispatch based on the trust level of the referrer.
         if referrer.starts_with("file://") {
-            resolve_from_main(specifier)
+            self.resolve_from_main(specifier)
         } else {
-            resolve_from_dep(specifier, referrer)
+            self.resolve_from_dep(specifier, referrer)
         }
     }
 
@@ -112,7 +165,7 @@ impl ModuleLoader for PgModuleLoader {
     ) -> ModuleLoadResponse {
         let url = module_specifier.as_str();
 
-        let source: String = match load_module_source(url) {
+        let source: String = match self.load_module_source(url) {
             Ok(Some(s)) => s,
             Ok(None) => {
                 return ModuleLoadResponse::Sync(Err(JsErrorBox::generic(format!(
@@ -225,52 +278,9 @@ impl GraphResolver for ImportMapResolver<'_> {
     }
 }
 
-fn with_import_map_resolver<T>(
-    f: impl FnOnce(ImportMapResolver<'_>) -> Result<T, JsErrorBox>,
-) -> Result<T, JsErrorBox> {
-    LOADER_CTX.with(|c| {
-        let ctx = c.borrow();
-        let ctx = ctx
-            .as_ref()
-            .ok_or_else(|| JsErrorBox::generic("pg_typescript: no loader context set"))?;
-        f(ImportMapResolver::new(&ctx.import_map))
-    })
-}
-
-/// Resolve an import that originates from the main module body.
-///
-/// Everything must be explicitly declared in the import map — relative imports
-/// are rejected outright, bare specifiers are looked up by key, and absolute
-/// http/https URLs must appear as a declared value.
-fn resolve_from_main(specifier: &str) -> Result<ModuleSpecifier, ModuleLoaderError> {
-    with_import_map_resolver(|resolver| resolver.resolve_from_main(specifier))
-}
-
-/// Resolve an import that originates from a transitive dependency.
-///
-/// Absolute http/https URLs pass through freely; relative specifiers are
-/// resolved against the referrer. Bare specifiers fall back to the import map.
-fn resolve_from_dep(specifier: &str, referrer: &str) -> Result<ModuleSpecifier, ModuleLoaderError> {
-    let base = ModuleSpecifier::parse(referrer)
-        .unwrap_or_else(|_| ModuleSpecifier::parse("file:///").unwrap());
-    with_import_map_resolver(|resolver| resolver.resolve_from_dependency(specifier, &base))
-}
-
 // ---------------------------------------------------------------------------
-// Module source retrieval
+// Transpilation
 // ---------------------------------------------------------------------------
-
-fn load_module_source(url: &str) -> Result<Option<String>, String> {
-    LOADER_CTX.with(|c| match c.borrow().as_ref() {
-        Some(ctx) => {
-            if let Some(source) = ctx.inline_modules.get(url) {
-                return Ok(Some(source.clone()));
-            }
-            ctx.store.load(ctx.fn_oid, url)
-        }
-        None => Err("no loader context set".to_string()),
-    })
-}
 
 fn maybe_transpile_source(
     module_specifier: &ModuleSpecifier,
@@ -311,14 +321,7 @@ mod tests {
 
     use crate::fetch::{make_import_map, HashMapModuleStore, ModuleStore};
 
-    /// Set up a loader context with the given import map entries and a
-    /// pre-populated store, returning the RAII guard.
-    fn make_ctx(
-        map_entries: &[(&str, &str)],
-        store: HashMapModuleStore,
-    ) -> super::LoaderContextGuard {
-        super::set_loader_context(0, make_import_map(map_entries), Box::new(store))
-    }
+    use super::PgModuleLoader;
 
     // --- load_module_source -------------------------------------------------
 
@@ -326,20 +329,26 @@ mod tests {
     fn load_hit() {
         let mut store = HashMapModuleStore::new();
         store.write(0, "https://esm.sh/lodash@4", "export default 42;");
-        let _ctx = make_ctx(&[("lodash", "https://esm.sh/lodash@4")], store);
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(
+            0,
+            make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
+            Box::new(store),
+        );
 
         assert_eq!(
-            super::load_module_source("https://esm.sh/lodash@4"),
+            loader.load_module_source("https://esm.sh/lodash@4"),
             Ok(Some("export default 42;".to_string()))
         );
     }
 
     #[test]
     fn load_miss() {
-        let _ctx = make_ctx(&[], HashMapModuleStore::new());
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
 
         assert_eq!(
-            super::load_module_source("https://esm.sh/missing"),
+            loader.load_module_source("https://esm.sh/missing"),
             Ok(None)
         );
     }
@@ -347,7 +356,8 @@ mod tests {
     #[test]
     fn load_no_context() {
         // No context set — must return Err.
-        let result = super::load_module_source("https://esm.sh/x");
+        let loader = PgModuleLoader::new();
+        let result = loader.load_module_source("https://esm.sh/x");
         assert!(result.is_err());
     }
 
@@ -355,100 +365,125 @@ mod tests {
 
     #[test]
     fn resolve_main_bare_in_map() {
-        let _ctx = make_ctx(
-            &[("lodash", "https://esm.sh/lodash@4")],
-            HashMapModuleStore::new(),
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(
+            0,
+            make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
+            Box::new(HashMapModuleStore::new()),
         );
 
-        let url = super::resolve_from_main("lodash").unwrap();
+        let url = loader.resolve_from_main("lodash").unwrap();
         assert_eq!(url.as_str(), "https://esm.sh/lodash@4");
     }
 
     #[test]
     fn resolve_main_bare_not_in_map() {
-        let _ctx = make_ctx(&[], HashMapModuleStore::new());
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
 
-        assert!(super::resolve_from_main("lodash").is_err());
+        assert!(loader.resolve_from_main("lodash").is_err());
     }
 
     #[test]
     fn resolve_main_relative_rejected() {
-        let _ctx = make_ctx(&[], HashMapModuleStore::new());
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
 
-        assert!(super::resolve_from_main("./foo").is_err());
-        assert!(super::resolve_from_main("../bar").is_err());
-        assert!(super::resolve_from_main("/abs").is_err());
+        assert!(loader.resolve_from_main("./foo").is_err());
+        assert!(loader.resolve_from_main("../bar").is_err());
+        assert!(loader.resolve_from_main("/abs").is_err());
     }
 
     #[test]
     fn resolve_main_absolute_declared() {
         // An absolute URL that appears as a value in the import map is allowed.
-        let _ctx = make_ctx(
-            &[("lodash", "https://esm.sh/lodash@4")],
-            HashMapModuleStore::new(),
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(
+            0,
+            make_import_map(&[("lodash", "https://esm.sh/lodash@4")]),
+            Box::new(HashMapModuleStore::new()),
         );
 
-        let url = super::resolve_from_main("https://esm.sh/lodash@4").unwrap();
+        let url = loader
+            .resolve_from_main("https://esm.sh/lodash@4")
+            .unwrap();
         assert_eq!(url.as_str(), "https://esm.sh/lodash@4");
     }
 
     #[test]
     fn resolve_main_absolute_undeclared() {
         // An absolute URL not present in the import map must be rejected.
-        let _ctx = make_ctx(&[], HashMapModuleStore::new());
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
 
-        assert!(super::resolve_from_main("https://esm.sh/undeclared").is_err());
+        assert!(loader
+            .resolve_from_main("https://esm.sh/undeclared")
+            .is_err());
     }
 
     // --- resolve_from_dep ---------------------------------------------------
 
     #[test]
     fn resolve_dep_absolute_passthrough() {
-        let _ctx = make_ctx(&[], HashMapModuleStore::new());
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
 
-        let url = super::resolve_from_dep("https://esm.sh/other@1", "https://esm.sh/pkg/index.js")
+        let url = loader
+            .resolve_from_dep("https://esm.sh/other@1", "https://esm.sh/pkg/index.js")
             .unwrap();
         assert_eq!(url.as_str(), "https://esm.sh/other@1");
     }
 
     #[test]
     fn resolve_dep_relative() {
-        let _ctx = make_ctx(&[], HashMapModuleStore::new());
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
 
-        let url = super::resolve_from_dep("./utils.js", "https://esm.sh/pkg/index.js").unwrap();
+        let url = loader
+            .resolve_from_dep("./utils.js", "https://esm.sh/pkg/index.js")
+            .unwrap();
         assert_eq!(url.as_str(), "https://esm.sh/pkg/utils.js");
     }
 
     #[test]
     fn resolve_dep_relative_parent() {
-        let _ctx = make_ctx(&[], HashMapModuleStore::new());
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
 
-        let url =
-            super::resolve_from_dep("../shared.js", "https://esm.sh/pkg/sub/index.js").unwrap();
+        let url = loader
+            .resolve_from_dep("../shared.js", "https://esm.sh/pkg/sub/index.js")
+            .unwrap();
         assert_eq!(url.as_str(), "https://esm.sh/pkg/shared.js");
     }
 
     #[test]
     fn resolve_dep_bare_in_map() {
-        let _ctx = make_ctx(
-            &[("zod", "https://esm.sh/zod@3")],
-            HashMapModuleStore::new(),
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(
+            0,
+            make_import_map(&[("zod", "https://esm.sh/zod@3")]),
+            Box::new(HashMapModuleStore::new()),
         );
 
-        let url = super::resolve_from_dep("zod", "https://esm.sh/some-dep/index.js").unwrap();
+        let url = loader
+            .resolve_from_dep("zod", "https://esm.sh/some-dep/index.js")
+            .unwrap();
         assert_eq!(url.as_str(), "https://esm.sh/zod@3");
     }
 
     #[test]
     fn resolve_dep_bare_not_in_map() {
-        let _ctx = make_ctx(&[], HashMapModuleStore::new());
+        let loader = PgModuleLoader::new();
+        let _ctx = loader.set_context(0, make_import_map(&[]), Box::new(HashMapModuleStore::new()));
 
-        assert!(super::resolve_from_dep("unknown", "https://esm.sh/pkg/index.js").is_err());
+        assert!(loader
+            .resolve_from_dep("unknown", "https://esm.sh/pkg/index.js")
+            .is_err());
     }
 
     #[test]
     fn resolve_file_root_allowed() {
-        let loader = super::PgModuleLoader;
+        let loader = PgModuleLoader::new();
         let url = loader
             .resolve(
                 "file:///pg_typescript/fn_1_deadbeefdeadbeef.ts",
@@ -464,7 +499,7 @@ mod tests {
 
     #[test]
     fn resolve_file_from_function_rejected() {
-        let loader = super::PgModuleLoader;
+        let loader = PgModuleLoader::new();
         let err = loader
             .resolve(
                 "file:///pg_typescript/fn_2_deadbeefdeadbeef.ts",

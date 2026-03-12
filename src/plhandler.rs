@@ -378,7 +378,7 @@ impl ModuleArtifact {
             allow_pg_execute,
             store,
         } = exec;
-        with_runtime(|rt| {
+        with_runtime(|rt, loader| {
             ensure_console_hook(rt);
             ensure_pg_api(rt);
             // Keep `_pg.execute()` disabled while the shared runtime is loading
@@ -393,7 +393,7 @@ impl ModuleArtifact {
                 },
             );
             set_runtime_permissions(rt, &permissions);
-            let fn_global = self.load_or_get_cached(rt, store);
+            let fn_global = self.load_or_get_cached(rt, loader, store);
             f(rt, fn_global)
         })
     }
@@ -401,6 +401,7 @@ impl ModuleArtifact {
     fn load_or_get_cached(
         self,
         rt: &mut deno_core::JsRuntime,
+        loader: &loader::PgModuleLoader,
         store: Box<dyn fetch::ModuleStore>,
     ) -> v8::Global<v8::Value> {
         if let Some(f) =
@@ -409,12 +410,13 @@ impl ModuleArtifact {
             return f;
         }
 
-        self.load_and_cache(rt, store)
+        self.load_and_cache(rt, loader, store)
     }
 
     fn load_and_cache(
         self,
         rt: &mut deno_core::JsRuntime,
+        loader: &loader::PgModuleLoader,
         store: Box<dyn fetch::ModuleStore>,
     ) -> v8::Global<v8::Value> {
         let Self {
@@ -430,7 +432,7 @@ impl ModuleArtifact {
         let mut inline_modules = HashMap::new();
         inline_modules.insert(specifier.clone(), module_source);
         let _ctx =
-            loader::set_loader_context_with_inline(cache_oid, import_map, store, inline_modules);
+            loader.set_context_with_inline(cache_oid, import_map, store, inline_modules);
 
         let module_id = block_on(rt.load_side_es_module(&specifier_url))
             .unwrap_or_else(|e| report_module_load_error(e));
@@ -843,8 +845,8 @@ mod unit_tests {
         let specifier =
             deno_core::resolve_url(&format!("file:///pg_typescript/test_syntax_{hash:016x}.ts"))
                 .unwrap();
-        let result = with_runtime(|rt| {
-            let _ctx = crate::loader::set_loader_context(
+        let result = with_runtime(|rt, loader| {
+            let _ctx = loader.set_context(
                 0,
                 Default::default(),
                 Box::new(crate::fetch::HashMapModuleStore::new()),
