@@ -1,0 +1,21 @@
+{
+  "name": "@pg-typescript/types",
+  "version": "0.1.0",
+  "description": "Ambient TypeScript types for pg_typescript runtime globals",
+  "types": "./index.d.ts",
+  "main": "./empty.js",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./empty.js"
+    }
+  },
+  "files": [
+    "README.md",
+    "index.d.ts",
+    "empty.js"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
