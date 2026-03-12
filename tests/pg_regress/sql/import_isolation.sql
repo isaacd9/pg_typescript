@@ -2,6 +2,7 @@
 -- 1) dynamic runtime imports are rejected
 -- 2) file:// probing of fn_* internals is rejected
 -- 3) declared static import-map bindings still work
+SET typescript.max_allow_import = 'esm.sh';
 
 CREATE OR REPLACE FUNCTION ts_assert_raises(stmt text) RETURNS bool
 LANGUAGE plpgsql AS $$
@@ -21,6 +22,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION ts_dynamic_import_bare_not_mapped() RETURNS text
 LANGUAGE typescript
+SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
 AS $$
   const mod = await import("zod");
@@ -35,6 +37,7 @@ $$;
 
 CREATE OR REPLACE FUNCTION ts_static_import_declared(name text) RETURNS text
 LANGUAGE typescript
+SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
 AS $$
   return lodash.capitalize(name);
@@ -61,3 +64,5 @@ FROM (
     )
 ) AS checks(test, ok)
 ORDER BY test;
+
+RESET typescript.max_allow_import;

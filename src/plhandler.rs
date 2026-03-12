@@ -18,7 +18,7 @@ use crate::fetch;
 use crate::guc::{import_url_allowed, GucParser, ImportUrlCap};
 use crate::loader;
 use crate::permissions::{
-    read_function_config, read_function_permissions, read_function_pg_execute,
+    import_allowed, read_function_config, read_function_permissions, read_function_pg_execute,
     read_inline_permissions, read_inline_pg_execute,
 };
 use crate::runtime::{
@@ -72,8 +72,8 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
     let arg_types = proc.proargtypes();
     let nargs = proc.pronargs();
     let param_names = build_param_names(&proc.proargnames(), nargs);
-    let (import_map, _max_imports) = read_import_map(&proc);
     let permissions = read_function_permissions(&proc);
+    let (import_map, _max_imports) = read_import_map(&proc, permissions.allow_import.as_deref());
     let allow_pg_execute = read_function_pg_execute(&proc);
 
     let args: Vec<PgDatum> = (0..nargs)
@@ -129,8 +129,8 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     let source = proc.prosrc();
     let nargs = proc.pronargs();
     let param_names = build_param_names(&proc.proargnames(), nargs);
-    let (import_map, _max_imports) = read_import_map(&proc);
     let permissions = read_function_permissions(&proc);
+    let (import_map, _max_imports) = read_import_map(&proc, permissions.allow_import.as_deref());
     let allow_pg_execute = read_function_pg_execute(&proc);
 
     // If the function declares an import map, fetch all dependencies now.
@@ -186,8 +186,9 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             .unwrap_or("")
             .to_string();
 
-        let (import_map, _max_imports) = read_inline_import_map();
         let permissions = read_inline_permissions();
+        let (import_map, _max_imports) =
+            read_inline_import_map(permissions.allow_import.as_deref());
         let allow_pg_execute = read_inline_pg_execute();
 
         // Fetch and cache all dependencies before execution — network access
@@ -608,9 +609,39 @@ fn enforce_import_map_cap(
     }
 }
 
+fn enforce_import_map_permissions(
+    import_map: &HashMap<String, String>,
+    allow_import: Option<&[String]>,
+    requested_source: &str,
+) {
+    let mut requested: Vec<String> = import_map.values().cloned().collect();
+    requested.sort();
+    requested.dedup();
+
+    let mut disallowed = Vec::new();
+    for url in &requested {
+        match import_allowed(url, allow_import) {
+            Ok(true) => {}
+            Ok(false) => disallowed.push(url.clone()),
+            Err(e) => pgrx::error!("pg_typescript: {e}"),
+        }
+    }
+
+    if !disallowed.is_empty() {
+        pgrx::error!(
+            "pg_typescript: {requested_source} cannot be fulfilled by effective typescript.allow_import: requested {} includes disallowed values {}",
+            format_import_urls(&requested),
+            format_import_urls(&disallowed),
+        );
+    }
+}
+
 /// Read the `typescript.import_map` value from a function's proconfig and
 /// parse it into a specifier → URL map, enforcing `typescript.max_imports`.
-fn read_import_map(proc: &PgProc) -> (HashMap<String, String>, ImportUrlCap) {
+fn read_import_map(
+    proc: &PgProc,
+    allow_import: Option<&[String]>,
+) -> (HashMap<String, String>, ImportUrlCap) {
     let max_imports = read_max_imports_cap();
     let map = crate::IMPORT_MAP_GUC
         .parse_raw(
@@ -618,17 +649,21 @@ fn read_import_map(proc: &PgProc) -> (HashMap<String, String>, ImportUrlCap) {
             "function setting typescript.import_map",
         )
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+    enforce_import_map_permissions(&map, allow_import, "function setting typescript.import_map");
     enforce_import_map_cap(&map, &max_imports, "function setting typescript.import_map");
     (map, max_imports)
 }
 
 /// Read the `typescript.import_map` GUC (set via `SET LOCAL typescript.import_map = '...'`)
 /// and parse it for use by DO blocks, enforcing `typescript.max_imports`.
-fn read_inline_import_map() -> (HashMap<String, String>, ImportUrlCap) {
+fn read_inline_import_map(
+    allow_import: Option<&[String]>,
+) -> (HashMap<String, String>, ImportUrlCap) {
     let max_imports = read_max_imports_cap();
     let map = crate::IMPORT_MAP_GUC
         .parse_setting("GUC typescript.import_map")
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
+    enforce_import_map_permissions(&map, allow_import, "GUC typescript.import_map");
     enforce_import_map_cap(&map, &max_imports, "GUC typescript.import_map");
     (map, max_imports)
 }

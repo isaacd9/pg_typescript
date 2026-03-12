@@ -1,5 +1,9 @@
 use std::collections::HashSet;
 
+use deno_core::url::Url;
+use deno_runtime::deno_permissions::{
+    PermissionDescriptorParser, QueryDescriptor, RuntimePermissionDescriptorParser,
+};
 use pgrx::pg_catalog::pg_proc::PgProc;
 
 use crate::guc::{GucParser, PermissionSetting};
@@ -95,6 +99,34 @@ fn read_inline_permissions_result() -> Result<RuntimePermissions, String> {
 
 pub(crate) fn read_function_pg_execute(proc: &PgProc) -> bool {
     read_function_pg_execute_result(proc).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+}
+
+pub(crate) fn import_allowed(url: &str, allow_import: Option<&[String]>) -> Result<bool, String> {
+    let Some(allow_import) = allow_import else {
+        return Ok(false);
+    };
+
+    if allow_import.is_empty() {
+        return Ok(true);
+    }
+
+    let parser = RuntimePermissionDescriptorParser::new(sys_traits::impls::RealSys);
+    let url =
+        Url::parse(url).map_err(|e| format!("invalid import URL '{url}' in import_map: {e}"))?;
+    let requested = parser
+        .parse_import_descriptor_from_url(&url)
+        .map_err(|e| format!("invalid import URL '{url}' in import_map: {e}"))?;
+
+    for entry in allow_import {
+        let allowed = parser.parse_import_descriptor(entry).map_err(|e| {
+            format!("invalid import permission value '{entry}' in typescript.allow_import: {e}")
+        })?;
+        if requested.matches_allow(&allowed) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 fn read_function_pg_execute_result(proc: &PgProc) -> Result<bool, String> {
@@ -301,6 +333,26 @@ mod unit_tests {
 
     fn parse_setting_for_test(raw: Option<String>) -> PermissionValue {
         PermissionParser::new().parse_raw(raw, "test").unwrap()
+    }
+
+    #[test]
+    fn import_allowed_denies_when_unset() {
+        assert!(!super::import_allowed("https://esm.sh/lodash@4", None)
+            .expect("unset allow_import should parse"));
+    }
+
+    #[test]
+    fn import_allowed_matches_host_allowlist() {
+        let allow_import = vec!["esm.sh".to_string()];
+        assert!(
+            super::import_allowed("https://esm.sh/lodash@4", Some(&allow_import))
+                .expect("host allowlist should parse")
+        );
+        assert!(!super::import_allowed(
+            "https://deno.land/std@0.224.0/mod.ts",
+            Some(&allow_import)
+        )
+        .expect("non-matching host should parse"));
     }
 
     #[test]

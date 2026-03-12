@@ -1,6 +1,9 @@
 -- very simple import-map test with lodash from esm.sh
+SET typescript.max_allow_import = 'esm.sh';
+
 CREATE OR REPLACE FUNCTION ts_lodash_capitalize(name text) RETURNS text
 LANGUAGE typescript
+SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
 AS $$
   return lodash.capitalize(name);
@@ -12,6 +15,7 @@ SELECT ts_lodash_capitalize('POSTGRES') = 'Postgres' AS ok;
 -- lodash chaining with multiple methods
 CREATE OR REPLACE FUNCTION ts_lodash_chain(input text) RETURNS jsonb
 LANGUAGE typescript
+SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
 AS $$
   const result = lodash
@@ -31,3 +35,5 @@ $$;
 SELECT ts_lodash_chain('HELLO hello World hello world');
 SELECT ts_lodash_chain('') = '[]'::jsonb AS empty_ok;
 SELECT ts_lodash_chain(NULL) = '[]'::jsonb AS null_ok;
+
+RESET typescript.max_allow_import;
