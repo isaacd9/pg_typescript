@@ -86,6 +86,30 @@ SELECT ts_perm_stmt_fails_with(
   'cannot be fulfilled by'
 ) AS env_exec_rejects_after_cap_tightened;
 
+SET typescript.max_allow_pg_execute = 'none';
+SELECT ts_perm_stmt_fails_with($sql$
+  CREATE OR REPLACE FUNCTION ts_perm_pg_execute() RETURNS integer
+  LANGUAGE typescript
+  SET typescript.allow_pg_execute = 'on'
+  AS $fn$
+    return _pg.execute("SELECT 42 AS value").rows[0].value;
+  $fn$;
+$sql$, 'cannot be fulfilled by') AS pg_execute_create_rejects_max_none;
+
+SET typescript.max_allow_pg_execute = 'on';
+CREATE OR REPLACE FUNCTION ts_perm_pg_execute() RETURNS integer
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
+  return _pg.execute("SELECT 42 AS value").rows[0].value;
+$$;
+
+SET typescript.max_allow_pg_execute = 'none';
+SELECT ts_perm_stmt_fails_with(
+  $$SELECT ts_perm_pg_execute();$$,
+  'cannot be fulfilled by'
+) AS pg_execute_exec_rejects_after_cap_tightened;
+
 SET typescript.max_imports = 'https://deno.land/x/';
 SELECT ts_perm_stmt_fails_with($sql$
   CREATE OR REPLACE FUNCTION ts_perm_import_map_disallowed() RETURNS int
@@ -108,4 +132,5 @@ RESET typescript.import_map;
 
 RESET typescript.max_allow_net;
 RESET typescript.max_allow_env;
+RESET typescript.max_allow_pg_execute;
 RESET typescript.max_imports;

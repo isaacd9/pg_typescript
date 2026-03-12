@@ -11,12 +11,15 @@ use pgrx::{fcinfo, pg_sys};
 
 use crate::convert::{PgDatum, PgDatumSeed, VoidSeed};
 use crate::extensions::console::ensure_console_hook;
-use crate::extensions::pg::{ensure_pg_api, set_pg_execute_allowed, with_pg_execute_allowed};
+use crate::extensions::pg::{
+    ensure_pg_api, set_pg_execute_state, with_pg_execute_allowed, PgExecuteState,
+};
 use crate::fetch;
 use crate::guc::{import_url_allowed, GucParser, ImportUrlCap};
 use crate::loader;
 use crate::permissions::{
-    read_function_config, read_function_permissions, read_inline_permissions,
+    read_function_config, read_function_permissions, read_function_pg_execute,
+    read_inline_permissions, read_inline_pg_execute,
 };
 use crate::runtime::{
     block_on, set_runtime_permissions, with_runtime, with_tokio_context, RuntimePermissions,
@@ -71,6 +74,7 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
     let param_names = build_param_names(&proc.proargnames(), nargs);
     let (import_map, _max_imports) = read_import_map(&proc);
     let permissions = read_function_permissions(&proc);
+    let allow_pg_execute = read_function_pg_execute(&proc);
 
     let args: Vec<PgDatum> = (0..nargs)
         .map(|i| unsafe {
@@ -92,7 +96,7 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
     }
     .prepare();
     let (datum, is_null) = artifact.execute(
-        ExecutionConfig::new(permissions, make_module_store()),
+        ExecutionConfig::new(permissions, allow_pg_execute, make_module_store()),
         &args,
         PgDatumSeed { oid: ret_type },
     );
@@ -127,6 +131,7 @@ pub unsafe extern "C-unwind" fn typescript_validator(
     let param_names = build_param_names(&proc.proargnames(), nargs);
     let (import_map, _max_imports) = read_import_map(&proc);
     let permissions = read_function_permissions(&proc);
+    let allow_pg_execute = read_function_pg_execute(&proc);
 
     // If the function declares an import map, fetch all dependencies now.
     #[cfg(not(test))]
@@ -152,7 +157,11 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         specifier_prefix: "fn",
     }
     .prepare();
-    artifact.preload(ExecutionConfig::new(permissions, make_module_store()));
+    artifact.preload(ExecutionConfig::new(
+        permissions,
+        allow_pg_execute,
+        make_module_store(),
+    ));
 
     fcinfo::pg_return_void()
 }
@@ -179,6 +188,7 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
 
         let (import_map, _max_imports) = read_inline_import_map();
         let permissions = read_inline_permissions();
+        let allow_pg_execute = read_inline_pg_execute();
 
         // Fetch and cache all dependencies before execution — network access
         // happens here, never during the execute step.
@@ -203,7 +213,11 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             specifier_prefix: "do",
         }
         .prepare();
-        artifact.execute_void(ExecutionConfig::new(permissions, make_module_store()));
+        artifact.execute_void(ExecutionConfig::new(
+            permissions,
+            allow_pg_execute,
+            make_module_store(),
+        ));
         fcinfo::pg_return_void()
     }
 }
@@ -269,13 +283,19 @@ fn make_module_store() -> impl fetch::ModuleStore {
 
 struct ExecutionConfig {
     permissions: RuntimePermissions,
+    allow_pg_execute: bool,
     store: Box<dyn fetch::ModuleStore>,
 }
 
 impl ExecutionConfig {
-    fn new(permissions: RuntimePermissions, store: impl fetch::ModuleStore + 'static) -> Self {
+    fn new(
+        permissions: RuntimePermissions,
+        allow_pg_execute: bool,
+        store: impl fetch::ModuleStore + 'static,
+    ) -> Self {
         Self {
             permissions,
+            allow_pg_execute,
             store: Box::new(store),
         }
     }
@@ -352,11 +372,25 @@ impl ModuleArtifact {
     where
         F: FnOnce(&mut deno_core::JsRuntime, v8::Global<v8::Value>) -> R,
     {
-        let ExecutionConfig { permissions, store } = exec;
+        let ExecutionConfig {
+            permissions,
+            allow_pg_execute,
+            store,
+        } = exec;
         with_runtime(|rt| {
             ensure_console_hook(rt);
             ensure_pg_api(rt);
-            set_pg_execute_allowed(rt, false);
+            // Keep `_pg.execute()` disabled while the shared runtime is loading
+            // and evaluating modules. The function-body guard only flips on
+            // during the direct user call, and only if the GUC gate enabled the
+            // capability for this function or DO block.
+            set_pg_execute_state(
+                rt,
+                PgExecuteState {
+                    enabled: allow_pg_execute,
+                    allowed: false,
+                },
+            );
             set_runtime_permissions(rt, &permissions);
             let fn_global = self.load_or_get_cached(rt, store);
             f(rt, fn_global)
@@ -644,7 +678,7 @@ mod unit_tests {
         }
         .prepare();
         artifact.execute(
-            super::ExecutionConfig::new(permissions, store),
+            super::ExecutionConfig::new(permissions, false, store),
             args,
             JsonSeed,
         )
@@ -699,6 +733,7 @@ mod unit_tests {
         artifact.execute(
             super::ExecutionConfig::new(
                 super::RuntimePermissions::default(),
+                false,
                 crate::fetch::HashMapModuleStore::new(),
             ),
             &args,
@@ -849,6 +884,7 @@ mod unit_tests {
         .prepare();
         artifact.execute_void(super::ExecutionConfig::new(
             super::RuntimePermissions::default(),
+            false,
             crate::fetch::HashMapModuleStore::new(),
         ));
     }
@@ -873,6 +909,7 @@ mod unit_tests {
         .prepare();
         artifact.execute_void(super::ExecutionConfig::new(
             super::RuntimePermissions::default(),
+            false,
             store,
         ));
     }

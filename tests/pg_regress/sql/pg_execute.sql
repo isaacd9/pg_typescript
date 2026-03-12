@@ -13,8 +13,12 @@ CREATE TABLE ts_pg_execute_logs (
   message text NOT NULL
 );
 
+SET typescript.max_allow_pg_execute = 'on';
+
 CREATE OR REPLACE FUNCTION ts_pg_execute_select(user_id int) RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const result = _pg.execute(
     "SELECT id, name, meta FROM ts_pg_execute_people WHERE id = $1",
     user_id,
@@ -32,7 +36,9 @@ $$;
 SELECT ts_pg_execute_select(1) AS select_smoke_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_numeric_results() RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const result = _pg.execute(
     `
       SELECT
@@ -64,7 +70,9 @@ $$;
 SELECT ts_pg_execute_numeric_results() AS numeric_results_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_scalar_results() RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const result = _pg.execute(
     `
       SELECT
@@ -90,7 +98,9 @@ $$;
 SELECT ts_pg_execute_scalar_results() AS scalar_results_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_json_result() RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const result = _pg.execute(
     "SELECT $1::jsonb AS json_value",
     { role: "admin", count: 2 },
@@ -110,7 +120,9 @@ $$;
 SELECT ts_pg_execute_json_result() AS json_result_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_uuid_result(uuid_text text) RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const result = _pg.execute(
     "SELECT $1::uuid AS uuid_value",
     { type: "uuid", value: uuid_text },
@@ -126,7 +138,9 @@ $$;
 SELECT ts_pg_execute_uuid_result('550e8400-e29b-41d4-a716-446655440000') AS uuid_result_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_numeric_result() RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const result = _pg.execute(
     "SELECT $1::numeric AS numeric_value",
     { type: "numeric", value: "12345.6789" },
@@ -142,7 +156,9 @@ $$;
 SELECT ts_pg_execute_numeric_result() AS numeric_result_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_result_nulls() RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const result = _pg.execute(
     "SELECT NULL::text AS nullable_text, NULL::jsonb AS nullable_json, $1::int4 AS present_value",
     9,
@@ -161,7 +177,9 @@ $$;
 SELECT ts_pg_execute_result_nulls() AS result_nulls_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_json_param() RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const result = _pg.execute(
     "SELECT (($1->>'count')::int + 1) AS total",
     { count: 41 },
@@ -177,7 +195,9 @@ $$;
 SELECT ts_pg_execute_json_param() AS inferred_json_param_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_typed(uuid_text text) RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const result = _pg.execute(
     "SELECT $1::uuid::text AS value",
     { type: "uuid", value: uuid_text },
@@ -193,7 +213,9 @@ $$;
 SELECT ts_pg_execute_typed('550e8400-e29b-41d4-a716-446655440000') AS typed_param_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_invalid_type_ref() RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   try {
     _pg.execute(
       "SELECT $1::int4 AS value",
@@ -209,7 +231,9 @@ $$;
 SELECT ts_pg_execute_invalid_type_ref() AS numeric_type_ref_rejected_ok;
 
 CREATE OR REPLACE FUNCTION ts_pg_execute_insert_checks() RETURNS bool
-LANGUAGE typescript AS $$
+LANGUAGE typescript
+SET typescript.allow_pg_execute = 'on'
+AS $$
   const first = _pg.execute(
     "INSERT INTO ts_pg_execute_logs (message) VALUES ($1)",
     "hello",
@@ -235,3 +259,5 @@ LANGUAGE typescript AS $$
 $$;
 
 SELECT ts_pg_execute_insert_checks() AS insert_checks_ok;
+
+RESET typescript.max_allow_pg_execute;

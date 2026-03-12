@@ -57,6 +57,41 @@ fn normalize_raw(raw: Option<String>) -> Option<String> {
     raw.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
+pub(crate) struct BoolGucParser {
+    inner: StringGuc,
+}
+
+impl BoolGucParser {
+    pub(crate) const fn new() -> Self {
+        Self {
+            inner: StringGuc::new(),
+        }
+    }
+}
+
+impl GucParser for BoolGucParser {
+    type Output = bool;
+
+    fn inner(&self) -> &StringGuc {
+        &self.inner
+    }
+
+    fn default_value(&self) -> Self::Output {
+        false
+    }
+
+    fn parse_nonempty(&self, value: &str, source: &str) -> Result<Self::Output, String> {
+        let normalized = value.to_ascii_lowercase();
+        match normalized.as_str() {
+            "off" | "none" | "deny" | "false" | "0" => Ok(false),
+            "*" | "all" | "allow" | "on" | "true" | "1" => Ok(true),
+            _ => Err(format!(
+                "invalid boolean setting '{value}' in {source}; expected on/off"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PermissionSetting {
     #[default]

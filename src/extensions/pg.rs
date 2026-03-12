@@ -12,11 +12,16 @@ use serde_json::Value as JsonValue;
 
 const PG_HOOK_JS: &str = include_str!("../js/pg_hook.js");
 
-// `_pg.execute()` is only valid while we are inside a TS function body. Module
-// loading reuses the same runtime, so this flag prevents top-level imports from
-// issuing SQL during validation or preload.
+// `_pg.execute()` is guarded by two runtime-scoped bits of state:
+// - `enabled`: the function/DO block requested access and the superuser cap
+//   allowed it
+// - `allowed`: we are currently inside the direct user function body rather
+//   than module loading/evaluation in the shared runtime
 #[derive(Clone, Copy, Default)]
-pub struct PgExecuteAllowed(pub bool);
+pub struct PgExecuteState {
+    pub enabled: bool,
+    pub allowed: bool,
+}
 
 // The JS hook rewrites each user argument into one of these tagged parameter
 // forms before calling the Rust op. `Inferred` means Rust picks a Postgres type
@@ -101,7 +106,15 @@ pub fn op_pg_execute(
     #[string] sql: &str,
     #[serde] params: Vec<InputParam>,
 ) -> Result<PgExecuteResult, JsErrorBox> {
-    if !state.borrow::<PgExecuteAllowed>().0 {
+    let pg_execute = *state.borrow::<PgExecuteState>();
+
+    if !pg_execute.enabled {
+        return Err(JsErrorBox::generic(
+            "pg_typescript: _pg.execute() requires typescript.allow_pg_execute to be enabled and permitted by typescript.max_allow_pg_execute",
+        ));
+    }
+
+    if !pg_execute.allowed {
         return Err(JsErrorBox::generic(
             "pg_typescript: _pg.execute() may only be called from inside the function body",
         ));
@@ -602,8 +615,8 @@ deno_core::extension!(
     esm_entry_point = "ext:pg_typescript_pg/pg_bridge.js",
     esm = [ dir "src/js", "pg_bridge.js" ],
     state = |state| {
-        if !state.has::<PgExecuteAllowed>() {
-            state.put(PgExecuteAllowed::default());
+        if !state.has::<PgExecuteState>() {
+            state.put(PgExecuteState::default());
         }
     },
 );
@@ -617,21 +630,33 @@ pub fn ensure_pg_api(rt: &mut JsRuntime) {
     install_pg_api(rt);
 }
 
-pub fn set_pg_execute_allowed(rt: &mut JsRuntime, allowed: bool) {
-    rt.op_state()
-        .borrow_mut()
-        .put::<PgExecuteAllowed>(PgExecuteAllowed(allowed));
+pub fn set_pg_execute_state(rt: &mut JsRuntime, pg_execute: PgExecuteState) {
+    rt.op_state().borrow_mut().put::<PgExecuteState>(pg_execute);
 }
 
 pub fn with_pg_execute_allowed<F, R>(rt: &mut JsRuntime, f: F) -> R
 where
     F: FnOnce(&mut JsRuntime) -> R,
 {
-    // Flip the capability on only for the direct TS function invocation and
-    // always restore it, even if user code panics through Rust.
-    set_pg_execute_allowed(rt, true);
+    // Only the direct user-function call gets the "inside the function body"
+    // flag. Module evaluation and other shared-runtime work keep it off, and
+    // the flag is always restored even if user code panics through Rust.
+    let enabled = rt.op_state().borrow().borrow::<PgExecuteState>().enabled;
+    set_pg_execute_state(
+        rt,
+        PgExecuteState {
+            enabled,
+            allowed: true,
+        },
+    );
     let result = catch_unwind(AssertUnwindSafe(|| f(rt)));
-    set_pg_execute_allowed(rt, false);
+    set_pg_execute_state(
+        rt,
+        PgExecuteState {
+            enabled,
+            allowed: false,
+        },
+    );
     match result {
         Ok(result) => result,
         Err(caught) => resume_unwind(caught),

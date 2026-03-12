@@ -12,7 +12,7 @@ mod permissions;
 mod plhandler;
 mod runtime;
 
-use crate::guc::{GucParser, ImportMapParser, MaxImportsParser, PermissionParser};
+use crate::guc::{BoolGucParser, GucParser, ImportMapParser, MaxImportsParser, PermissionParser};
 
 /// GUC for DO-block import maps. Use `SET LOCAL typescript.import_map = '{"imports": {...}}'`
 /// before a DO block so the setting reverts automatically at transaction end.
@@ -49,6 +49,9 @@ pub(crate) static ALLOW_FFI_GUC: PermissionParser = PermissionParser::new();
 pub(crate) static ALLOW_SYS_GUC: PermissionParser = PermissionParser::new();
 /// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_IMPORT_GUC: PermissionParser = PermissionParser::new();
+/// Request access to `_pg.execute()` from a function or DO block.
+/// Default: unset (`None`), treated as deny.
+pub(crate) static ALLOW_PG_EXECUTE_GUC: BoolGucParser = BoolGucParser::new();
 
 /// Superuser caps for each permission. `allow_*` requests must be fully
 /// satisfiable by `max_allow_*`; otherwise execution fails with an error.
@@ -68,6 +71,9 @@ pub(crate) static MAX_ALLOW_FFI_GUC: PermissionParser = PermissionParser::new();
 pub(crate) static MAX_ALLOW_SYS_GUC: PermissionParser = PermissionParser::new();
 /// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_IMPORT_GUC: PermissionParser = PermissionParser::new();
+/// Superuser cap for `_pg.execute()` access.
+/// Default: unset (`None`), treated as deny.
+pub(crate) static MAX_ALLOW_PG_EXECUTE_GUC: BoolGucParser = BoolGucParser::new();
 
 // Register the GUC for per-function import maps.
 #[pg_guard]
@@ -153,6 +159,14 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_string_guc(
+        c"typescript.allow_pg_execute",
+        c"Requested access to _pg.execute(): off|on",
+        c"",
+        ALLOW_PG_EXECUTE_GUC.inner(),
+        GucContext::Userset,
+        GucFlags::default(),
+    );
 
     GucRegistry::define_string_guc(
         c"typescript.max_allow_read",
@@ -215,6 +229,14 @@ pub unsafe extern "C-unwind" fn _PG_init() {
         c"Superuser max import permission cap: off|*|comma-list",
         c"",
         MAX_ALLOW_IMPORT_GUC.inner(),
+        GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"typescript.max_allow_pg_execute",
+        c"Superuser max _pg.execute() cap: off|on",
+        c"",
+        MAX_ALLOW_PG_EXECUTE_GUC.inner(),
         GucContext::Suset,
         GucFlags::default(),
     );
