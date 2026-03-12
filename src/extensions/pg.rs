@@ -1,0 +1,684 @@
+use std::collections::BTreeMap;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+
+use deno_core::{op2, JsRuntime, OpState};
+use deno_error::JsErrorBox;
+use pgrx::{pg_sys, FromDatum, IntoDatum, JsonB, PgTryBuilder, Spi};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+
+const PG_HOOK_JS: &str = include_str!("../js/pg_hook.js");
+
+// `_pg.execute()` is guarded by two runtime-scoped bits of state:
+// - `enabled`: the function/DO block requested access and the superuser cap
+//   allowed it
+// - `allowed`: we are currently inside the direct user function body rather
+//   than module loading/evaluation in the shared runtime
+#[derive(Clone, Copy, Default)]
+pub struct PgExecuteState {
+    pub enabled: bool,
+    pub allowed: bool,
+}
+
+// The JS hook rewrites each user argument into one of these tagged parameter
+// forms before calling the Rust op. `Inferred` means Rust picks a Postgres type
+// from the JS value, while `Typed` carries an explicit SQL type override.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InputParam {
+    Inferred {
+        value: InputValue,
+    },
+    Typed {
+        #[serde(rename = "type")]
+        type_ref: InputTypeRef,
+        value: InputValue,
+    },
+}
+
+// A typed parameter names the target Postgres type (`uuid`, `jsonb`, `int4`).
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InputTypeRef {
+    Name { value: String },
+}
+
+// Serde-friendly mirror of the JS values `_pg.execute()` accepts after the JS
+// hook has normalized them. This is still input data, not the final SPI form.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum InputValue {
+    Null,
+    Bool { value: bool },
+    Number { value: f64 },
+    String { value: String },
+    Bigint { value: String },
+    Array { value: Vec<InputValue> },
+    Object { value: BTreeMap<String, InputValue> },
+}
+
+// Postgres SPI expects parallel arrays of OIDs, Datums, and null flags. This
+// struct is the bound form of a single parameter after inference/parsing.
+#[derive(Debug)]
+struct SpiParam {
+    oid: pg_sys::Oid,
+    datum: pg_sys::Datum,
+    is_null: bool,
+}
+
+// Rust-side result object that gets serialized back into the JS
+// `{ rows, command, rowCount }` shape. `row_count` stays as `f64` because it
+// crosses into JS as a normal Number.
+#[derive(Debug)]
+pub struct PgExecuteResult {
+    rows: Vec<PgExecuteRow>,
+    command: &'static str,
+    row_count: f64,
+}
+
+// One fully owned result row copied out of `SPI_tuptable`. We keep the row as
+// ordered `(column_name, value)` pairs and serialize it into a JS object later.
+#[derive(Debug)]
+struct PgExecuteRow(Vec<(String, OwnedPgValue)>);
+
+// Values copied out of SPI into owned Rust data before returning to JS. This
+// avoids exposing raw Postgres memory past the lifetime of the SPI call.
+#[derive(Debug)]
+enum OwnedPgValue {
+    Null,
+    Bool(bool),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    String(String),
+    Json(JsonValue),
+}
+
+#[op2]
+#[serde]
+pub fn op_pg_execute(
+    state: &mut OpState,
+    #[string] sql: &str,
+    #[serde] params: Vec<InputParam>,
+) -> Result<PgExecuteResult, JsErrorBox> {
+    let pg_execute = *state.borrow::<PgExecuteState>();
+
+    if !pg_execute.enabled {
+        return Err(JsErrorBox::generic(
+            "pg_typescript: _pg.execute() requires typescript.allow_pg_execute to be enabled and permitted by typescript.max_allow_pg_execute",
+        ));
+    }
+
+    if !pg_execute.allowed {
+        return Err(JsErrorBox::generic(
+            "pg_typescript: _pg.execute() may only be called from inside the function body",
+        ));
+    }
+
+    // SPI can throw PostgreSQL errors via ereport/longjmp, so we translate that
+    // boundary into a normal JS exception before returning into V8.
+    PgTryBuilder::new(|| execute_sql(sql, params))
+        .catch_others(|cause| {
+            let message = match cause {
+                pgrx::pg_sys::panic::CaughtError::PostgresError(err)
+                | pgrx::pg_sys::panic::CaughtError::ErrorReport(err)
+                | pgrx::pg_sys::panic::CaughtError::RustPanic { ereport: err, .. } => {
+                    format_pg_error(&err)
+                }
+            };
+            Err(JsErrorBox::generic(message))
+        })
+        .execute()
+}
+
+fn execute_sql(sql: &str, params: Vec<InputParam>) -> Result<PgExecuteResult, JsErrorBox> {
+    // The JS hook normalizes each argument into a tagged input value so Rust can
+    // bind parameters without reparsing arbitrary JS objects here.
+    let spi_params = params
+        .into_iter()
+        .enumerate()
+        .map(|(idx, param)| param.into_spi_param().map_err(|err| param_error(idx, err)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Spi::connect(|_client| {
+        let query =
+            CString::new(sql).map_err(|e| JsErrorBox::generic(format!("pg_typescript: {e}")))?;
+
+        let status_code = execute_spi(&query, &spi_params);
+        let command = map_command(status_code)?;
+        let row_count = unsafe { pg_sys::SPI_processed as u64 } as f64;
+        let rows = extract_rows()?;
+
+        Ok(PgExecuteResult {
+            rows,
+            command,
+            row_count,
+        })
+    })
+}
+
+fn execute_spi(query: &CString, params: &[SpiParam]) -> i32 {
+    // `SPI_tuptable` is a process-global pointer to the last SPI result. Clear
+    // it first so a utility statement with no rows does not accidentally reuse
+    // a previous table.
+    unsafe {
+        pg_sys::SPI_tuptable = std::ptr::null_mut();
+    }
+
+    match params.len() {
+        0 => unsafe { pg_sys::SPI_execute(query.as_ptr(), false, 0) },
+        nargs => {
+            let mut argtypes = params.iter().map(|param| param.oid).collect::<Vec<_>>();
+            let mut datums = params.iter().map(|param| param.datum).collect::<Vec<_>>();
+            // SPI expects a parallel null-marker array alongside the Datums:
+            // `'n'` means "this parameter is NULL" and a space means "this
+            // parameter is present". These entries line up with `$1`, `$2`, ...
+            // in the SQL in the same order as `argtypes` and `datums`.
+            let nulls = params.iter().map(SpiParam::null_marker).collect::<Vec<_>>();
+
+            unsafe {
+                // This is where PostgreSQL binds the Rust-built parameter arrays
+                // to `$1`, `$2`, ... placeholders in the SQL text.
+                pg_sys::SPI_execute_with_args(
+                    query.as_ptr(),
+                    nargs as i32,
+                    argtypes.as_mut_ptr(),
+                    datums.as_mut_ptr(),
+                    nulls.as_ptr(),
+                    false,
+                    0,
+                )
+            }
+        }
+    }
+}
+
+fn extract_rows() -> Result<Vec<PgExecuteRow>, JsErrorBox> {
+    // SPI stores the most recent result set in `SPI_tuptable`; by the time we
+    // return to JS we need to have copied out every row into owned Rust values.
+    let Some(table) = (unsafe { pg_sys::SPI_tuptable.as_ref() }) else {
+        return Ok(Vec::new());
+    };
+
+    let tupdesc = table.tupdesc;
+    let num_rows = table.numvals as usize;
+    let num_cols = unsafe { (*tupdesc).natts as usize };
+    let tuples = unsafe { std::slice::from_raw_parts(table.vals, num_rows) };
+
+    let mut rows = Vec::with_capacity(num_rows);
+
+    for tuple in tuples {
+        let mut row = Vec::with_capacity(num_cols);
+        for ordinal in 1..=num_cols {
+            let name = column_name(tupdesc, ordinal as i32)?;
+            let mut is_null = false;
+            let datum =
+                unsafe { pg_sys::SPI_getbinval(*tuple, tupdesc, ordinal as i32, &mut is_null) };
+            let oid = unsafe { pg_sys::SPI_gettypeid(tupdesc, ordinal as i32) };
+            let value = OwnedPgValue::from_datum(datum, is_null, oid)?;
+            row.push((name, value));
+        }
+        rows.push(PgExecuteRow(row));
+    }
+
+    Ok(rows)
+}
+
+fn column_name(tupdesc: pg_sys::TupleDesc, ordinal: i32) -> Result<String, JsErrorBox> {
+    unsafe {
+        let ptr = pg_sys::SPI_fname(tupdesc, ordinal);
+        if ptr.is_null() {
+            return Err(JsErrorBox::generic(format!(
+                "pg_typescript: could not read SPI column name at ordinal {ordinal}"
+            )));
+        }
+
+        let name = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        pg_sys::pfree(ptr.cast());
+        Ok(name)
+    }
+}
+
+fn map_command(status_code: i32) -> Result<&'static str, JsErrorBox> {
+    if status_code == 0 {
+        return Ok("EMPTY");
+    }
+
+    match Spi::check_status(status_code)
+        .map_err(|e| JsErrorBox::generic(format!("pg_typescript: SPI execute failed: {e}")))?
+    {
+        pgrx::spi::SpiOkCodes::Select | pgrx::spi::SpiOkCodes::SelInto => Ok("SELECT"),
+        pgrx::spi::SpiOkCodes::Insert | pgrx::spi::SpiOkCodes::InsertReturning => Ok("INSERT"),
+        pgrx::spi::SpiOkCodes::Update | pgrx::spi::SpiOkCodes::UpdateReturning => Ok("UPDATE"),
+        pgrx::spi::SpiOkCodes::Delete | pgrx::spi::SpiOkCodes::DeleteReturning => Ok("DELETE"),
+        pgrx::spi::SpiOkCodes::Merge => Ok("MERGE"),
+        _ => Ok("UTILITY"),
+    }
+}
+
+fn param_error(index: usize, err: JsErrorBox) -> JsErrorBox {
+    JsErrorBox::generic(format!(
+        "pg_typescript: invalid parameter ${}: {}",
+        index + 1,
+        err
+    ))
+}
+
+fn format_pg_error(err: &pgrx::pg_sys::panic::ErrorReportWithLevel) -> String {
+    let mut message = format!("pg_typescript: {}", err.message());
+    if let Some(detail) = err.detail() {
+        message.push_str(&format!("\nDETAIL: {detail}"));
+    }
+    if let Some(hint) = err.hint() {
+        message.push_str(&format!("\nHINT: {hint}"));
+    }
+    message
+}
+
+impl InputParam {
+    fn into_spi_param(self) -> Result<SpiParam, JsErrorBox> {
+        match self {
+            Self::Inferred { value } => value.into_inferred_spi_param(),
+            Self::Typed { type_ref, value } => value.into_typed_spi_param(type_ref.into_oid()),
+        }
+    }
+}
+
+impl SpiParam {
+    fn null_marker(&self) -> c_char {
+        if self.is_null {
+            b'n' as c_char
+        } else {
+            b' ' as c_char
+        }
+    }
+}
+
+impl InputTypeRef {
+    fn into_oid(self) -> pg_sys::Oid {
+        match self {
+            Self::Name { value } => pgrx::regtypein(&value),
+        }
+    }
+}
+
+impl InputValue {
+    // Default JS -> Postgres inference for `_pg.execute(...)` parameters:
+    // - `null` -> `unknown` (caller can cast in SQL)
+    // - `boolean` -> `bool`
+    // - integral `number` in int4 range -> `int4`
+    // - other integral `number` -> `int8`
+    // - non-integral `number` -> `float8`
+    // - `string` -> `text`
+    // - `bigint` -> `int8`
+    // - arrays / plain objects -> `jsonb`
+    fn into_inferred_spi_param(self) -> Result<SpiParam, JsErrorBox> {
+        match self {
+            Self::Null => Ok(SpiParam {
+                oid: pg_sys::UNKNOWNOID,
+                datum: pg_sys::Datum::from(0usize),
+                is_null: true,
+            }),
+            Self::Bool { value } => Ok(SpiParam {
+                oid: pg_sys::BOOLOID,
+                datum: value.into_datum().ok_or_else(|| {
+                    JsErrorBox::generic("pg_typescript: failed to encode boolean")
+                })?,
+                is_null: false,
+            }),
+            Self::Number { value } => Self::inferred_number_into_spi_param(value),
+            Self::String { value } => Ok(SpiParam {
+                oid: pg_sys::TEXTOID,
+                datum: value
+                    .into_datum()
+                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode text"))?,
+                is_null: false,
+            }),
+            Self::Bigint { value } => {
+                let parsed = value.parse::<i64>().map_err(|_| {
+                    JsErrorBox::range_error(format!(
+                        "pg_typescript: bigint parameter is out of range for int8: {value}"
+                    ))
+                })?;
+                Ok(SpiParam {
+                    oid: pg_sys::INT8OID,
+                    datum: parsed.into_datum().ok_or_else(|| {
+                        JsErrorBox::generic("pg_typescript: failed to encode int8")
+                    })?,
+                    is_null: false,
+                })
+            }
+            complex @ (Self::Array { .. } | Self::Object { .. }) => {
+                let json = complex.to_json_value()?;
+                Ok(SpiParam {
+                    oid: pg_sys::JSONBOID,
+                    datum: JsonB(json).into_datum().ok_or_else(|| {
+                        JsErrorBox::generic("pg_typescript: failed to encode jsonb")
+                    })?,
+                    is_null: false,
+                })
+            }
+        }
+    }
+
+    fn into_typed_spi_param(self, oid: pg_sys::Oid) -> Result<SpiParam, JsErrorBox> {
+        match self {
+            Self::Null => Ok(SpiParam {
+                oid,
+                datum: pg_sys::Datum::from(0usize),
+                is_null: true,
+            }),
+            complex @ (Self::Array { .. } | Self::Object { .. })
+                if oid == pg_sys::JSONOID || oid == pg_sys::JSONBOID =>
+            {
+                let text = serde_json::to_string(&complex.to_json_value()?)
+                    .map_err(|e| JsErrorBox::generic(format!("pg_typescript: {e}")))?;
+                Ok(SpiParam {
+                    oid,
+                    datum: input_fn_call(&text, oid),
+                    is_null: false,
+                })
+            }
+            Self::Array { .. } | Self::Object { .. } => Err(JsErrorBox::type_error(
+                "pg_typescript: array/object typed parameters are only supported for json/jsonb",
+            )),
+            primitive => {
+                // For explicitly typed values we let Postgres parse the text form
+                // using the target type's input function instead of hardcoding
+                // per-type encoders on the Rust side. `input_fn_call()` is the
+                // bridge into that per-type parser.
+                let text = primitive.to_text()?;
+                Ok(SpiParam {
+                    oid,
+                    datum: input_fn_call(&text, oid),
+                    is_null: false,
+                })
+            }
+        }
+    }
+
+    fn inferred_number_into_spi_param(value: f64) -> Result<SpiParam, JsErrorBox> {
+        if value.fract() == 0.0 && value >= i32::MIN as f64 && value <= i32::MAX as f64 {
+            let parsed = value as i32;
+            return Ok(SpiParam {
+                oid: pg_sys::INT4OID,
+                datum: parsed
+                    .into_datum()
+                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode int4"))?,
+                is_null: false,
+            });
+        }
+
+        if value.fract() == 0.0 {
+            let parsed = value as i64;
+            return Ok(SpiParam {
+                oid: pg_sys::INT8OID,
+                datum: parsed
+                    .into_datum()
+                    .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode int8"))?,
+                is_null: false,
+            });
+        }
+
+        Ok(SpiParam {
+            oid: pg_sys::FLOAT8OID,
+            datum: value
+                .into_datum()
+                .ok_or_else(|| JsErrorBox::generic("pg_typescript: failed to encode float8"))?,
+            is_null: false,
+        })
+    }
+
+    fn to_text(&self) -> Result<String, JsErrorBox> {
+        match self {
+            Self::Null => Err(JsErrorBox::type_error(
+                "pg_typescript: null values require an explicit type or SQL cast",
+            )),
+            Self::Bool { value } => Ok(value.to_string()),
+            Self::Number { value } => Ok(value.to_string()),
+            Self::String { value } => Ok(value.clone()),
+            Self::Bigint { value } => Ok(value.clone()),
+            Self::Array { .. } | Self::Object { .. } => Err(JsErrorBox::type_error(
+                "pg_typescript: array/object parameters require JSON/jsonb or a string literal",
+            )),
+        }
+    }
+
+    fn to_json_value(&self) -> Result<JsonValue, JsErrorBox> {
+        match self {
+            Self::Null => Ok(JsonValue::Null),
+            Self::Bool { value } => Ok(JsonValue::Bool(*value)),
+            Self::Number { value } => {
+                if value.is_finite() && value.fract() == 0.0 {
+                    if *value >= i64::MIN as f64 && *value <= i64::MAX as f64 {
+                        return Ok(JsonValue::Number((*value as i64).into()));
+                    }
+                }
+
+                serde_json::Number::from_f64(*value)
+                    .map(JsonValue::Number)
+                    .ok_or_else(|| {
+                        JsErrorBox::type_error(
+                            "pg_typescript: cannot encode NaN or Infinity inside JSON values",
+                        )
+                    })
+            }
+            Self::String { value } => Ok(JsonValue::String(value.clone())),
+            Self::Bigint { .. } => Err(JsErrorBox::type_error(
+                "pg_typescript: bigint values are not supported inside inferred JSON parameters",
+            )),
+            Self::Array { value } => value
+                .iter()
+                .map(InputValue::to_json_value)
+                .collect::<Result<Vec<_>, _>>()
+                .map(JsonValue::Array),
+            Self::Object { value } => value
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), value.to_json_value()?)))
+                .collect::<Result<serde_json::Map<String, JsonValue>, _>>()
+                .map(JsonValue::Object),
+        }
+    }
+}
+
+impl OwnedPgValue {
+    fn from_datum(
+        datum: pg_sys::Datum,
+        is_null: bool,
+        oid: pg_sys::Oid,
+    ) -> Result<Self, JsErrorBox> {
+        if is_null {
+            return Ok(Self::Null);
+        }
+
+        unsafe {
+            match oid {
+                pg_sys::INT2OID => {
+                    Ok(Self::I16(i16::from_datum(datum, false).ok_or_else(
+                        || JsErrorBox::generic("pg_typescript: failed to decode int2"),
+                    )?))
+                }
+                pg_sys::INT4OID => {
+                    Ok(Self::I32(i32::from_datum(datum, false).ok_or_else(
+                        || JsErrorBox::generic("pg_typescript: failed to decode int4"),
+                    )?))
+                }
+                pg_sys::INT8OID => {
+                    Ok(Self::I64(i64::from_datum(datum, false).ok_or_else(
+                        || JsErrorBox::generic("pg_typescript: failed to decode int8"),
+                    )?))
+                }
+                pg_sys::FLOAT4OID => Ok(Self::F32(f32::from_datum(datum, false).ok_or_else(
+                    || JsErrorBox::generic("pg_typescript: failed to decode float4"),
+                )?)),
+                pg_sys::FLOAT8OID => Ok(Self::F64(f64::from_datum(datum, false).ok_or_else(
+                    || JsErrorBox::generic("pg_typescript: failed to decode float8"),
+                )?)),
+                pg_sys::BOOLOID => Ok(Self::Bool(bool::from_datum(datum, false).ok_or_else(
+                    || JsErrorBox::generic("pg_typescript: failed to decode boolean"),
+                )?)),
+                pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID | pg_sys::NAMEOID => {
+                    Ok(Self::String(String::from_datum(datum, false).ok_or_else(
+                        || JsErrorBox::generic("pg_typescript: failed to decode text"),
+                    )?))
+                }
+                pg_sys::JSONOID | pg_sys::JSONBOID => Ok(Self::Json(
+                    JsonB::from_datum(datum, false)
+                        .map(|json| json.0)
+                        .ok_or_else(|| {
+                            JsErrorBox::generic("pg_typescript: failed to decode json/jsonb")
+                        })?,
+                )),
+                // Fall back to the type's text output function so callers still
+                // get a value for types we have not added a native JS mapping for.
+                // `output_fn_call()` asks Postgres to stringify the Datum using
+                // the type's own output function.
+                _ => Ok(Self::String(output_fn_call(datum, oid))),
+            }
+        }
+    }
+}
+
+impl Serialize for PgExecuteResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("rows", &self.rows)?;
+        map.serialize_entry("command", self.command)?;
+        map.serialize_entry("rowCount", &self.row_count)?;
+        map.end()
+    }
+}
+
+impl Serialize for PgExecuteRow {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, value) in &self.0 {
+            map.serialize_entry(name, value)?;
+        }
+        map.end()
+    }
+}
+
+impl Serialize for OwnedPgValue {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Null => serializer.serialize_none(),
+            Self::Bool(value) => serializer.serialize_bool(*value),
+            Self::I16(value) => serializer.serialize_i16(*value),
+            Self::I32(value) => serializer.serialize_i32(*value),
+            Self::I64(value) => serializer.serialize_i64(*value),
+            Self::F32(value) => serializer.serialize_f32(*value),
+            Self::F64(value) => serializer.serialize_f64(*value),
+            Self::String(value) => serializer.serialize_str(value),
+            Self::Json(value) => value.serialize(serializer),
+        }
+    }
+}
+
+// Look up the Postgres output function for `type_oid` and use it to turn a raw
+// Datum into its text form. This is the generic fallback path for result types
+// we do not decode into a richer JS value ourselves.
+fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String {
+    unsafe {
+        let mut output_fn: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut is_varlena = false;
+        pg_sys::getTypeOutputInfo(type_oid, &mut output_fn, &mut is_varlena);
+        let cstr = pg_sys::OidOutputFunctionCall(output_fn, datum);
+        let result = CStr::from_ptr(cstr).to_string_lossy().into_owned();
+        pg_sys::pfree(cstr.cast());
+        result
+    }
+}
+
+// Look up the Postgres input function for `type_oid` and let Postgres parse the
+// provided text into the correct Datum representation. This keeps typed params
+// aligned with PostgreSQL's own type parsing rules instead of duplicating them
+// in Rust.
+fn input_fn_call(value: &str, type_oid: pg_sys::Oid) -> pg_sys::Datum {
+    unsafe {
+        let mut input_fn: pg_sys::Oid = pg_sys::InvalidOid;
+        let mut ioparam: pg_sys::Oid = pg_sys::InvalidOid;
+        pg_sys::getTypeInputInfo(type_oid, &mut input_fn, &mut ioparam);
+        let cstr = CString::new(value).expect("NUL byte in parameter text");
+        pg_sys::OidInputFunctionCall(input_fn, cstr.as_ptr().cast_mut(), ioparam, -1)
+    }
+}
+
+deno_core::extension!(
+    pg_typescript_pg,
+    ops = [op_pg_execute],
+    esm_entry_point = "ext:pg_typescript_pg/pg_bridge.js",
+    esm = [ dir "src/js", "pg_bridge.js" ],
+    state = |state| {
+        if !state.has::<PgExecuteState>() {
+            state.put(PgExecuteState::default());
+        }
+    },
+);
+
+pub fn install_pg_api(rt: &mut JsRuntime) {
+    rt.execute_script("pg_typescript:pg_hook", PG_HOOK_JS)
+        .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to install _pg API: {e}"));
+}
+
+pub fn ensure_pg_api(rt: &mut JsRuntime) {
+    install_pg_api(rt);
+}
+
+pub fn set_pg_execute_state(rt: &mut JsRuntime, pg_execute: PgExecuteState) {
+    rt.op_state().borrow_mut().put::<PgExecuteState>(pg_execute);
+}
+
+pub fn with_pg_execute_allowed<F, R>(rt: &mut JsRuntime, f: F) -> R
+where
+    F: FnOnce(&mut JsRuntime) -> R,
+{
+    // Only the direct user-function call gets the "inside the function body"
+    // flag. Module evaluation and other shared-runtime work keep it off, and
+    // the flag is always restored even if user code panics through Rust.
+    let enabled = rt.op_state().borrow().borrow::<PgExecuteState>().enabled;
+    set_pg_execute_state(
+        rt,
+        PgExecuteState {
+            enabled,
+            allowed: true,
+        },
+    );
+    let result = catch_unwind(AssertUnwindSafe(|| f(rt)));
+    set_pg_execute_state(
+        rt,
+        PgExecuteState {
+            enabled,
+            allowed: false,
+        },
+    );
+    match result {
+        Ok(result) => result,
+        Err(caught) => resume_unwind(caught),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{map_command, InputValue};
+
+    #[test]
+    fn wire_value_json_rejects_bigint() {
+        let err = InputValue::Bigint {
+            value: "42".to_string(),
+        }
+        .to_json_value()
+        .unwrap_err();
+        assert!(err.to_string().contains("bigint values are not supported"));
+    }
+
+    #[test]
+    fn empty_command_maps() {
+        assert_eq!(map_command(0).unwrap(), "EMPTY");
+    }
+}

@@ -93,6 +93,41 @@ fn read_inline_permissions_result() -> Result<RuntimePermissions, String> {
     Ok(effective_permissions(requested, max))
 }
 
+pub(crate) fn read_function_pg_execute(proc: &PgProc) -> bool {
+    read_function_pg_execute_result(proc).unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+}
+
+fn read_function_pg_execute_result(proc: &PgProc) -> Result<bool, String> {
+    let requested = crate::ALLOW_PG_EXECUTE_GUC.parse_raw(
+        read_function_config(proc, "typescript.allow_pg_execute"),
+        "function setting typescript.allow_pg_execute",
+    )?;
+    let max = read_max_pg_execute()?;
+    enforce_pg_execute_cap(
+        requested,
+        max,
+        "function setting typescript.allow_pg_execute",
+        "GUC typescript.max_allow_pg_execute",
+    )?;
+    Ok(requested && max)
+}
+
+pub(crate) fn read_inline_pg_execute() -> bool {
+    read_inline_pg_execute_result().unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"))
+}
+
+fn read_inline_pg_execute_result() -> Result<bool, String> {
+    let requested = crate::ALLOW_PG_EXECUTE_GUC.parse_setting("GUC typescript.allow_pg_execute")?;
+    let max = read_max_pg_execute()?;
+    enforce_pg_execute_cap(
+        requested,
+        max,
+        "GUC typescript.allow_pg_execute",
+        "GUC typescript.max_allow_pg_execute",
+    )?;
+    Ok(requested && max)
+}
+
 fn read_max_permissions() -> Result<PermissionSpec, String> {
     Ok(PermissionSpec {
         read: crate::MAX_ALLOW_READ_GUC.parse_setting("GUC typescript.max_allow_read")?,
@@ -106,6 +141,10 @@ fn read_max_permissions() -> Result<PermissionSpec, String> {
     })
 }
 
+fn read_max_pg_execute() -> Result<bool, String> {
+    crate::MAX_ALLOW_PG_EXECUTE_GUC.parse_setting("GUC typescript.max_allow_pg_execute")
+}
+
 fn effective_permissions(requested: PermissionSpec, max: PermissionSpec) -> RuntimePermissions {
     RuntimePermissions {
         allow_read: to_runtime_allowlist(intersect_permission(requested.read, max.read)),
@@ -117,6 +156,20 @@ fn effective_permissions(requested: PermissionSpec, max: PermissionSpec) -> Runt
         allow_sys: to_runtime_allowlist(intersect_permission(requested.sys, max.sys)),
         allow_import: to_runtime_allowlist(intersect_permission(requested.import, max.import)),
     }
+}
+
+fn enforce_pg_execute_cap(
+    requested: bool,
+    max: bool,
+    requested_source: &str,
+    max_source: &str,
+) -> Result<(), String> {
+    if requested && !max {
+        return Err(format!(
+            "{requested_source} cannot be fulfilled by {max_source}: requested 'on' but cap is 'off'"
+        ));
+    }
+    Ok(())
 }
 
 fn enforce_permission_cap(
