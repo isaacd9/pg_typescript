@@ -18,6 +18,17 @@ created, those imports are cached inside a PostgreSQL table, and subsequent
 calls to the function will use the cached modules rather than resolving them
 again.
 
+## FAQ
+### What is this?
+A PostgreSQL extension that allows running TypeScript functions in PostgreSQL via Deno/V8.
+
+### Why?
+Why not? (More seriously, this is useful for re-using existing TypeScript code in PostgreSQL without rewriting it, and integrating with existing TypeScript tooling and libraries. Beyond that, this enables complex program execution directly in PostgreSQL, which is useful for deploying software close to your data for low-latency access.)
+
+### Should I use this in production?
+Probably not. This is still alpha quality software right now that has not been
+thoroughly tested in production PostgreSQL environments. But give it a go and let me know how it works!
+
 ## Project Status
 This is **alpha** quality software that you probably shouldn't use in production yet. That
 said, the integration tests are comprehensive and the basic functionality works
