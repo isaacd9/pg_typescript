@@ -21,8 +21,13 @@ use crate::loader::PgModuleLoader;
 const STARTUP_SNAPSHOT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pg_typescript_runtime.snap"));
 
+struct RuntimeState {
+    worker: MainWorker,
+    loader: Rc<PgModuleLoader>,
+}
+
 thread_local! {
-    static JS_RT: RefCell<Option<(MainWorker, Rc<PgModuleLoader>)>> = const { RefCell::new(None) };
+    static JS_RT: RefCell<Option<RuntimeState>> = const { RefCell::new(None) };
     static TOKIO_RT: RefCell<Option<tokio::runtime::Runtime>> = const { RefCell::new(None) };
 }
 
@@ -90,8 +95,8 @@ where
         if borrow.is_none() {
             *borrow = Some(create_runtime());
         }
-        let (worker, loader) = borrow.as_mut().unwrap();
-        f(&mut worker.js_runtime, loader)
+        let state = borrow.as_mut().unwrap();
+        f(&mut state.worker.js_runtime, &state.loader)
     })
 }
 
@@ -169,7 +174,7 @@ fn build_permissions_container(permissions: &RuntimePermissions) -> PermissionsC
     PermissionsContainer::new(Arc::new(parser), perms)
 }
 
-fn create_runtime() -> (MainWorker, Rc<PgModuleLoader>) {
+fn create_runtime() -> RuntimeState {
     RUSTLS_PROVIDER_INIT.call_once(|| {
         // rustls 0.23 requires a process-level crypto provider before TLS use.
         let _ =
@@ -221,5 +226,5 @@ fn create_runtime() -> (MainWorker, Rc<PgModuleLoader>) {
     install_console_hook(&mut worker.js_runtime);
     install_pg_api(&mut worker.js_runtime);
 
-    (worker, loader)
+    RuntimeState { worker, loader }
 }

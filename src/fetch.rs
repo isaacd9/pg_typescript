@@ -15,8 +15,15 @@ use crate::loader::ImportMapResolver;
 // ---------------------------------------------------------------------------
 
 pub trait ModuleStore {
+    /// Return the cached source for `url` within the namespace of `fn_oid`.
+    ///
+    /// `Ok(None)` means the module is not present in the store.
     fn load(&self, fn_oid: u32, url: &str) -> Result<Option<String>, String>;
+
+    /// Insert or replace the cached source for `url` within `fn_oid`.
     fn write(&mut self, fn_oid: u32, url: &str, source: &str);
+
+    /// Remove all cached modules associated with `fn_oid`.
     fn clear_for_fn(&mut self, fn_oid: u32);
 }
 
@@ -122,6 +129,8 @@ impl ModuleStore for PgModuleStore {
 // ---------------------------------------------------------------------------
 
 pub trait Fetcher {
+    /// Fetch the module source for `url`, or raise a user-visible error if it
+    /// cannot be retrieved.
     fn fetch(&self, url: &str) -> String;
 }
 
