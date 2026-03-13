@@ -23,6 +23,7 @@ pg_test = []
 pgrx = "=0.17.0"
 deno_core = "0.386.0"
 deno_runtime = { version = "0.242.0", features = ["transpile"] }
+deno_graph = { version = "=0.107.1", default-features = false, features = ["swc"] }
 tokio = { version = "1", features = ["rt", "time"] }
 serde = "1"
 serde_json = "1"

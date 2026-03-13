@@ -17,6 +17,7 @@ use crate::extensions::pg::{
 use crate::fetch;
 use crate::guc::{import_url_allowed, GucParser, ImportUrlCap};
 use crate::loader;
+use crate::module_store;
 use crate::permissions::{
     import_allowed, read_function_config, read_function_permissions, read_function_pg_execute,
     read_inline_permissions, read_inline_pg_execute,
@@ -139,7 +140,7 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         fetch::fetch_and_cache(
             u32::from(fn_oid),
             &import_map,
-            &mut fetch::PgModuleStore,
+            &mut module_store::PgModuleStore,
             &fetch::UreqFetcher,
             &_max_imports,
         )
@@ -198,7 +199,7 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             fetch::fetch_and_cache(
                 DO_BLOCK_OID,
                 &import_map,
-                &mut fetch::PgModuleStore,
+                &mut module_store::PgModuleStore,
                 &fetch::UreqFetcher,
                 &_max_imports,
             )
@@ -271,28 +272,28 @@ fn build_param_names(arg_names: &[Option<String>], nargs: usize) -> Vec<String> 
 }
 
 /// Return a module store appropriate for the current build target.
-fn make_module_store() -> impl fetch::ModuleStore {
+fn make_module_store() -> impl module_store::ModuleStore {
     #[cfg(any(not(test), feature = "pg_test"))]
     {
-        fetch::PgModuleStore
+        module_store::PgModuleStore
     }
     #[cfg(all(test, not(feature = "pg_test")))]
     {
-        fetch::HashMapModuleStore::new()
+        module_store::HashMapModuleStore::new()
     }
 }
 
 struct ExecutionConfig {
     permissions: RuntimePermissions,
     allow_pg_execute: bool,
-    store: Box<dyn fetch::ModuleStore>,
+    store: Box<dyn module_store::ModuleStore>,
 }
 
 impl ExecutionConfig {
     fn new(
         permissions: RuntimePermissions,
         allow_pg_execute: bool,
-        store: impl fetch::ModuleStore + 'static,
+        store: impl module_store::ModuleStore + 'static,
     ) -> Self {
         Self {
             permissions,
@@ -378,7 +379,7 @@ impl ModuleArtifact {
             allow_pg_execute,
             store,
         } = exec;
-        with_runtime(|rt| {
+        with_runtime(|rt, loader| {
             ensure_console_hook(rt);
             ensure_pg_api(rt);
             // Keep `_pg.execute()` disabled while the shared runtime is loading
@@ -393,7 +394,7 @@ impl ModuleArtifact {
                 },
             );
             set_runtime_permissions(rt, &permissions);
-            let fn_global = self.load_or_get_cached(rt, store);
+            let fn_global = self.load_or_get_cached(rt, loader, store);
             f(rt, fn_global)
         })
     }
@@ -401,7 +402,8 @@ impl ModuleArtifact {
     fn load_or_get_cached(
         self,
         rt: &mut deno_core::JsRuntime,
-        store: Box<dyn fetch::ModuleStore>,
+        loader: &loader::PgModuleLoader,
+        store: Box<dyn module_store::ModuleStore>,
     ) -> v8::Global<v8::Value> {
         if let Some(f) =
             FN_CACHE.with(|c| c.borrow().get(&(self.cache_oid, self.source_hash)).cloned())
@@ -409,13 +411,14 @@ impl ModuleArtifact {
             return f;
         }
 
-        self.load_and_cache(rt, store)
+        self.load_and_cache(rt, loader, store)
     }
 
     fn load_and_cache(
         self,
         rt: &mut deno_core::JsRuntime,
-        store: Box<dyn fetch::ModuleStore>,
+        loader: &loader::PgModuleLoader,
+        store: Box<dyn module_store::ModuleStore>,
     ) -> v8::Global<v8::Value> {
         let Self {
             cache_oid,
@@ -429,22 +432,22 @@ impl ModuleArtifact {
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
         let mut inline_modules = HashMap::new();
         inline_modules.insert(specifier.clone(), module_source);
-        let _ctx =
-            loader::set_loader_context_with_inline(cache_oid, import_map, store, inline_modules);
 
-        let module_id = block_on(rt.load_side_es_module(&specifier_url))
-            .unwrap_or_else(|e| report_module_load_error(e));
+        loader.with_context(cache_oid, import_map, store, inline_modules, || {
+            let module_id = block_on(rt.load_side_es_module(&specifier_url))
+                .unwrap_or_else(|e| report_module_load_error(e));
 
-        let evaluate = rt.mod_evaluate(module_id);
-        block_on(rt.with_event_loop_promise(evaluate, Default::default()))
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
+            let evaluate = rt.mod_evaluate(module_id);
+            block_on(rt.with_event_loop_promise(evaluate, Default::default()))
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: module evaluation failed: {e}"));
 
-        let namespace = rt
-            .get_module_namespace(module_id)
-            .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
-        let f = extract_default_export(rt, namespace);
-        FN_CACHE.with(|c| c.borrow_mut().insert((cache_oid, source_hash), f.clone()));
-        f
+            let namespace = rt
+                .get_module_namespace(module_id)
+                .unwrap_or_else(|e| pgrx::error!("pg_typescript: get_module_namespace: {e}"));
+            let f = extract_default_export(rt, namespace);
+            FN_CACHE.with(|c| c.borrow_mut().insert((cache_oid, source_hash), f.clone()));
+            f
+        })
     }
 }
 
@@ -674,7 +677,7 @@ fn read_inline_import_map(
 
 #[cfg(all(test, not(feature = "pg_test")))]
 mod unit_tests {
-    use crate::fetch::ModuleStore;
+    use crate::module_store::ModuleStore;
     use pgrx::FromDatum;
     use serde_json::{json, Value};
 
@@ -700,7 +703,7 @@ mod unit_tests {
         args: &[Value],
         import_map: std::collections::HashMap<String, String>,
         permissions: super::RuntimePermissions,
-        store: crate::fetch::HashMapModuleStore,
+        store: crate::module_store::HashMapModuleStore,
     ) -> (Value, bool) {
         let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
         let fn_oid = pgrx::pg_sys::Oid::from(0u32);
@@ -727,7 +730,7 @@ mod unit_tests {
             args,
             Default::default(),
             super::RuntimePermissions::default(),
-            crate::fetch::HashMapModuleStore::new(),
+            crate::module_store::HashMapModuleStore::new(),
         )
     }
 
@@ -744,7 +747,7 @@ mod unit_tests {
             args,
             Default::default(),
             permissions,
-            crate::fetch::HashMapModuleStore::new(),
+            crate::module_store::HashMapModuleStore::new(),
         )
     }
 
@@ -769,7 +772,7 @@ mod unit_tests {
             super::ExecutionConfig::new(
                 super::RuntimePermissions::default(),
                 false,
-                crate::fetch::HashMapModuleStore::new(),
+                crate::module_store::HashMapModuleStore::new(),
             ),
             &args,
             crate::convert::PgDatumSeed { oid: ret_oid },
@@ -799,7 +802,7 @@ mod unit_tests {
             fn $name() {
                 let args: Vec<Value> = vec![$($a),*];
                 let import_map = crate::fetch::make_import_map(&[$(($spec, $url)),*]);
-                let mut store = crate::fetch::HashMapModuleStore::new();
+                let mut store = crate::module_store::HashMapModuleStore::new();
                 $( store.write(0, $murl, $msrc); )*
                 let (val, is_null) = run_impl(
                     $src,
@@ -843,13 +846,14 @@ mod unit_tests {
         let specifier =
             deno_core::resolve_url(&format!("file:///pg_typescript/test_syntax_{hash:016x}.ts"))
                 .unwrap();
-        let result = with_runtime(|rt| {
-            let _ctx = crate::loader::set_loader_context(
+        let result = with_runtime(|rt, loader| {
+            loader.with_context(
                 0,
                 Default::default(),
-                Box::new(crate::fetch::HashMapModuleStore::new()),
-            );
-            block_on(rt.load_side_es_module_from_code(&specifier, module_source))
+                Box::new(crate::module_store::HashMapModuleStore::new()),
+                HashMap::new(),
+                || block_on(rt.load_side_es_module_from_code(&specifier, module_source)),
+            )
         });
         assert!(
             result.is_err(),
@@ -920,14 +924,14 @@ mod unit_tests {
         artifact.execute_void(super::ExecutionConfig::new(
             super::RuntimePermissions::default(),
             false,
-            crate::fetch::HashMapModuleStore::new(),
+            crate::module_store::HashMapModuleStore::new(),
         ));
     }
 
     #[test]
     fn inline_block_with_module() {
         let import_map = crate::fetch::make_import_map(&[("math", "https://esm.sh/math@1")]);
-        let mut store = crate::fetch::HashMapModuleStore::new();
+        let mut store = crate::module_store::HashMapModuleStore::new();
         store.write(
             0,
             "https://esm.sh/math@1",

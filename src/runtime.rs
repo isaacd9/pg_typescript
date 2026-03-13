@@ -4,7 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Once;
 
-use deno_core::JsRuntime;
+use deno_core::{JsRuntime, ModuleLoader};
 use deno_runtime::deno_permissions::{
     Permissions, PermissionsContainer, PermissionsOptions, RuntimePermissionDescriptorParser,
 };
@@ -21,8 +21,13 @@ use crate::loader::PgModuleLoader;
 const STARTUP_SNAPSHOT: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/pg_typescript_runtime.snap"));
 
+struct RuntimeState {
+    worker: MainWorker,
+    loader: Rc<PgModuleLoader>,
+}
+
 thread_local! {
-    static JS_RT: RefCell<Option<MainWorker>> = const { RefCell::new(None) };
+    static JS_RT: RefCell<Option<RuntimeState>> = const { RefCell::new(None) };
     static TOKIO_RT: RefCell<Option<tokio::runtime::Runtime>> = const { RefCell::new(None) };
 }
 
@@ -83,15 +88,15 @@ deno_core::extension!(
 /// Run `f` with the per-connection runtime, initialising it on first use.
 pub fn with_runtime<F, R>(f: F) -> R
 where
-    F: FnOnce(&mut JsRuntime) -> R,
+    F: FnOnce(&mut JsRuntime, &PgModuleLoader) -> R,
 {
     JS_RT.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if borrow.is_none() {
             *borrow = Some(create_runtime());
         }
-        let worker = borrow.as_mut().unwrap();
-        f(&mut worker.js_runtime)
+        let state = borrow.as_mut().unwrap();
+        f(&mut state.worker.js_runtime, &state.loader)
     })
 }
 
@@ -100,7 +105,7 @@ where
 /// This is called from `_PG_init` in backend processes so first function
 /// execution does not pay runtime bootstrap latency.
 pub fn prewarm_runtime() {
-    with_runtime(|_| ());
+    with_runtime(|_, _| ());
 }
 
 /// Apply effective permissions to the runtime before module load/evaluation.
@@ -169,7 +174,7 @@ fn build_permissions_container(permissions: &RuntimePermissions) -> PermissionsC
     PermissionsContainer::new(Arc::new(parser), perms)
 }
 
-fn create_runtime() -> MainWorker {
+fn create_runtime() -> RuntimeState {
     RUSTLS_PROVIDER_INIT.call_once(|| {
         // rustls 0.23 requires a process-level crypto provider before TLS use.
         let _ =
@@ -179,6 +184,8 @@ fn create_runtime() -> MainWorker {
     let permissions = build_permissions_container(&RuntimePermissions::default());
     let main_module = deno_core::resolve_url("file:///pg_typescript/runtime_bootstrap.mjs")
         .expect("pg_typescript: invalid runtime bootstrap specifier");
+
+    let loader = Rc::new(PgModuleLoader::new());
 
     let services: WorkerServiceOptions<
         PgInNpmPackageChecker,
@@ -190,7 +197,7 @@ fn create_runtime() -> MainWorker {
         deno_rt_native_addon_loader: None,
         feature_checker: Arc::new(FeatureChecker::default()),
         fs: Arc::new(deno_runtime::deno_fs::RealFs),
-        module_loader: Rc::new(PgModuleLoader),
+        module_loader: Rc::clone(&loader) as Rc<dyn ModuleLoader>,
         node_services: None,
         npm_process_state_provider: None,
         permissions,
@@ -219,5 +226,5 @@ fn create_runtime() -> MainWorker {
     install_console_hook(&mut worker.js_runtime);
     install_pg_api(&mut worker.js_runtime);
 
-    worker
+    RuntimeState { worker, loader }
 }

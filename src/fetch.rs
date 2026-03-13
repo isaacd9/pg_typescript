@@ -1,119 +1,25 @@
-use std::collections::{HashMap, HashSet};
+//! Build-time/cache-time module prefetching and cache population.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use deno_core::futures::executor::block_on;
+use deno_error::JsErrorBox;
+use deno_graph::source::{LoadError, LoadFuture, LoadOptions, LoadResponse, Loader};
+use deno_graph::{BuildOptions, GraphKind, ModuleGraph, ModuleSpecifier};
 
 use crate::guc::{import_url_allowed, ImportUrlCap};
-
-// ---------------------------------------------------------------------------
-// ModuleStore trait
-// ---------------------------------------------------------------------------
-
-pub trait ModuleStore {
-    fn load(&self, fn_oid: u32, url: &str) -> Result<Option<String>, String>;
-    fn write(&mut self, fn_oid: u32, url: &str, source: &str);
-    fn clear_for_fn(&mut self, fn_oid: u32);
-}
-
-// ---------------------------------------------------------------------------
-// HashMapModuleStore — in-memory store, used in tests
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-pub struct HashMapModuleStore(HashMap<(u32, String), String>);
-
-impl HashMapModuleStore {
-    #[allow(dead_code)]
-    pub fn new() -> Self {
-        Self(HashMap::new())
-    }
-}
-
-#[allow(dead_code)]
-impl Default for HashMapModuleStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ModuleStore for HashMapModuleStore {
-    fn load(&self, fn_oid: u32, url: &str) -> Result<Option<String>, String> {
-        Ok(self.0.get(&(fn_oid, url.to_string())).cloned())
-    }
-
-    fn write(&mut self, fn_oid: u32, url: &str, source: &str) {
-        self.0.insert((fn_oid, url.to_string()), source.to_string());
-    }
-
-    fn clear_for_fn(&mut self, fn_oid: u32) {
-        self.0.retain(|(oid, _), _| *oid != fn_oid);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PgModuleStore — Postgres-backed store.
-//
-// Excluded from test builds: pgrx::Spi links against _CacheMemoryContext and
-// other PostgreSQL globals that are not present in the unit-test binary.
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-pub struct PgModuleStore;
-
-impl ModuleStore for PgModuleStore {
-    fn load(&self, fn_oid: u32, url: &str) -> Result<Option<String>, String> {
-        use pgrx::spi::SpiError;
-        use pgrx::{pg_sys, Spi};
-
-        let pg_oid = pg_sys::Oid::from(fn_oid);
-        Spi::connect(|client| {
-            let mut rows = client.select(
-                "SELECT source \
-                 FROM deno_internal.deno_package_modules \
-                 WHERE function_oid = $1 AND url = $2",
-                None,
-                &[pg_oid.into(), url.to_string().into()],
-            )?;
-            if let Some(row) = rows.next() {
-                let src: Option<String> = row["source"].value()?;
-                return Ok(src);
-            }
-            Ok::<Option<String>, SpiError>(None)
-        })
-        .map_err(|e| format!("{e:?}"))
-    }
-
-    fn write(&mut self, fn_oid: u32, url: &str, source: &str) {
-        use pgrx::{pg_sys, Spi};
-
-        let pg_oid = pg_sys::Oid::from(fn_oid);
-        Spi::run_with_args(
-            "INSERT INTO deno_internal.deno_package_modules (function_oid, url, source) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (function_oid, url) DO UPDATE SET source = EXCLUDED.source",
-            &[
-                pg_oid.into(),
-                url.to_string().into(),
-                source.to_string().into(),
-            ],
-        )
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to cache module {url}: {e:?}"));
-    }
-
-    fn clear_for_fn(&mut self, fn_oid: u32) {
-        use pgrx::{pg_sys, Spi};
-
-        let pg_oid = pg_sys::Oid::from(fn_oid);
-        Spi::run_with_args(
-            "DELETE FROM deno_internal.deno_package_modules WHERE function_oid = $1",
-            &[pg_oid.into()],
-        )
-        .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to clear module cache: {e:?}"));
-    }
-}
+use crate::loader::ImportMapResolver;
+use crate::module_store::ModuleStore;
 
 // ---------------------------------------------------------------------------
 // Fetcher trait
 // ---------------------------------------------------------------------------
 
 pub trait Fetcher {
+    /// Fetch the module source for `url`, or raise a user-visible error if it
+    /// cannot be retrieved.
     fn fetch(&self, url: &str) -> String;
 }
 
@@ -175,8 +81,8 @@ impl Fetcher for UreqFetcher {
 // Fetching and caching
 // ---------------------------------------------------------------------------
 
-/// Fetch all modules in the import map (and transitive dependencies) and
-/// write them into the provided store using the provided fetcher.
+/// Fetch all import-map entrypoints, then let `deno_graph` parse each module
+/// and recursively discover the static dependency graph.
 pub fn fetch_and_cache<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
     fn_oid_raw: u32,
     import_map: &HashMap<String, String>,
@@ -184,85 +90,108 @@ pub fn fetch_and_cache<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
     fetcher: &F,
     max_imports: &ImportUrlCap,
 ) -> Result<(), String> {
-    for url in import_map.values() {
-        if !import_url_allowed(url, max_imports)? {
-            return Err(format!(
-                "import URL '{url}' is not allowed by GUC typescript.max_imports"
-            ));
-        }
-    }
-
     store.clear_for_fn(fn_oid_raw);
 
-    let mut visited: HashSet<String> = HashSet::new();
-    for url in import_map.values() {
-        fetch_recursive(fn_oid_raw, url, &mut visited, store, fetcher, max_imports)?;
-    }
+    let roots = import_map
+        .values()
+        .map(|url| {
+            ModuleSpecifier::parse(url)
+                .map_err(|e| format!("invalid import URL '{url}' in import_map: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let resolver = ImportMapResolver::new(import_map);
+    let loader = PrefetchLoader::new(fn_oid_raw, store, fetcher, max_imports);
+    let mut graph = ModuleGraph::new(GraphKind::CodeOnly);
+
+    block_on(graph.build(
+        roots,
+        Vec::new(),
+        &loader,
+        BuildOptions {
+            resolver: Some(&resolver),
+            // Mirror the previous prefetch semantics: only follow static imports.
+            skip_dynamic_deps: true,
+            ..Default::default()
+        },
+    ));
+
+    graph.valid().map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn fetch_recursive<S: ModuleStore + ?Sized, F: Fetcher + ?Sized>(
-    fn_oid_raw: u32,
-    url: &str,
-    visited: &mut std::collections::HashSet<String>,
-    store: &mut S,
-    fetcher: &F,
-    max_imports: &ImportUrlCap,
-) -> Result<(), String> {
-    if !import_url_allowed(url, max_imports)? {
-        return Err(format!(
-            "import URL '{url}' is not allowed by GUC typescript.max_imports"
-        ));
-    }
+// ---------------------------------------------------------------------------
+// Graph loader
+// ---------------------------------------------------------------------------
 
-    if visited.contains(url) {
-        return Ok(());
-    }
-    visited.insert(url.to_string());
+struct PrefetchLoader<'a, S: ModuleStore + ?Sized, F: Fetcher + ?Sized> {
+    fn_oid: u32,
+    store: RefCell<&'a mut S>,
+    fetcher: &'a F,
+    max_imports: &'a ImportUrlCap,
+}
 
-    let source = fetcher.fetch(url);
-    store.write(fn_oid_raw, url, &source);
-
-    for dep_specifier in extract_imports(&source) {
-        if let Some(dep_url) = resolve_specifier(&dep_specifier, url) {
-            fetch_recursive(fn_oid_raw, &dep_url, visited, store, fetcher, max_imports)?;
+impl<'a, S: ModuleStore + ?Sized, F: Fetcher + ?Sized> PrefetchLoader<'a, S, F> {
+    fn new(fn_oid: u32, store: &'a mut S, fetcher: &'a F, max_imports: &'a ImportUrlCap) -> Self {
+        Self {
+            fn_oid,
+            store: RefCell::new(store),
+            fetcher,
+            max_imports,
         }
     }
-    Ok(())
-}
 
-// ---------------------------------------------------------------------------
-// Import extraction (pure Rust)
-// ---------------------------------------------------------------------------
+    fn load_module(&self, specifier: &ModuleSpecifier) -> Result<Option<LoadResponse>, LoadError> {
+        let url = specifier.as_str();
 
-fn extract_imports(source: &str) -> Vec<String> {
-    source.lines().filter_map(extract_from_specifier).collect()
-}
+        if !import_url_allowed(url, self.max_imports)
+            .map_err(|e| graph_load_error(format!("pg_typescript: {e}")))?
+        {
+            return Err(graph_load_error(format!(
+                "import URL '{url}' is not allowed by GUC typescript.max_imports"
+            )));
+        }
 
-fn extract_from_specifier(line: &str) -> Option<String> {
-    let from_idx = line.rfind(" from ")?;
-    let after = line[from_idx + 6..].trim();
-    let quote = after.chars().next().filter(|c| *c == '"' || *c == '\'')?;
-    let inner = &after[1..];
-    let end = inner.find(quote)?;
-    Some(inner[..end].to_string())
-}
+        if let Some(source) = self
+            .store
+            .borrow()
+            .load(self.fn_oid, url)
+            .map_err(|e| graph_load_error(format!("pg_typescript: error loading {url}: {e}")))?
+        {
+            return Ok(Some(module_response(specifier.clone(), source)));
+        }
 
-fn resolve_specifier(specifier: &str, referrer: &str) -> Option<String> {
-    use deno_core::ModuleSpecifier;
-    if specifier.starts_with("http://") || specifier.starts_with("https://") {
-        return Some(specifier.to_string());
+        let source = self.fetcher.fetch(url);
+        self.store.borrow_mut().write(self.fn_oid, url, &source);
+
+        Ok(Some(module_response(specifier.clone(), source)))
     }
-    let base = ModuleSpecifier::parse(referrer).ok()?;
-    if specifier.starts_with('/') {
-        let origin = format!(
-            "{}://{}",
-            base.scheme(),
-            base.host_str().unwrap_or("localhost")
-        );
-        return Some(format!("{origin}{specifier}"));
+}
+
+impl<S: ModuleStore + ?Sized, F: Fetcher + ?Sized> std::fmt::Debug for PrefetchLoader<'_, S, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrefetchLoader").finish()
     }
-    base.join(specifier).ok().map(|u| u.to_string())
+}
+
+impl<S: ModuleStore + ?Sized, F: Fetcher + ?Sized> Loader for PrefetchLoader<'_, S, F> {
+    fn load(&self, specifier: &ModuleSpecifier, _options: LoadOptions) -> LoadFuture {
+        let result = self.load_module(specifier);
+        Box::pin(async move { result })
+    }
+}
+
+fn module_response(specifier: ModuleSpecifier, source: String) -> LoadResponse {
+    LoadResponse::Module {
+        content: Arc::from(source.into_bytes()),
+        mtime: None,
+        specifier,
+        maybe_headers: None,
+    }
+}
+
+fn graph_load_error(message: String) -> LoadError {
+    LoadError::Other(Arc::new(JsErrorBox::generic(message)))
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +214,7 @@ pub(crate) fn make_import_map(entries: &[(&str, &str)]) -> HashMap<String, Strin
 mod tests {
     use super::*;
     use crate::guc::{GucParser, ImportMapParser, MaxImportsParser};
+    use crate::module_store::HashMapModuleStore;
 
     fn parse_import_map_for_test(json: &str) -> Result<HashMap<String, String>, String> {
         ImportMapParser::new().parse_raw(Some(json.to_string()), "test import_map")
@@ -306,10 +236,6 @@ mod tests {
 
     #[test]
     fn parse_import_map_cases() {
-        // (name, input, expected)
-        // Ok(Some((key, url))) — parse succeeds, verify this entry is present
-        // Ok(None)             — parse succeeds, map is empty
-        // Err(())              — parse must return Err
         let cases: &[(&str, &str, Result<Option<(&str, &str)>, ()>)] = &[
             (
                 "single entry",
@@ -443,7 +369,6 @@ mod tests {
 
     #[test]
     fn fetch_transitive_dep() {
-        // pkg@1 imports ./utils.js, which resolves to https://esm.sh/utils.js
         let fetcher = make_fetcher![
             "https://esm.sh/pkg@1" => "export { x } from './utils.js';",
             "https://esm.sh/utils.js" => "export const x = 1;",
@@ -464,16 +389,101 @@ mod tests {
     }
 
     #[test]
-    fn fetch_deduplicates_urls() {
-        // Two import map entries pointing to the same URL — fetched only once.
-        let fetcher = make_fetcher!["https://esm.sh/shared@1" => "export const s = 1;"];
+    fn fetch_side_effect_import() {
+        let fetcher = make_fetcher![
+            "https://esm.sh/pkg@1" => "import './side_effect.js'; export const x = 1;",
+            "https://esm.sh/side_effect.js" => "globalThis.side = true;",
+        ];
+        let mut store = HashMapModuleStore::new();
+
+        fetch_and_cache(
+            0,
+            &make_import_map(&[("pkg", "https://esm.sh/pkg@1")]),
+            &mut store,
+            &fetcher,
+            &ImportUrlCap::AllowAll,
+        )
+        .unwrap();
+
+        assert!(store
+            .load(0, "https://esm.sh/side_effect.js")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn fetch_export_all_dep() {
+        let fetcher = make_fetcher![
+            "https://esm.sh/pkg@1" => "export * from './utils.js';",
+            "https://esm.sh/utils.js" => "export const x = 1;",
+        ];
+        let mut store = HashMapModuleStore::new();
+
+        fetch_and_cache(
+            0,
+            &make_import_map(&[("pkg", "https://esm.sh/pkg@1")]),
+            &mut store,
+            &fetcher,
+            &ImportUrlCap::AllowAll,
+        )
+        .unwrap();
+
+        assert!(store.load(0, "https://esm.sh/utils.js").unwrap().is_some());
+    }
+
+    #[test]
+    fn fetch_multiline_import() {
+        let fetcher = make_fetcher![
+            "https://esm.sh/pkg@1" => "import {\n  x,\n} from './utils.js';\nexport { x };",
+            "https://esm.sh/utils.js" => "export const x = 1;",
+        ];
+        let mut store = HashMapModuleStore::new();
+
+        fetch_and_cache(
+            0,
+            &make_import_map(&[("pkg", "https://esm.sh/pkg@1")]),
+            &mut store,
+            &fetcher,
+            &ImportUrlCap::AllowAll,
+        )
+        .unwrap();
+
+        assert!(store.load(0, "https://esm.sh/utils.js").unwrap().is_some());
+    }
+
+    #[test]
+    fn fetch_root_relative_dep() {
+        let fetcher = make_fetcher![
+            "https://esm.sh/pkg/index.js" => "export { x } from '/shared.js';",
+            "https://esm.sh/shared.js" => "export const x = 1;",
+        ];
+        let mut store = HashMapModuleStore::new();
+
+        fetch_and_cache(
+            0,
+            &make_import_map(&[("pkg", "https://esm.sh/pkg/index.js")]),
+            &mut store,
+            &fetcher,
+            &ImportUrlCap::AllowAll,
+        )
+        .unwrap();
+
+        assert!(store.load(0, "https://esm.sh/shared.js").unwrap().is_some());
+    }
+
+    #[test]
+    fn fetch_transitive_bare_specifier_from_import_map() {
+        let fetcher = make_fetcher![
+            "https://esm.sh/pkg@1" => "export { z } from 'zod';",
+            "https://esm.sh/zod@3" => "export const z = 3;",
+        ];
         let mut store = HashMapModuleStore::new();
 
         fetch_and_cache(
             0,
             &make_import_map(&[
-                ("a", "https://esm.sh/shared@1"),
-                ("b", "https://esm.sh/shared@1"),
+                ("pkg", "https://esm.sh/pkg@1"),
+                ("zod", "https://esm.sh/zod@3"),
             ]),
             &mut store,
             &fetcher,
@@ -481,75 +491,7 @@ mod tests {
         )
         .unwrap();
 
-        // Would panic inside HashMapFetcher if fetched more than once and we
-        // hadn't inserted it — but the visited set prevents duplicate fetches.
-        assert!(store.load(0, "https://esm.sh/shared@1").unwrap().is_some());
-    }
-
-    // --- extract_from_specifier ---------------------------------------------
-
-    #[test]
-    fn extract_double_quote() {
-        assert_eq!(
-            extract_from_specifier(r#"import { foo } from "lodash""#),
-            Some("lodash".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_single_quote() {
-        assert_eq!(
-            extract_from_specifier("export { bar } from 'https://esm.sh/x'"),
-            Some("https://esm.sh/x".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_no_from_clause() {
-        assert_eq!(extract_from_specifier("const x = 1;"), None);
-    }
-
-    #[test]
-    fn extract_uses_last_from() {
-        // rfind means we pick the last " from " on the line.
-        assert_eq!(
-            extract_from_specifier(r#"export { from } from "mod""#),
-            Some("mod".to_string())
-        );
-    }
-
-    // --- resolve_specifier --------------------------------------------------
-
-    #[test]
-    fn resolve_absolute_passthrough() {
-        assert_eq!(
-            resolve_specifier("https://esm.sh/other", "https://esm.sh/pkg"),
-            Some("https://esm.sh/other".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_relative() {
-        assert_eq!(
-            resolve_specifier("./utils.js", "https://esm.sh/pkg/index.js"),
-            Some("https://esm.sh/pkg/utils.js".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_parent_relative() {
-        assert_eq!(
-            resolve_specifier("../shared.js", "https://esm.sh/pkg/sub/index.js"),
-            Some("https://esm.sh/pkg/shared.js".to_string())
-        );
-    }
-
-    #[test]
-    fn resolve_root_relative() {
-        assert_eq!(
-            resolve_specifier("/v135/lodash@4/index.js", "https://esm.sh/pkg"),
-            Some("https://esm.sh/v135/lodash@4/index.js".to_string())
-        );
+        assert!(store.load(0, "https://esm.sh/zod@3").unwrap().is_some());
     }
 
     // --- max_imports --------------------------------------------------------

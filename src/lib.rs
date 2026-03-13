@@ -8,6 +8,7 @@ mod extensions;
 mod fetch;
 mod guc;
 mod loader;
+mod module_store;
 mod permissions;
 mod plhandler;
 mod runtime;
