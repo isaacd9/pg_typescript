@@ -14,232 +14,73 @@ mod runtime;
 
 use crate::guc::{BoolGucParser, GucParser, ImportMapParser, MaxImportsParser, PermissionParser};
 
-/// GUC for DO-block import maps. Use `SET LOCAL typescript.import_map = '{"imports": {...}}'`
-/// before a DO block so the setting reverts automatically at transaction end.
-/// Per-function import maps are stored in proconfig via `CREATE FUNCTION … SET`.
-/// Default: unset (`None`), treated as no import map.
+// ---------------------------------------------------------------------------
+// GUC statics
+// ---------------------------------------------------------------------------
+
 pub(crate) static IMPORT_MAP_GUC: ImportMapParser = ImportMapParser::new();
-/// Superuser cap for allowed import-map URL prefixes. Values:
-/// - `off|none|deny|false` => deny all imports
-/// - `*|all|on|true` => allow all imports
-/// - `a,b,c` => allowlist of URL prefixes
-///
-/// Default: unset (`None`), treated as allow all imports.
 pub(crate) static MAX_IMPORTS_GUC: MaxImportsParser = MaxImportsParser::new();
 
-/// Userset permission request knobs (function-level via `CREATE FUNCTION ... SET`, or
-/// session/local for DO blocks). Values:
-/// - `off|none|deny|false` => deny
-/// - `*|all|on|true` => allow all
-/// - `a,b,c` => allowlist
-///
-/// Default for each `allow_*` GUC: unset (`None`), treated as deny.
 pub(crate) static ALLOW_READ_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_WRITE_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_NET_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_ENV_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_RUN_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_FFI_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_SYS_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_IMPORT_GUC: PermissionParser = PermissionParser::new();
-/// Request access to `_pg.execute()` from a function or DO block.
-/// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_PG_EXECUTE_GUC: BoolGucParser = BoolGucParser::new();
 
-/// Superuser caps for each permission. `allow_*` requests must be fully
-/// satisfiable by `max_allow_*`; otherwise execution fails with an error.
-/// Default for each `max_allow_*` GUC: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_READ_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_WRITE_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_NET_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_ENV_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_RUN_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_FFI_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_SYS_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_IMPORT_GUC: PermissionParser = PermissionParser::new();
-/// Superuser cap for `_pg.execute()` access.
-/// Default: unset (`None`), treated as deny.
 pub(crate) static MAX_ALLOW_PG_EXECUTE_GUC: BoolGucParser = BoolGucParser::new();
 
-// Register the GUC for per-function import maps.
+// ---------------------------------------------------------------------------
+// GUC registration
+// ---------------------------------------------------------------------------
+
+macro_rules! register_guc {
+    ($name:expr, $desc:expr, $guc:expr, $ctx:expr) => {
+        GucRegistry::define_string_guc($name, $desc, c"", $guc.inner(), $ctx, GucFlags::default());
+    };
+}
+
 #[pg_guard]
 pub unsafe extern "C-unwind" fn _PG_init() {
-    GucRegistry::define_string_guc(
-        c"typescript.import_map",
-        c"Deno-style import map JSON for pg_typescript functions, e.g. {\"imports\":{\"lodash\":\"https://esm.sh/lodash@4.17.23\"}}",
-        c"",
-        IMPORT_MAP_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.max_imports",
+    register_guc!(c"typescript.import_map",
+        c"Deno-style import map JSON for pg_typescript functions",
+        IMPORT_MAP_GUC, GucContext::Userset);
+    register_guc!(c"typescript.max_imports",
         c"Superuser max import URL cap: off|*|comma-list of http(s) URL prefixes",
-        c"",
-        MAX_IMPORTS_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
+        MAX_IMPORTS_GUC, GucContext::Suset);
 
-    GucRegistry::define_string_guc(
-        c"typescript.allow_read",
-        c"Requested read permission: off|*|comma-list",
-        c"",
-        ALLOW_READ_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.allow_write",
-        c"Requested write permission: off|*|comma-list",
-        c"",
-        ALLOW_WRITE_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.allow_net",
-        c"Requested network permission: off|*|comma-list",
-        c"",
-        ALLOW_NET_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.allow_env",
-        c"Requested environment permission: off|*|comma-list",
-        c"",
-        ALLOW_ENV_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.allow_run",
-        c"Requested subprocess permission: off|*|comma-list",
-        c"",
-        ALLOW_RUN_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.allow_ffi",
-        c"Requested FFI permission: off|*|comma-list",
-        c"",
-        ALLOW_FFI_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.allow_sys",
-        c"Requested system-information permission: off|*|comma-list",
-        c"",
-        ALLOW_SYS_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.allow_import",
-        c"Requested import permission: off|*|comma-list",
-        c"",
-        ALLOW_IMPORT_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.allow_pg_execute",
-        c"Requested access to _pg.execute(): off|on",
-        c"",
-        ALLOW_PG_EXECUTE_GUC.inner(),
-        GucContext::Userset,
-        GucFlags::default(),
-    );
+    // Userset allow_* permission knobs (off|*|comma-list, default deny).
+    register_guc!(c"typescript.allow_read",       c"Requested read permission: off|*|comma-list",               ALLOW_READ_GUC,       GucContext::Userset);
+    register_guc!(c"typescript.allow_write",      c"Requested write permission: off|*|comma-list",              ALLOW_WRITE_GUC,      GucContext::Userset);
+    register_guc!(c"typescript.allow_net",        c"Requested network permission: off|*|comma-list",            ALLOW_NET_GUC,        GucContext::Userset);
+    register_guc!(c"typescript.allow_env",        c"Requested environment permission: off|*|comma-list",        ALLOW_ENV_GUC,        GucContext::Userset);
+    register_guc!(c"typescript.allow_run",        c"Requested subprocess permission: off|*|comma-list",         ALLOW_RUN_GUC,        GucContext::Userset);
+    register_guc!(c"typescript.allow_ffi",        c"Requested FFI permission: off|*|comma-list",                ALLOW_FFI_GUC,        GucContext::Userset);
+    register_guc!(c"typescript.allow_sys",        c"Requested system-information permission: off|*|comma-list", ALLOW_SYS_GUC,        GucContext::Userset);
+    register_guc!(c"typescript.allow_import",     c"Requested import permission: off|*|comma-list",             ALLOW_IMPORT_GUC,     GucContext::Userset);
+    register_guc!(c"typescript.allow_pg_execute", c"Requested access to _pg.execute(): off|on",                 ALLOW_PG_EXECUTE_GUC, GucContext::Userset);
 
-    GucRegistry::define_string_guc(
-        c"typescript.max_allow_read",
-        c"Superuser max read permission cap: off|*|comma-list",
-        c"",
-        MAX_ALLOW_READ_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.max_allow_write",
-        c"Superuser max write permission cap: off|*|comma-list",
-        c"",
-        MAX_ALLOW_WRITE_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.max_allow_net",
-        c"Superuser max network permission cap: off|*|comma-list",
-        c"",
-        MAX_ALLOW_NET_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.max_allow_env",
-        c"Superuser max environment permission cap: off|*|comma-list",
-        c"",
-        MAX_ALLOW_ENV_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.max_allow_run",
-        c"Superuser max subprocess permission cap: off|*|comma-list",
-        c"",
-        MAX_ALLOW_RUN_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.max_allow_ffi",
-        c"Superuser max FFI permission cap: off|*|comma-list",
-        c"",
-        MAX_ALLOW_FFI_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.max_allow_sys",
-        c"Superuser max system-information permission cap: off|*|comma-list",
-        c"",
-        MAX_ALLOW_SYS_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.max_allow_import",
-        c"Superuser max import permission cap: off|*|comma-list",
-        c"",
-        MAX_ALLOW_IMPORT_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_string_guc(
-        c"typescript.max_allow_pg_execute",
-        c"Superuser max _pg.execute() cap: off|on",
-        c"",
-        MAX_ALLOW_PG_EXECUTE_GUC.inner(),
-        GucContext::Suset,
-        GucFlags::default(),
-    );
+    // Superuser max_allow_* caps (off|*|comma-list, default deny).
+    register_guc!(c"typescript.max_allow_read",       c"Superuser max read permission cap: off|*|comma-list",               MAX_ALLOW_READ_GUC,       GucContext::Suset);
+    register_guc!(c"typescript.max_allow_write",      c"Superuser max write permission cap: off|*|comma-list",              MAX_ALLOW_WRITE_GUC,      GucContext::Suset);
+    register_guc!(c"typescript.max_allow_net",        c"Superuser max network permission cap: off|*|comma-list",            MAX_ALLOW_NET_GUC,        GucContext::Suset);
+    register_guc!(c"typescript.max_allow_env",        c"Superuser max environment permission cap: off|*|comma-list",        MAX_ALLOW_ENV_GUC,        GucContext::Suset);
+    register_guc!(c"typescript.max_allow_run",        c"Superuser max subprocess permission cap: off|*|comma-list",         MAX_ALLOW_RUN_GUC,        GucContext::Suset);
+    register_guc!(c"typescript.max_allow_ffi",        c"Superuser max FFI permission cap: off|*|comma-list",                MAX_ALLOW_FFI_GUC,        GucContext::Suset);
+    register_guc!(c"typescript.max_allow_sys",        c"Superuser max system-information permission cap: off|*|comma-list", MAX_ALLOW_SYS_GUC,        GucContext::Suset);
+    register_guc!(c"typescript.max_allow_import",     c"Superuser max import permission cap: off|*|comma-list",             MAX_ALLOW_IMPORT_GUC,     GucContext::Suset);
+    register_guc!(c"typescript.max_allow_pg_execute", c"Superuser max _pg.execute() cap: off|on",                           MAX_ALLOW_PG_EXECUTE_GUC, GucContext::Suset);
 
     // Don't initialize V8 in the postmaster process.
     if unsafe { pg_sys::IsUnderPostmaster } {

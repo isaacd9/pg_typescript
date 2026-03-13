@@ -282,22 +282,18 @@ fn make_module_store() -> impl fetch::ModuleStore {
     }
 }
 
-struct ExecutionConfig {
+struct ExecutionConfig<S: fetch::ModuleStore> {
     permissions: RuntimePermissions,
     allow_pg_execute: bool,
-    store: Box<dyn fetch::ModuleStore>,
+    store: S,
 }
 
-impl ExecutionConfig {
-    fn new(
-        permissions: RuntimePermissions,
-        allow_pg_execute: bool,
-        store: impl fetch::ModuleStore + 'static,
-    ) -> Self {
+impl<S: fetch::ModuleStore> ExecutionConfig<S> {
+    fn new(permissions: RuntimePermissions, allow_pg_execute: bool, store: S) -> Self {
         Self {
             permissions,
             allow_pg_execute,
-            store: Box::new(store),
+            store,
         }
     }
 }
@@ -311,7 +307,7 @@ struct ModuleInputs<'a> {
 }
 
 impl<'a> ModuleInputs<'a> {
-    fn prepare(self) -> ModuleArtifact {
+    fn prepare(self) -> ModuleArtifact<'a> {
         let params = self.param_names.join(", ");
         let module_source = assemble_module(self.source, self.import_map, &params);
         let source_hash = hash_str(&module_source);
@@ -325,31 +321,32 @@ impl<'a> ModuleInputs<'a> {
             source_hash,
             specifier,
             module_source,
-            import_map: self.import_map.clone(),
+            import_map: self.import_map,
         }
     }
 }
 
 /// Prepared module artifact shared by validation and execution.
 ///
-/// This captures the synthetic entrypoint source, cache key, and loader inputs.
-struct ModuleArtifact {
+/// Borrows the import map; only clones it on cache miss (module load path).
+struct ModuleArtifact<'a> {
     cache_oid: u32,
     source_hash: u64,
     specifier: String,
     module_source: String,
-    import_map: HashMap<String, String>,
+    import_map: &'a HashMap<String, String>,
 }
 
-impl ModuleArtifact {
-    fn preload(self, exec: ExecutionConfig) {
+impl<'a> ModuleArtifact<'a> {
+    fn preload<S: fetch::ModuleStore + 'static>(self, exec: ExecutionConfig<S>) {
         self.with_loaded_fn(exec, |_rt, _fn_global| ());
     }
 
-    fn execute<A, S, R>(self, exec: ExecutionConfig, args: &[A], seed: S) -> R
+    fn execute<S, A, Seed, R>(self, exec: ExecutionConfig<S>, args: &[A], seed: Seed) -> R
     where
+        S: fetch::ModuleStore + 'static,
         A: serde::Serialize,
-        S: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
+        Seed: for<'de> serde::de::DeserializeSeed<'de, Value = R>,
     {
         self.with_loaded_fn(exec, |rt, fn_global| {
             with_pg_execute_allowed(rt, |rt| {
@@ -364,13 +361,14 @@ impl ModuleArtifact {
         })
     }
 
-    fn execute_void(self, exec: ExecutionConfig) {
+    fn execute_void<S: fetch::ModuleStore + 'static>(self, exec: ExecutionConfig<S>) {
         let no_args: &[serde_json::Value] = &[];
         self.execute(exec, no_args, VoidSeed);
     }
 
-    fn with_loaded_fn<F, R>(self, exec: ExecutionConfig, f: F) -> R
+    fn with_loaded_fn<S, F, R>(self, exec: ExecutionConfig<S>, f: F) -> R
     where
+        S: fetch::ModuleStore + 'static,
         F: FnOnce(&mut deno_core::JsRuntime, v8::Global<v8::Value>) -> R,
     {
         let ExecutionConfig {
@@ -381,10 +379,6 @@ impl ModuleArtifact {
         with_runtime(|rt| {
             ensure_console_hook(rt);
             ensure_pg_api(rt);
-            // Keep `_pg.execute()` disabled while the shared runtime is loading
-            // and evaluating modules. The function-body guard only flips on
-            // during the direct user call, and only if the GUC gate enabled the
-            // capability for this function or DO block.
             set_pg_execute_state(
                 rt,
                 PgExecuteState {
@@ -398,10 +392,10 @@ impl ModuleArtifact {
         })
     }
 
-    fn load_or_get_cached(
+    fn load_or_get_cached<S: fetch::ModuleStore + 'static>(
         self,
         rt: &mut deno_core::JsRuntime,
-        store: Box<dyn fetch::ModuleStore>,
+        store: S,
     ) -> v8::Global<v8::Value> {
         if let Some(f) =
             FN_CACHE.with(|c| c.borrow().get(&(self.cache_oid, self.source_hash)).cloned())
@@ -412,10 +406,10 @@ impl ModuleArtifact {
         self.load_and_cache(rt, store)
     }
 
-    fn load_and_cache(
+    fn load_and_cache<S: fetch::ModuleStore + 'static>(
         self,
         rt: &mut deno_core::JsRuntime,
-        store: Box<dyn fetch::ModuleStore>,
+        store: S,
     ) -> v8::Global<v8::Value> {
         let Self {
             cache_oid,
@@ -429,8 +423,13 @@ impl ModuleArtifact {
             .unwrap_or_else(|e| pgrx::error!("pg_typescript: invalid specifier: {e}"));
         let mut inline_modules = HashMap::new();
         inline_modules.insert(specifier.clone(), module_source);
-        let _ctx =
-            loader::set_loader_context_with_inline(cache_oid, import_map, store, inline_modules);
+        // Clone the import map only on cache miss (module load path).
+        let _ctx = loader::set_loader_context_with_inline(
+            cache_oid,
+            import_map.clone(),
+            Box::new(store),
+            inline_modules,
+        );
 
         let module_id = block_on(rt.load_side_es_module(&specifier_url))
             .unwrap_or_else(|e| report_module_load_error(e));
@@ -582,18 +581,21 @@ fn format_import_urls(values: &[String]) -> String {
     format!("[{}]", values.join(","))
 }
 
-fn enforce_import_map_cap(
+fn enforce_import_map_check<F>(
     import_map: &HashMap<String, String>,
-    max_imports: &ImportUrlCap,
+    check: F,
     requested_source: &str,
-) {
+    cap_source: &str,
+) where
+    F: Fn(&str) -> Result<bool, String>,
+{
     let mut requested: Vec<String> = import_map.values().cloned().collect();
     requested.sort();
     requested.dedup();
 
     let mut disallowed = Vec::new();
     for url in &requested {
-        match import_url_allowed(url, max_imports) {
+        match check(url) {
             Ok(true) => {}
             Ok(false) => disallowed.push(url.clone()),
             Err(e) => pgrx::error!("pg_typescript: {e}"),
@@ -602,70 +604,44 @@ fn enforce_import_map_cap(
 
     if !disallowed.is_empty() {
         pgrx::error!(
-            "pg_typescript: {requested_source} cannot be fulfilled by GUC typescript.max_imports: requested {} includes disallowed values {}",
+            "pg_typescript: {requested_source} cannot be fulfilled by {cap_source}: requested {} includes disallowed values {}",
             format_import_urls(&requested),
             format_import_urls(&disallowed),
         );
     }
 }
 
-fn enforce_import_map_permissions(
-    import_map: &HashMap<String, String>,
+fn enforce_and_finalize_import_map(
+    map: HashMap<String, String>,
     allow_import: Option<&[String]>,
-    requested_source: &str,
-) {
-    let mut requested: Vec<String> = import_map.values().cloned().collect();
-    requested.sort();
-    requested.dedup();
-
-    let mut disallowed = Vec::new();
-    for url in &requested {
-        match import_allowed(url, allow_import) {
-            Ok(true) => {}
-            Ok(false) => disallowed.push(url.clone()),
-            Err(e) => pgrx::error!("pg_typescript: {e}"),
-        }
-    }
-
-    if !disallowed.is_empty() {
-        pgrx::error!(
-            "pg_typescript: {requested_source} cannot be fulfilled by effective typescript.allow_import: requested {} includes disallowed values {}",
-            format_import_urls(&requested),
-            format_import_urls(&disallowed),
-        );
-    }
+    source: &str,
+) -> (HashMap<String, String>, ImportUrlCap) {
+    let max_imports = read_max_imports_cap();
+    enforce_import_map_check(&map, |url| import_allowed(url, allow_import), source, "effective typescript.allow_import");
+    enforce_import_map_check(&map, |url| import_url_allowed(url, &max_imports), source, "GUC typescript.max_imports");
+    (map, max_imports)
 }
 
-/// Read the `typescript.import_map` value from a function's proconfig and
-/// parse it into a specifier → URL map, enforcing `typescript.max_imports`.
 fn read_import_map(
     proc: &PgProc,
     allow_import: Option<&[String]>,
 ) -> (HashMap<String, String>, ImportUrlCap) {
-    let max_imports = read_max_imports_cap();
     let map = crate::IMPORT_MAP_GUC
         .parse_raw(
             read_function_config(proc, "typescript.import_map"),
             "function setting typescript.import_map",
         )
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
-    enforce_import_map_permissions(&map, allow_import, "function setting typescript.import_map");
-    enforce_import_map_cap(&map, &max_imports, "function setting typescript.import_map");
-    (map, max_imports)
+    enforce_and_finalize_import_map(map, allow_import, "function setting typescript.import_map")
 }
 
-/// Read the `typescript.import_map` GUC (set via `SET LOCAL typescript.import_map = '...'`)
-/// and parse it for use by DO blocks, enforcing `typescript.max_imports`.
 fn read_inline_import_map(
     allow_import: Option<&[String]>,
 ) -> (HashMap<String, String>, ImportUrlCap) {
-    let max_imports = read_max_imports_cap();
     let map = crate::IMPORT_MAP_GUC
         .parse_setting("GUC typescript.import_map")
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: {e}"));
-    enforce_import_map_permissions(&map, allow_import, "GUC typescript.import_map");
-    enforce_import_map_cap(&map, &max_imports, "GUC typescript.import_map");
-    (map, max_imports)
+    enforce_and_finalize_import_map(map, allow_import, "GUC typescript.import_map")
 }
 
 // ---------------------------------------------------------------------------

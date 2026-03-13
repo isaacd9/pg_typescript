@@ -80,38 +80,7 @@ deno_core::extension!(
     }
 );
 
-/// Run `f` with the per-connection runtime, initialising it on first use.
-pub fn with_runtime<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut JsRuntime) -> R,
-{
-    JS_RT.with(|cell| {
-        let mut borrow = cell.borrow_mut();
-        if borrow.is_none() {
-            *borrow = Some(create_runtime());
-        }
-        let worker = borrow.as_mut().unwrap();
-        f(&mut worker.js_runtime)
-    })
-}
-
-/// Eagerly initialize the per-connection runtime.
-///
-/// This is called from `_PG_init` in backend processes so first function
-/// execution does not pay runtime bootstrap latency.
-pub fn prewarm_runtime() {
-    with_runtime(|_| ());
-}
-
-/// Apply effective permissions to the runtime before module load/evaluation.
-pub fn set_runtime_permissions(rt: &mut JsRuntime, permissions: &RuntimePermissions) {
-    let container = build_permissions_container(permissions);
-    rt.op_state()
-        .borrow_mut()
-        .put::<PermissionsContainer>(container);
-}
-
-fn ensure_tokio_rt() {
+fn ensure_both_runtimes() {
     TOKIO_RT.with(|cell| {
         let mut borrow = cell.borrow_mut();
         if borrow.is_none() {
@@ -123,12 +92,46 @@ fn ensure_tokio_rt() {
             );
         }
     });
+    JS_RT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        if borrow.is_none() {
+            *borrow = Some(create_runtime());
+        }
+    });
+}
+
+/// Run `f` with the per-connection runtime, initialising it on first use.
+pub fn with_runtime<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut JsRuntime) -> R,
+{
+    ensure_both_runtimes();
+    JS_RT.with(|cell| {
+        let mut borrow = cell.borrow_mut();
+        let worker = borrow.as_mut().unwrap();
+        f(&mut worker.js_runtime)
+    })
+}
+
+/// Eagerly initialize the per-connection runtime.
+///
+/// This is called from `_PG_init` in backend processes so first function
+/// execution does not pay runtime bootstrap latency.
+pub fn prewarm_runtime() {
+    ensure_both_runtimes();
+}
+
+/// Apply effective permissions to the runtime before module load/evaluation.
+pub fn set_runtime_permissions(rt: &mut JsRuntime, permissions: &RuntimePermissions) {
+    let container = build_permissions_container(permissions);
+    rt.op_state()
+        .borrow_mut()
+        .put::<PermissionsContainer>(container);
 }
 
 /// Block the current thread on an async future, using a per-connection
 /// single-threaded Tokio runtime.
 pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    ensure_tokio_rt();
     TOKIO_RT.with(|cell| cell.borrow().as_ref().unwrap().block_on(future))
 }
 
@@ -140,7 +143,6 @@ pub fn with_tokio_context<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    ensure_tokio_rt();
     TOKIO_RT.with(|cell| {
         let borrow = cell.borrow();
         let _guard = borrow.as_ref().unwrap().enter();

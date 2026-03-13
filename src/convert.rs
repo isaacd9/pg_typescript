@@ -401,7 +401,7 @@ unsafe fn build_heap_tuple(
 }
 
 /// Call the type's output function to convert a datum to a string.
-unsafe fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String {
+pub(crate) unsafe fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String {
     let mut output_fn: pg_sys::Oid = pg_sys::InvalidOid;
     let mut is_varlena: bool = false;
     pg_sys::getTypeOutputInfo(type_oid, &mut output_fn, &mut is_varlena);
@@ -414,7 +414,7 @@ unsafe fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String 
 }
 
 /// Call the type's input function to parse a string into a Datum.
-fn input_fn_call(s: &str, type_oid: pg_sys::Oid) -> pg_sys::Datum {
+pub(crate) fn input_fn_call(s: &str, type_oid: pg_sys::Oid) -> pg_sys::Datum {
     unsafe {
         let mut input_fn: pg_sys::Oid = pg_sys::InvalidOid;
         let mut ioparam: pg_sys::Oid = pg_sys::InvalidOid;

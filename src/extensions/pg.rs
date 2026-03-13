@@ -10,6 +10,8 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use crate::convert::{input_fn_call, output_fn_call};
+
 const PG_HOOK_JS: &str = include_str!("../js/pg_hook.js");
 
 // `_pg.execute()` is guarded by two runtime-scoped bits of state:
@@ -580,35 +582,6 @@ impl Serialize for OwnedPgValue {
     }
 }
 
-// Look up the Postgres output function for `type_oid` and use it to turn a raw
-// Datum into its text form. This is the generic fallback path for result types
-// we do not decode into a richer JS value ourselves.
-fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String {
-    unsafe {
-        let mut output_fn: pg_sys::Oid = pg_sys::InvalidOid;
-        let mut is_varlena = false;
-        pg_sys::getTypeOutputInfo(type_oid, &mut output_fn, &mut is_varlena);
-        let cstr = pg_sys::OidOutputFunctionCall(output_fn, datum);
-        let result = CStr::from_ptr(cstr).to_string_lossy().into_owned();
-        pg_sys::pfree(cstr.cast());
-        result
-    }
-}
-
-// Look up the Postgres input function for `type_oid` and let Postgres parse the
-// provided text into the correct Datum representation. This keeps typed params
-// aligned with PostgreSQL's own type parsing rules instead of duplicating them
-// in Rust.
-fn input_fn_call(value: &str, type_oid: pg_sys::Oid) -> pg_sys::Datum {
-    unsafe {
-        let mut input_fn: pg_sys::Oid = pg_sys::InvalidOid;
-        let mut ioparam: pg_sys::Oid = pg_sys::InvalidOid;
-        pg_sys::getTypeInputInfo(type_oid, &mut input_fn, &mut ioparam);
-        let cstr = CString::new(value).expect("NUL byte in parameter text");
-        pg_sys::OidInputFunctionCall(input_fn, cstr.as_ptr().cast_mut(), ioparam, -1)
-    }
-}
-
 deno_core::extension!(
     pg_typescript_pg,
     ops = [op_pg_execute],
@@ -621,13 +594,18 @@ deno_core::extension!(
     },
 );
 
+struct PgApiInstalled;
+
 pub fn install_pg_api(rt: &mut JsRuntime) {
     rt.execute_script("pg_typescript:pg_hook", PG_HOOK_JS)
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to install _pg API: {e}"));
+    rt.op_state().borrow_mut().put(PgApiInstalled);
 }
 
 pub fn ensure_pg_api(rt: &mut JsRuntime) {
-    install_pg_api(rt);
+    if !rt.op_state().borrow().has::<PgApiInstalled>() {
+        install_pg_api(rt);
+    }
 }
 
 pub fn set_pg_execute_state(rt: &mut JsRuntime, pg_execute: PgExecuteState) {

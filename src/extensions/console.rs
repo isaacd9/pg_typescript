@@ -28,12 +28,17 @@ deno_core::extension!(
 
 const CONSOLE_HOOK_JS: &str = include_str!("../js/console_hook.js");
 
+struct ConsoleHookInstalled;
+
 pub fn install_console_hook(rt: &mut JsRuntime) {
     rt.execute_script("pg_typescript:console_hook", CONSOLE_HOOK_JS)
         .unwrap_or_else(|e| pgrx::error!("pg_typescript: failed to install console hook: {e}"));
+    rt.op_state().borrow_mut().put(ConsoleHookInstalled);
 }
 
-/// Re-apply the console hook in case runtime bootstrap code replaced console methods.
+/// Re-apply the console hook if not already installed.
 pub fn ensure_console_hook(rt: &mut JsRuntime) {
-    install_console_hook(rt);
+    if !rt.op_state().borrow().has::<ConsoleHookInstalled>() {
+        install_console_hook(rt);
+    }
 }
