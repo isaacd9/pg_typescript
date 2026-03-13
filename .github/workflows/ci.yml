@@ -205,3 +205,15 @@ jobs:
             - name: Run regress (pg${{ matrix.pg }})
               working-directory: pg_deno
               run: nix develop -c just regress "pg${{ matrix.pg }}"
+
+            - name: Package (pg${{ matrix.pg }})
+              working-directory: pg_deno
+              run: nix develop -c cargo pgrx package --no-default-features --features "pg${{ matrix.pg }}" --out-dir "dist/pg${{ matrix.pg }}"
+
+            - name: Upload package artifact (pg${{ matrix.pg }})
+              uses: actions/upload-artifact@v4
+              with:
+                  name: package-pg${{ matrix.pg }}-${{ matrix.arch }}
+                  path: pg_deno/dist/pg${{ matrix.pg }}
+                  if-no-files-found: error
+                  retention-days: 7
