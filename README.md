@@ -1,4 +1,5 @@
 # pg_typescript
+[![CI](https://github.com/isaacd9/pg_typescript/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacd9/pg_typescript/actions/workflows/ci.yml)
 
 This is a postgres extension, built with `pgrx` in Rust that allows users to
 run TypeScript functions in PostgreSQL via Deno/V8.
@@ -18,7 +19,10 @@ again.
 
 ## Project Status
 This is *alpha* software that you probably shouldn't use in production yet. That
-said, the integration tests are comprehensive and the basic functionality works end to end and appears to have attractive performance.
+said, the integration tests are comprehensive and the basic functionality works
+end to end and appears to have attractive performance.
+
+Eventually, releases will be tagged and published on GitHub releases.
 
 ## Architecture
 This extension creates a Deno runtime on `_PG_init()` backend, and then reuses
