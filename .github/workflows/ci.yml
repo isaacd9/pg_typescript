@@ -214,12 +214,52 @@ jobs:
 
             - name: Package (pg${{ matrix.pg }})
               working-directory: pg_deno
-              run: nix develop -c cargo pgrx package --no-default-features --features "pg${{ matrix.pg }}" --out-dir "dist/pg${{ matrix.pg }}"
+              run: |
+                  nix develop -c bash -euo pipefail -c '
+                    pg_config="$(cargo pgrx info pg-config ${{ matrix.pg }})"
+                    cargo pgrx package \
+                      --pg-config "$pg_config" \
+                      --no-default-features \
+                      --features "pg${{ matrix.pg }}" \
+                      --out-dir "dist/pg${{ matrix.pg }}"
+                  '
+
+            - name: Bundle package tarball (pg${{ matrix.pg }})
+              working-directory: pg_deno
+              run: |
+                  set -euo pipefail
+
+                  version="$(grep "^default_version = " pg_typescript.control | cut -d"'" -f2)"
+                  if [ -z "$version" ]; then
+                    echo "failed to determine extension version from pg_typescript.control" >&2
+                    exit 1
+                  fi
+
+                  package_root="dist/pg${{ matrix.pg }}"
+                  artifact_root="dist/pg_typescript-${version}-pg${{ matrix.pg }}-linux-${{ matrix.arch }}"
+                  tarball="dist/package-pg${{ matrix.pg }}-${{ matrix.arch }}.tar.gz"
+
+                  libdir="$(find "$package_root" -type d -path '*/lib/postgresql' | head -n 1)"
+                  extdir="$(find "$package_root" -type d -path '*/share/postgresql/extension' | head -n 1)"
+
+                  if [ -z "$libdir" ] || [ -z "$extdir" ]; then
+                    echo "failed to locate packaged extension directories under $package_root" >&2
+                    find "$package_root" -maxdepth 8 -print >&2 || true
+                    exit 1
+                  fi
+
+                  rm -rf "$artifact_root"
+                  mkdir -p "$artifact_root/lib/postgresql" "$artifact_root/share/postgresql/extension"
+
+                  cp -a "$libdir/." "$artifact_root/lib/postgresql/"
+                  cp -a "$extdir/." "$artifact_root/share/postgresql/extension/"
+
+                  tar -C dist -czf "$tarball" "$(basename "$artifact_root")"
 
             - name: Upload package artifact (pg${{ matrix.pg }})
               uses: actions/upload-artifact@v4
               with:
                   name: package-pg${{ matrix.pg }}-${{ matrix.arch }}
-                  path: pg_deno/dist/pg${{ matrix.pg }}
+                  path: pg_deno/dist/package-pg${{ matrix.pg }}-${{ matrix.arch }}.tar.gz
                   if-no-files-found: error
                   retention-days: 7
