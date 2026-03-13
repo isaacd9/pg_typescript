@@ -17,6 +17,7 @@ use crate::extensions::pg::{
 use crate::fetch;
 use crate::guc::{import_url_allowed, GucParser, ImportUrlCap};
 use crate::loader;
+use crate::module_store;
 use crate::permissions::{
     import_allowed, read_function_config, read_function_permissions, read_function_pg_execute,
     read_inline_permissions, read_inline_pg_execute,
@@ -139,7 +140,7 @@ pub unsafe extern "C-unwind" fn typescript_validator(
         fetch::fetch_and_cache(
             u32::from(fn_oid),
             &import_map,
-            &mut fetch::PgModuleStore,
+            &mut module_store::PgModuleStore,
             &fetch::UreqFetcher,
             &_max_imports,
         )
@@ -198,7 +199,7 @@ pub unsafe extern "C-unwind" fn typescript_inline_handler(
             fetch::fetch_and_cache(
                 DO_BLOCK_OID,
                 &import_map,
-                &mut fetch::PgModuleStore,
+                &mut module_store::PgModuleStore,
                 &fetch::UreqFetcher,
                 &_max_imports,
             )
@@ -271,28 +272,28 @@ fn build_param_names(arg_names: &[Option<String>], nargs: usize) -> Vec<String> 
 }
 
 /// Return a module store appropriate for the current build target.
-fn make_module_store() -> impl fetch::ModuleStore {
+fn make_module_store() -> impl module_store::ModuleStore {
     #[cfg(any(not(test), feature = "pg_test"))]
     {
-        fetch::PgModuleStore
+        module_store::PgModuleStore
     }
     #[cfg(all(test, not(feature = "pg_test")))]
     {
-        fetch::HashMapModuleStore::new()
+        module_store::HashMapModuleStore::new()
     }
 }
 
 struct ExecutionConfig {
     permissions: RuntimePermissions,
     allow_pg_execute: bool,
-    store: Box<dyn fetch::ModuleStore>,
+    store: Box<dyn module_store::ModuleStore>,
 }
 
 impl ExecutionConfig {
     fn new(
         permissions: RuntimePermissions,
         allow_pg_execute: bool,
-        store: impl fetch::ModuleStore + 'static,
+        store: impl module_store::ModuleStore + 'static,
     ) -> Self {
         Self {
             permissions,
@@ -402,7 +403,7 @@ impl ModuleArtifact {
         self,
         rt: &mut deno_core::JsRuntime,
         loader: &loader::PgModuleLoader,
-        store: Box<dyn fetch::ModuleStore>,
+        store: Box<dyn module_store::ModuleStore>,
     ) -> v8::Global<v8::Value> {
         if let Some(f) =
             FN_CACHE.with(|c| c.borrow().get(&(self.cache_oid, self.source_hash)).cloned())
@@ -417,7 +418,7 @@ impl ModuleArtifact {
         self,
         rt: &mut deno_core::JsRuntime,
         loader: &loader::PgModuleLoader,
-        store: Box<dyn fetch::ModuleStore>,
+        store: Box<dyn module_store::ModuleStore>,
     ) -> v8::Global<v8::Value> {
         let Self {
             cache_oid,
@@ -676,7 +677,7 @@ fn read_inline_import_map(
 
 #[cfg(all(test, not(feature = "pg_test")))]
 mod unit_tests {
-    use crate::fetch::ModuleStore;
+    use crate::module_store::ModuleStore;
     use pgrx::FromDatum;
     use serde_json::{json, Value};
 
@@ -702,7 +703,7 @@ mod unit_tests {
         args: &[Value],
         import_map: std::collections::HashMap<String, String>,
         permissions: super::RuntimePermissions,
-        store: crate::fetch::HashMapModuleStore,
+        store: crate::module_store::HashMapModuleStore,
     ) -> (Value, bool) {
         let param_names: Vec<String> = params.iter().map(|s| s.to_string()).collect();
         let fn_oid = pgrx::pg_sys::Oid::from(0u32);
@@ -729,7 +730,7 @@ mod unit_tests {
             args,
             Default::default(),
             super::RuntimePermissions::default(),
-            crate::fetch::HashMapModuleStore::new(),
+            crate::module_store::HashMapModuleStore::new(),
         )
     }
 
@@ -746,7 +747,7 @@ mod unit_tests {
             args,
             Default::default(),
             permissions,
-            crate::fetch::HashMapModuleStore::new(),
+            crate::module_store::HashMapModuleStore::new(),
         )
     }
 
@@ -771,7 +772,7 @@ mod unit_tests {
             super::ExecutionConfig::new(
                 super::RuntimePermissions::default(),
                 false,
-                crate::fetch::HashMapModuleStore::new(),
+                crate::module_store::HashMapModuleStore::new(),
             ),
             &args,
             crate::convert::PgDatumSeed { oid: ret_oid },
@@ -801,7 +802,7 @@ mod unit_tests {
             fn $name() {
                 let args: Vec<Value> = vec![$($a),*];
                 let import_map = crate::fetch::make_import_map(&[$(($spec, $url)),*]);
-                let mut store = crate::fetch::HashMapModuleStore::new();
+                let mut store = crate::module_store::HashMapModuleStore::new();
                 $( store.write(0, $murl, $msrc); )*
                 let (val, is_null) = run_impl(
                     $src,
@@ -849,7 +850,7 @@ mod unit_tests {
             loader.with_context(
                 0,
                 Default::default(),
-                Box::new(crate::fetch::HashMapModuleStore::new()),
+                Box::new(crate::module_store::HashMapModuleStore::new()),
                 HashMap::new(),
                 || block_on(rt.load_side_es_module_from_code(&specifier, module_source)),
             )
@@ -923,14 +924,14 @@ mod unit_tests {
         artifact.execute_void(super::ExecutionConfig::new(
             super::RuntimePermissions::default(),
             false,
-            crate::fetch::HashMapModuleStore::new(),
+            crate::module_store::HashMapModuleStore::new(),
         ));
     }
 
     #[test]
     fn inline_block_with_module() {
         let import_map = crate::fetch::make_import_map(&[("math", "https://esm.sh/math@1")]);
-        let mut store = crate::fetch::HashMapModuleStore::new();
+        let mut store = crate::module_store::HashMapModuleStore::new();
         store.write(
             0,
             "https://esm.sh/math@1",
