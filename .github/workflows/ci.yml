@@ -206,6 +206,12 @@ jobs:
               working-directory: pg_deno
               run: nix develop -c just regress "pg${{ matrix.pg }}"
 
+            - name: Stamp package version (pg${{ matrix.pg }})
+              working-directory: pg_deno
+              run: |
+                  version="v0.0.1-${GITHUB_SHA}"
+                  sed -i "s/^default_version = .*/default_version = '${version}'/" pg_typescript.control
+
             - name: Package (pg${{ matrix.pg }})
               working-directory: pg_deno
               run: nix develop -c cargo pgrx package --no-default-features --features "pg${{ matrix.pg }}" --out-dir "dist/pg${{ matrix.pg }}"
