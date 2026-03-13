@@ -25,6 +25,16 @@ profile pg_version="pg18":
   cargo pgrx install --features "{{pg_version}}" --no-default-features --release
   cargo pgrx connect {{pg_version}} < tests/profiling/setup_vs_exec.sql
 
+# Profile a more realistic _pg.execute + JSON shaping workload.
+# Example: just profile-pg-execute pg18
+profile-pg-execute pg_version="pg18":
+  #!/usr/bin/env bash
+  set -euo pipefail
+  cd "{{justfile_directory()}}"
+  cargo pgrx start {{pg_version}}
+  cargo pgrx install --features "{{pg_version}}" --no-default-features --release
+  cargo pgrx connect {{pg_version}} < tests/profiling/pg_execute_workload.sql
+
 # Start PostgREST against the local pgrx Postgres instance.
 # Example: just postgrest
 postgrest pg_version="pg18" api_port="3000" db_name="postgrest_demo":
