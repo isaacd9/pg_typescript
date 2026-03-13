@@ -11,30 +11,64 @@ sandbox function execution, and only allow the features that a user or
 administrator has explicitly granted. Both regular and `async` functions are
 supported, and types in PostgreSQL are mapped to TypeScript types.
 
-Imports are resolved via Deno's module resolution mechanism, but must be
-imported from a URL, like esm.sh or a GitHub raw URL. When a function is
-created, these imports are cached inside a PostgreSQL table, and subsequent
-calls to the function will use the cached imports rather than resolving them
+Imports are resolved via Deno's module resolution mechanism. Function bodies use
+bare specifiers declared in a Deno-style import map, and those specifiers map
+to `http(s)` URLs such as esm.sh or a GitHub raw URL. When a function is
+created, those imports are cached inside a PostgreSQL table, and subsequent
+calls to the function will use the cached modules rather than resolving them
 again.
 
 ## Project Status
-This is *alpha* software that you probably shouldn't use in production yet. That
+This is **alpha** quality software that you probably shouldn't use in production yet. That
 said, the integration tests are comprehensive and the basic functionality works
 end to end and appears to have attractive performance.
 
 Eventually, releases will be tagged and published on GitHub releases.
 
-## Architecture
-This extension creates a Deno runtime on `_PG_init()` backend, and then reuses
-that runtime for subsequent calls. The effect of this, and the Postgres
-one-process-per-backend model, is that the runtime (and `tokio` runtime) is
-local to a given backend and can be `thread_local`.
+## Run
 
-When a function is called, we read source code, from the PostgreSQL invocation,
-and then inject it into the Deno runtime. The source code is evaluated in the
-context of the Deno runtime, and loads modules on-demand from PostgreSQL via
-the `pg` module. A per-backend cache stores the compiled module source code,
-so that subsequent calls to the same function do not need to recompile it.
+With Postgres 18:
+```bash
+cargo pgrx run pg18
+```
+
+```sql
+CREATE EXTENSION pg_typescript;
+
+CREATE FUNCTION add(a int, b int) RETURNS int LANGUAGE typescript AS $$
+  return a + b;
+$$;
+
+SELECT add(1, 2);
+```
+
+## Test
+
+Postgres extension tests:
+
+```bash
+cargo pgrx test pg18
+```
+
+Regression tests:
+```bash
+just regress
+```
+
+## Architecture
+PostgreSQL uses one process per backend connection. This extension keeps both
+the Deno runtime and the `tokio` runtime local to that backend and stores them
+in `thread_local` state. When the extension library is loaded in a backend
+process, `_PG_init()` prewarms the Deno runtime; subsequent calls in that same
+backend reuse it.
+
+When a function is called, we read the function source from PostgreSQL, wrap it
+in a synthetic module, and evaluate it inside the shared backend-local runtime.
+Imported module source is fetched ahead of time and stored in a PostgreSQL
+table, and the runtime loader reads from that store during module evaluation.
+A separate per-backend cache stores the compiled default export handle for each
+loaded function so repeated calls do not need to reload and reevaluate the
+module.
 
 Permissions are managed by PostgreSQL GUCs (configuration variables), and can be
 enforced either on the function call level or by a Superuser with a "maximum"
@@ -46,8 +80,9 @@ use to call into PostgreSQL. This provides a function, `execute`, that can be
 used to execute a PostgreSQL query and return the results mapped back into a JavaScript
 object.
 
-The types for this can be found in `packages/types`. Execution can be enabled or disabled
-globally via the `typescript.import_map` GUC.
+The types for this can be found in `packages/types`. Execution can be enabled
+for a function or `DO` block via `typescript.allow_pg_execute`, subject to the
+superuser cap `typescript.max_allow_pg_execute`.
 
 ## GUC Configuration
 
@@ -58,9 +93,11 @@ request. Permission-list GUCs accept `off|none|deny|false`, `*|all|on|true`, or
 a comma-separated allowlist. `typescript.import_map` expects an [import
 map JSON](https://deno.land/manual/typescript/import_maps).
 
-The keys in the import map JSON are module specifiers are used as the module
-name in the JavaScript code, and so they must be valid module specifiers. See
-the `examples/` directory for examples of imports.
+Top-level imports in function bodies must be declared in `typescript.import_map`.
+Import-map keys are used as JavaScript identifiers in generated `import * as ...`
+statements, so they must be valid JS identifiers such as `lodash` or `_internal`,
+not arbitrary package specifiers like `my-pkg`. See the `examples/` directory
+for examples of imports.
 
 | GUC | Settable By | Default | Purpose |
 | --- | --- | --- | --- |
@@ -130,34 +167,4 @@ does not keep linking an older copied archive from `target/`.
 ```bash
 $ cargo clean
 $ cargo build
-```
-
-## Run
-
-With Postgres 18:
-```bash
-cargo pgrx run pg18
-```
-
-```sql
-CREATE EXTENSION pg_typescript;
-
-CREATE FUNCTION add(a int, b int) RETURNS int LANGUAGE typescript AS $$
-  return a + b;
-$$;
-
-SELECT add(1, 2);
-```
-
-## Test
-
-Unit tests:
-
-```bash
-cargo pgrx test pg18
-```
-
-Regression tests:
-```bash
-just regress
 ```
