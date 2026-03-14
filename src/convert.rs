@@ -46,6 +46,9 @@ impl Serialize for PgDatum {
                         .unwrap_or(Value::Null);
                     v.serialize(s)
                 }
+                oid if classify_oid(oid) == OidCategory::Composite => {
+                    serialize_composite(self.datum, s)
+                }
                 _ => {
                     let text = output_fn_call(self.datum, self.oid);
                     s.serialize_str(&text)
@@ -358,6 +361,7 @@ fn classify_oid(oid: pg_sys::Oid) -> OidCategory {
         | pg_sys::NAMEOID
         | pg_sys::JSONOID
         | pg_sys::JSONBOID => OidCategory::Scalar,
+        pg_sys::RECORDOID => OidCategory::Composite,
         oid if unsafe { (pg_sys::get_typtype(oid) as u8) == b'c' } => OidCategory::Composite,
         _ => OidCategory::Other,
     }
@@ -417,9 +421,7 @@ impl<'de> DeserializeSeed<'de> for ReturnSeed {
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
         match self {
             Self::Oid(s) => s.deserialize(deserializer),
-            Self::Record(tupdesc) => {
-                deserializer.deserialize_any(RecordDatumVisitor { tupdesc })
-            }
+            Self::Record(tupdesc) => deserializer.deserialize_any(RecordDatumVisitor { tupdesc }),
         }
     }
 }
@@ -484,6 +486,56 @@ unsafe fn build_heap_tuple_from_tupdesc(
 
     let tuple = pg_sys::heap_form_tuple(tupdesc, datums.as_mut_ptr(), nulls.as_mut_ptr());
     Ok(pg_sys::Datum::from((*tuple).t_data as usize))
+}
+
+/// Serialize a composite or record datum as a JS object (map of field name →
+/// value).  Works for both named composite types and anonymous RECORD values
+/// by extracting the tuple descriptor from the datum header.
+unsafe fn serialize_composite<S: serde::Serializer>(
+    datum: pg_sys::Datum,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+
+    // Composite datums may have a short varlena header (e.g. when stored as a
+    // field inside another tuple).  Detoast first to get a proper pointer.
+    let td = pg_sys::pg_detoast_datum(datum.cast_mut_ptr::<pg_sys::varlena>())
+        as pg_sys::HeapTupleHeader;
+    let typid = pg_sys::HeapTupleHeaderGetTypeId(td);
+    let typmod = pg_sys::HeapTupleHeaderGetTypMod(td);
+    let tupdesc = pg_sys::lookup_rowtype_tupdesc(typid, typmod);
+    let natts = (*tupdesc).natts as usize;
+
+    // Build a stack HeapTupleData so we can call heap_deform_tuple.
+    let mut tuple_data: pg_sys::HeapTupleData = std::mem::zeroed();
+    tuple_data.t_len = pg_sys::HeapTupleHeaderGetDatumLength(td);
+    tuple_data.t_data = td;
+
+    let mut values = vec![pg_sys::Datum::from(0usize); natts];
+    let mut nulls = vec![false; natts];
+    pg_sys::heap_deform_tuple(
+        &mut tuple_data,
+        tupdesc,
+        values.as_mut_ptr(),
+        nulls.as_mut_ptr(),
+    );
+
+    let mut map = s.serialize_map(Some(natts))?;
+    for i in 0..natts {
+        let attr = &*pg_sys::TupleDescAttr(tupdesc, i as i32);
+        if attr.attisdropped {
+            continue;
+        }
+        let field = PgDatum {
+            datum: values[i],
+            isnull: nulls[i],
+            oid: attr.atttypid,
+        };
+        map.serialize_entry(attr.name(), &field)?;
+    }
+
+    pg_sys::DecrTupleDescRefCount(tupdesc);
+    map.end()
 }
 
 /// Call the type's output function to convert a datum to a string.

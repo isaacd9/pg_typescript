@@ -1,4 +1,4 @@
--- composite type returns from TypeScript functions
+-- composite and record type support
 
 CREATE TYPE ts_point AS (x float8, y float8);
 
@@ -171,3 +171,129 @@ EXECUTE FUNCTION ts_trigger_after_insert();
 INSERT INTO ts_trigger_notes (body) VALUES ('apple banana apple cherry apple');
 
 SELECT note_id, word_count, top_word FROM ts_trigger_results;
+
+-- =========================================================================
+-- Composite inputs — named types arrive as JS objects
+-- =========================================================================
+
+-- named composite input
+CREATE OR REPLACE FUNCTION ts_point_magnitude(p ts_point) RETURNS float8
+LANGUAGE typescript AS $$
+  return Math.sqrt(p.x * p.x + p.y * p.y);
+$$;
+
+SELECT ts_point_magnitude(ROW(3.0, 4.0)::ts_point);
+
+-- access fields of a named composite input
+CREATE OR REPLACE FUNCTION ts_greet_person(p ts_person) RETURNS text
+LANGUAGE typescript AS $$
+  return `${p.name} is ${p.age} years old`;
+$$;
+
+SELECT ts_greet_person(ROW('Bob', 25, true)::ts_person);
+
+-- null composite input
+CREATE OR REPLACE FUNCTION ts_point_or_default(p ts_point) RETURNS float8
+LANGUAGE typescript AS $$
+  if (p === null) return -1;
+  return p.x + p.y;
+$$;
+
+SELECT ts_point_or_default(NULL::ts_point);
+SELECT ts_point_or_default(ROW(1.0, 2.0)::ts_point);
+
+-- nested composite input
+CREATE OR REPLACE FUNCTION ts_contact_city(c ts_contact) RETURNS text
+LANGUAGE typescript AS $$
+  return c.addr.city;
+$$;
+
+SELECT ts_contact_city(ROW('Eve', 28, ROW('123 Main St', 'Portland')::ts_address)::ts_contact);
+
+-- composite input with null fields
+CREATE OR REPLACE FUNCTION ts_person_status(p ts_person) RETURNS text
+LANGUAGE typescript AS $$
+  const age = p.age === null ? "unknown age" : `age ${p.age}`;
+  const status = p.active ? "active" : "inactive";
+  return `${p.name}: ${age}, ${status}`;
+$$;
+
+SELECT ts_person_status(ROW('Alice', NULL, false)::ts_person);
+
+-- multiple composite inputs
+CREATE OR REPLACE FUNCTION ts_point_distance(a ts_point, b ts_point) RETURNS float8
+LANGUAGE typescript AS $$
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  return Math.sqrt(dx * dx + dy * dy);
+$$;
+
+SELECT ts_point_distance(ROW(0.0, 0.0)::ts_point, ROW(3.0, 4.0)::ts_point);
+
+-- composite input and composite output
+CREATE OR REPLACE FUNCTION ts_scale_point(p ts_point, factor float8) RETURNS ts_point
+LANGUAGE typescript AS $$
+  return { x: p.x * factor, y: p.y * factor };
+$$;
+
+SELECT (ts_scale_point(ROW(3.0, 4.0)::ts_point, 2.0)).*;
+
+-- =========================================================================
+-- RETURNS RECORD — anonymous composite via OUT params or caller AS clause
+-- =========================================================================
+
+-- OUT parameters
+CREATE OR REPLACE FUNCTION ts_record_out(
+  IN x int, OUT a int, OUT b text
+) RETURNS RECORD
+LANGUAGE typescript AS $$
+  return { a: x * 2, b: "hello" };
+$$;
+
+SELECT * FROM ts_record_out(21);
+
+-- caller-side AS clause
+CREATE OR REPLACE FUNCTION ts_record_anon(x int) RETURNS RECORD
+LANGUAGE typescript AS $$
+  return { name: "Alice", age: x };
+$$;
+
+SELECT * FROM ts_record_anon(30) AS (name text, age int);
+
+-- NULL return from RECORD function
+CREATE OR REPLACE FUNCTION ts_record_null() RETURNS RECORD
+LANGUAGE typescript AS $$
+  return null;
+$$;
+
+SELECT * FROM ts_record_null() AS (a int, b text);
+
+-- missing fields become NULL
+CREATE OR REPLACE FUNCTION ts_record_partial(x int)
+  RETURNS RECORD
+LANGUAGE typescript AS $$
+  return { a: x };
+$$;
+
+SELECT * FROM ts_record_partial(42) AS (a int, b text, c bool);
+
+-- multiple OUT parameters with mixed types
+CREATE OR REPLACE FUNCTION ts_record_multi_out(
+  IN val float8,
+  OUT doubled float8,
+  OUT label text,
+  OUT flag bool
+) RETURNS RECORD
+LANGUAGE typescript AS $$
+  return { doubled: val * 2, label: "result", flag: val > 0 };
+$$;
+
+SELECT * FROM ts_record_multi_out(3.14);
+
+-- anonymous RECORD input (columns are named f1, f2, … by default)
+CREATE OR REPLACE FUNCTION ts_record_sum(r record) RETURNS int
+LANGUAGE typescript AS $$
+  return r.f1 + r.f2;
+$$;
+
+SELECT ts_record_sum(ROW(10, 32));
