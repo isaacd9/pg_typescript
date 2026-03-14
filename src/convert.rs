@@ -400,6 +400,92 @@ unsafe fn build_heap_tuple(
     Ok(pg_sys::Datum::from((*tuple).t_data as usize))
 }
 
+// ---------------------------------------------------------------------------
+// DeserializeSeed for RETURNS RECORD (anonymous composite via TupleDesc)
+// ---------------------------------------------------------------------------
+
+/// Unified seed for return-value deserialization.  Wraps either a simple OID
+/// (named type) or a pre-resolved [`TupleDesc`] (RETURNS RECORD).
+pub enum ReturnSeed {
+    Oid(PgDatumSeed),
+    Record(pg_sys::TupleDesc),
+}
+
+impl<'de> DeserializeSeed<'de> for ReturnSeed {
+    type Value = (pg_sys::Datum, bool);
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        match self {
+            Self::Oid(s) => s.deserialize(deserializer),
+            Self::Record(tupdesc) => {
+                deserializer.deserialize_any(RecordDatumVisitor { tupdesc })
+            }
+        }
+    }
+}
+
+struct RecordDatumVisitor {
+    tupdesc: pg_sys::TupleDesc,
+}
+
+impl<'de> Visitor<'de> for RecordDatumVisitor {
+    type Value = (pg_sys::Datum, bool);
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "a JS object convertible to a Postgres RECORD")
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok((pg_sys::Datum::from(0usize), true))
+    }
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok((pg_sys::Datum::from(0usize), true))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        let value = Value::deserialize(serde::de::value::MapAccessDeserializer::new(map))?;
+        match value {
+            Value::Object(obj) => unsafe { build_heap_tuple_from_tupdesc(obj, self.tupdesc) }
+                .map(|d| (d, false))
+                .map_err(A::Error::custom),
+            _ => Err(A::Error::custom(
+                "pg_typescript: RECORD return type requires a JS object",
+            )),
+        }
+    }
+}
+
+/// Build a composite (row) datum from a JSON object using a pre-resolved
+/// [`TupleDesc`].  The descriptor must already be blessed (via
+/// `BlessTupleDesc`).
+unsafe fn build_heap_tuple_from_tupdesc(
+    obj: serde_json::Map<String, Value>,
+    tupdesc: pg_sys::TupleDesc,
+) -> Result<pg_sys::Datum, String> {
+    let natts = (*tupdesc).natts as usize;
+
+    let mut datums = vec![pg_sys::Datum::from(0usize); natts];
+    let mut nulls = vec![true; natts];
+
+    for i in 0..natts {
+        let attr = &*pg_sys::TupleDescAttr(tupdesc, i as i32);
+        if attr.attisdropped {
+            continue;
+        }
+
+        if let Some(field_val) = obj.get(attr.name()) {
+            let (datum, isnull) = PgDatumSeed { oid: attr.atttypid }
+                .deserialize(field_val.clone())
+                .map_err(|e: serde_json::Error| e.to_string())?;
+            datums[i] = datum;
+            nulls[i] = isnull;
+        }
+    }
+
+    let tuple = pg_sys::heap_form_tuple(tupdesc, datums.as_mut_ptr(), nulls.as_mut_ptr());
+    Ok(pg_sys::Datum::from((*tuple).t_data as usize))
+}
+
 /// Call the type's output function to convert a datum to a string.
 unsafe fn output_fn_call(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> String {
     let mut output_fn: pg_sys::Oid = pg_sys::InvalidOid;

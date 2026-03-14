@@ -9,7 +9,7 @@ use pgrx::pg_catalog::pg_proc::PgProc;
 use pgrx::prelude::*;
 use pgrx::{fcinfo, pg_sys};
 
-use crate::convert::{PgDatum, PgDatumSeed, VoidSeed};
+use crate::convert::{PgDatum, PgDatumSeed, ReturnSeed, VoidSeed};
 use crate::extensions::console::ensure_console_hook;
 use crate::extensions::pg::{
     ensure_pg_api, set_pg_execute_state, with_pg_execute_allowed, PgExecuteState,
@@ -96,10 +96,26 @@ pub unsafe extern "C-unwind" fn typescript_call_handler(
         specifier_prefix: "fn",
     }
     .prepare();
+
+    // For RETURNS RECORD the tuple descriptor comes from the call site (OUT
+    // parameters or caller-side AS clause), not from a named composite type.
+    let seed = if ret_type == pg_sys::RECORDOID {
+        let mut result_tupdesc: pg_sys::TupleDesc = std::ptr::null_mut();
+        unsafe {
+            pg_sys::get_call_result_type(fcinfo, std::ptr::null_mut(), &mut result_tupdesc);
+        }
+        if result_tupdesc.is_null() {
+            pgrx::error!("pg_typescript: could not determine result type for RETURNS RECORD function");
+        }
+        ReturnSeed::Record(unsafe { pg_sys::BlessTupleDesc(result_tupdesc) })
+    } else {
+        ReturnSeed::Oid(PgDatumSeed { oid: ret_type })
+    };
+
     let (datum, is_null) = artifact.execute(
         ExecutionConfig::new(permissions, allow_pg_execute, make_module_store()),
         &args,
-        PgDatumSeed { oid: ret_type },
+        seed,
     );
 
     if is_null {
@@ -677,6 +693,8 @@ fn read_inline_import_map(
 
 #[cfg(all(test, not(feature = "pg_test")))]
 mod unit_tests {
+    use std::collections::HashMap;
+
     use crate::module_store::ModuleStore;
     use pgrx::FromDatum;
     use serde_json::{json, Value};
