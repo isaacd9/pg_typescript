@@ -18,6 +18,7 @@ Cargo.lock
 
 # pgrx test artifacts
 tests/pg_regress/results/
+tests/pg_regress/sh
 tests/pg_regress/regression.diffs
 tests/pg_regress/regression.out
 .rusty_v8-prebuilt/

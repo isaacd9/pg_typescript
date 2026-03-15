@@ -75,6 +75,7 @@ SELECT ts_perm_stmt_fails_with($sql$
   $do$ LANGUAGE typescript;
 $sql$, 'cannot be fulfilled by') AS inline_rejects_unfulfillable_request;
 RESET typescript.allow_net;
+RESET typescript.max_allow_env;
 
 SELECT ts_perm_env_path_only('PATH') = true AS env_exec_allows_when_fulfillable;
 
@@ -121,6 +122,7 @@ $sql$, 'typescript.allow_import') AS import_map_create_rejects_explicit_deny;
 
 CREATE OR REPLACE FUNCTION ts_perm_import_allowed(name text) RETURNS text
 LANGUAGE typescript
+SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
 AS $$
   return lodash.capitalize(name);

@@ -133,6 +133,9 @@
 
               shellHook = ''
                 if [ "$(uname -s)" = "Darwin" ]; then
+                  # pg_regress uses execl("sh", ...) without PATH lookup; ensure
+                  # a symlink exists in the test directory so it finds the shell.
+                  ln -sfn "$(which sh)" tests/pg_regress/sh
                   export RUSTY_V8_MIRROR="https://github.com/denoland/rusty_v8/releases/download"
                   # Help `cargo pgrx init` find Nix-provided headers (readline, icu, etc.)
                   # when it builds PostgreSQL from source.

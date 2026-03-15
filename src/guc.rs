@@ -7,23 +7,30 @@ use serde_json::Value;
 
 pub(crate) struct StringGuc {
     inner: GucSetting<Option<CString>>,
+    boot: Option<&'static CStr>,
 }
 
 impl StringGuc {
     pub(crate) const fn new() -> Self {
         Self {
             inner: GucSetting::<Option<CString>>::new(None),
+            boot: None,
         }
     }
 
     pub(crate) const fn with_default(value: &'static CStr) -> Self {
         Self {
             inner: GucSetting::<Option<CString>>::new(Some(value)),
+            boot: Some(value),
         }
     }
 
     fn get(&self) -> Option<CString> {
         self.inner.get()
+    }
+
+    pub(crate) fn boot_value(&self) -> Option<&'static CStr> {
+        self.boot
     }
 }
 
@@ -54,7 +61,10 @@ pub(crate) trait GucParser {
     fn parse_raw(&self, raw: Option<String>, source: &str) -> Result<Self::Output, String> {
         match normalize_raw(raw) {
             Some(value) => self.parse_nonempty(&value, source),
-            None => Ok(self.default_value()),
+            None => match self.inner().boot_value() {
+                Some(boot) => self.parse_nonempty(boot.to_str().unwrap_or(""), source),
+                None => Ok(self.default_value()),
+            },
         }
     }
 }
