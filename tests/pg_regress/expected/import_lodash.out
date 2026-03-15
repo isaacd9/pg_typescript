@@ -1,5 +1,4 @@
 -- very simple import-map test with lodash from esm.sh
-SET typescript.max_allow_import = 'esm.sh';
 CREATE OR REPLACE FUNCTION ts_lodash_capitalize(name text) RETURNS text
 LANGUAGE typescript
 SET typescript.allow_import = 'esm.sh'
@@ -56,4 +55,3 @@ SELECT ts_lodash_chain(NULL) = '[]'::jsonb AS null_ok;
  t
 (1 row)
 
-RESET typescript.max_allow_import;

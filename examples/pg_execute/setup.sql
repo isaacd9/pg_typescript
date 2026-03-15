@@ -54,8 +54,6 @@ INSERT INTO public.project_notes (project_id, body) VALUES
 -- literal for the CREATE FUNCTION body.
 \set read_two_tables_body `cat examples/pg_execute/read_two_tables.ts`
 
-SET typescript.max_allow_pg_execute = 'on';
-
 CREATE OR REPLACE FUNCTION public.read_two_tables(user_id integer)
 RETURNS jsonb
 LANGUAGE typescript
@@ -64,4 +62,3 @@ AS :'read_two_tables_body';
 
 SELECT jsonb_pretty(public.read_two_tables(1));
 
-RESET typescript.max_allow_pg_execute;

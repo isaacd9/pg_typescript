@@ -13,8 +13,6 @@ CREATE TABLE ts_pg_execute_logs (
   message text NOT NULL
 );
 
-SET typescript.max_allow_pg_execute = 'on';
-
 CREATE OR REPLACE FUNCTION ts_pg_execute_select(user_id int) RETURNS bool
 LANGUAGE typescript
 SET typescript.allow_pg_execute = 'on'
@@ -260,4 +258,3 @@ $$;
 
 SELECT ts_pg_execute_insert_checks() AS insert_checks_ok;
 
-RESET typescript.max_allow_pg_execute;

@@ -56,25 +56,18 @@ pub(crate) static ALLOW_PG_EXECUTE_GUC: BoolGucParser = BoolGucParser::new();
 
 /// Superuser caps for each permission. `allow_*` requests must be fully
 /// satisfiable by `max_allow_*`; otherwise execution fails with an error.
-/// Default for each `max_allow_*` GUC: unset (`None`), treated as deny.
-pub(crate) static MAX_ALLOW_READ_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
-pub(crate) static MAX_ALLOW_WRITE_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
-pub(crate) static MAX_ALLOW_NET_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
-pub(crate) static MAX_ALLOW_ENV_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
-pub(crate) static MAX_ALLOW_RUN_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
-pub(crate) static MAX_ALLOW_FFI_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
-pub(crate) static MAX_ALLOW_SYS_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
-pub(crate) static MAX_ALLOW_IMPORT_GUC: PermissionParser = PermissionParser::new();
-/// Superuser cap for `_pg.execute()` access.
-/// Default: unset (`None`), treated as deny.
-pub(crate) static MAX_ALLOW_PG_EXECUTE_GUC: BoolGucParser = BoolGucParser::new();
+/// Default for each `max_allow_*` GUC: `*` (uncapped). Superusers can
+/// tighten with `ALTER SYSTEM SET typescript.max_allow_<perm> = '...'`.
+pub(crate) static MAX_ALLOW_READ_GUC: PermissionParser = PermissionParser::with_default(c"*");
+pub(crate) static MAX_ALLOW_WRITE_GUC: PermissionParser = PermissionParser::with_default(c"*");
+pub(crate) static MAX_ALLOW_NET_GUC: PermissionParser = PermissionParser::with_default(c"*");
+pub(crate) static MAX_ALLOW_ENV_GUC: PermissionParser = PermissionParser::with_default(c"*");
+pub(crate) static MAX_ALLOW_RUN_GUC: PermissionParser = PermissionParser::with_default(c"*");
+pub(crate) static MAX_ALLOW_FFI_GUC: PermissionParser = PermissionParser::with_default(c"*");
+pub(crate) static MAX_ALLOW_SYS_GUC: PermissionParser = PermissionParser::with_default(c"*");
+pub(crate) static MAX_ALLOW_IMPORT_GUC: PermissionParser = PermissionParser::with_default(c"*");
+/// Superuser cap for `_pg.execute()` access. Default: `on` (uncapped).
+pub(crate) static MAX_ALLOW_PG_EXECUTE_GUC: BoolGucParser = BoolGucParser::with_default(c"on");
 
 // Register the GUC for per-function import maps.
 #[pg_guard]

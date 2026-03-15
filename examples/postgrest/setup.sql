@@ -2,16 +2,6 @@ LOAD 'pg_typescript';
 
 CREATE EXTENSION IF NOT EXISTS pg_typescript;
 
-DO $$
-BEGIN
-  EXECUTE format(
-    'ALTER DATABASE %I SET typescript.max_allow_import = %L',
-    current_database(),
-    'esm.sh'
-  );
-END;
-$$;
-
 CREATE OR REPLACE FUNCTION public.ts_generate_fun_payload()
 RETURNS jsonb
 LANGUAGE typescript

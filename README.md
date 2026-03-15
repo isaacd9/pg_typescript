@@ -15,8 +15,12 @@ as well as a larger set of features, including access to common Node.js APIs.
 - Provides an API for calling back into PostgreSQL from TypeScript (`_pg.execute()`).
 
 ```sql
+LOAD 'pg_typescript';
+CREATE EXTENSION IF NOT EXISTS pg_typescript;
+
 CREATE FUNCTION slugify(title text) RETURNS text
 LANGUAGE typescript
+SET "typescript.allow_import" = 'esm.sh'
 SET "typescript.import_map" = '{"imports":{"lodash":"https://esm.sh/lodash@4"}}'
 AS $$
   return lodash.kebabCase(title);
@@ -61,6 +65,17 @@ cp -r pg_typescript-*/share/postgresql/extension/* $(pg_config --sharedir)/exten
 Then in psql: `CREATE EXTENSION pg_typescript;`
 
 </details>
+
+### Preloading
+
+The first time pg_typescript loads in a backend it initializes the V8 runtime,
+which can be slow. To avoid the cold-start on the first query, preload the
+library by adding it to `shared_preload_libraries` in `postgresql.conf`:
+
+```
+# postgresql.conf
+shared_preload_libraries = 'pg_typescript'
+```
 
 ## Test
 
@@ -177,15 +192,15 @@ for examples of imports.
 | `typescript.allow_sys` | Userset | Unset; treated as deny | Deno system-information permission. |
 | `typescript.allow_import` | Userset | Unset; treated as deny | Deno import permission for remote module loading. |
 | `typescript.allow_pg_execute` | Userset | Unset; treated as off | Access to `_pg.execute()`. |
-| `typescript.max_allow_read` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_read`. |
-| `typescript.max_allow_write` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_write`. |
-| `typescript.max_allow_net` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_net`. |
-| `typescript.max_allow_env` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_env`. |
-| `typescript.max_allow_run` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_run`. |
-| `typescript.max_allow_ffi` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_ffi`. |
-| `typescript.max_allow_sys` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_sys`. |
-| `typescript.max_allow_import` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_import`. |
-| `typescript.max_allow_pg_execute` | Superuser (`Suset`) | Unset; treated as off | Maximum allowed `_pg.execute()`. |
+| `typescript.max_allow_read` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_read`. |
+| `typescript.max_allow_write` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_write`. |
+| `typescript.max_allow_net` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_net`. |
+| `typescript.max_allow_env` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_env`. |
+| `typescript.max_allow_run` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_run`. |
+| `typescript.max_allow_ffi` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_ffi`. |
+| `typescript.max_allow_sys` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_sys`. |
+| `typescript.max_allow_import` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_import`. |
+| `typescript.max_allow_pg_execute` | Superuser (`Suset`) | `on` (uncapped) | Maximum allowed `_pg.execute()`. |
 
 </details>
 

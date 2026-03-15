@@ -1,5 +1,3 @@
-SET typescript.max_allow_import = 'esm.sh';
-
 CREATE OR REPLACE FUNCTION ts_drop_recreate_same_name(name text) RETURNS text
 LANGUAGE typescript
 SET typescript.allow_import = 'esm.sh'
@@ -50,4 +48,3 @@ SELECT ts_drop_recreate_same_name('hello world') = 'v2:Hello world' AS recreated
 
 DROP TABLE ts_drop_recreate_oids;
 
-RESET typescript.max_allow_import;

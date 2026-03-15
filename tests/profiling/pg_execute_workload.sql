@@ -7,7 +7,6 @@ LOAD 'pg_typescript';
 \echo '=== setup ==='
 CREATE EXTENSION IF NOT EXISTS pg_typescript;
 SET client_min_messages = warning;
-SET typescript.max_allow_pg_execute = 'on';
 
 -- Build a small but non-trivial local dataset:
 -- 25 users, 20 memberships each, and 5 notes per project.
@@ -268,4 +267,3 @@ DROP TABLE profile_projects;
 DROP FUNCTION ts_profile_project_digest(integer);
 DROP FUNCTION sql_profile_project_digest(integer);
 
-RESET typescript.max_allow_pg_execute;

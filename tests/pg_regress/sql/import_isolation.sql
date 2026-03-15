@@ -2,8 +2,6 @@
 -- 1) dynamic runtime imports are rejected
 -- 2) file:// probing of fn_* internals is rejected
 -- 3) declared static import-map bindings still work
-SET typescript.max_allow_import = 'esm.sh';
-
 CREATE OR REPLACE FUNCTION ts_assert_raises(stmt text) RETURNS bool
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -65,4 +63,3 @@ FROM (
 ) AS checks(test, ok)
 ORDER BY test;
 
-RESET typescript.max_allow_import;

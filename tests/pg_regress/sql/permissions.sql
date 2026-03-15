@@ -1,4 +1,5 @@
 -- requested allow_* settings must be fully satisfiable by max_allow_* caps
+-- (max_allow_* defaults are now '*'/uncapped; tests explicitly tighten them)
 CREATE OR REPLACE FUNCTION ts_perm_stmt_fails_with(stmt text, needle text) RETURNS boolean
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -8,8 +9,6 @@ EXCEPTION WHEN others THEN
   RETURN position(needle in SQLERRM) > 0;
 END;
 $$;
-
-SET typescript.max_allow_env = '*';
 
 CREATE OR REPLACE FUNCTION ts_perm_env_path_only(name text) RETURNS boolean
 LANGUAGE typescript
@@ -77,7 +76,6 @@ SELECT ts_perm_stmt_fails_with($sql$
 $sql$, 'cannot be fulfilled by') AS inline_rejects_unfulfillable_request;
 RESET typescript.allow_net;
 
-SET typescript.max_allow_env = '*';
 SELECT ts_perm_env_path_only('PATH') = true AS env_exec_allows_when_fulfillable;
 
 SET typescript.max_allow_env = 'none';
@@ -96,7 +94,7 @@ SELECT ts_perm_stmt_fails_with($sql$
   $fn$;
 $sql$, 'cannot be fulfilled by') AS pg_execute_create_rejects_max_none;
 
-SET typescript.max_allow_pg_execute = 'on';
+RESET typescript.max_allow_pg_execute;
 CREATE OR REPLACE FUNCTION ts_perm_pg_execute() RETURNS integer
 LANGUAGE typescript
 SET typescript.allow_pg_execute = 'on'
@@ -146,7 +144,7 @@ SELECT ts_perm_stmt_fails_with(
   'cannot be fulfilled by'
 ) AS import_exec_rejects_after_cap_tightened;
 
-SET typescript.max_allow_import = '*';
+RESET typescript.max_allow_import;
 CREATE OR REPLACE FUNCTION ts_perm_import_wildcard(name text) RETURNS text
 LANGUAGE typescript
 SET typescript.allow_import = '*'

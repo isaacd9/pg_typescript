@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::ops::Deref;
 
 use pgrx::guc::GucSetting;
@@ -13,6 +13,12 @@ impl StringGuc {
     pub(crate) const fn new() -> Self {
         Self {
             inner: GucSetting::<Option<CString>>::new(None),
+        }
+    }
+
+    pub(crate) const fn with_default(value: &'static CStr) -> Self {
+        Self {
+            inner: GucSetting::<Option<CString>>::new(Some(value)),
         }
     }
 
@@ -67,6 +73,12 @@ impl BoolGucParser {
             inner: StringGuc::new(),
         }
     }
+
+    pub(crate) const fn with_default(value: &'static CStr) -> Self {
+        Self {
+            inner: StringGuc::with_default(value),
+        }
+    }
 }
 
 impl GucParser for BoolGucParser {
@@ -108,6 +120,12 @@ impl PermissionParser {
     pub(crate) const fn new() -> Self {
         Self {
             inner: StringGuc::new(),
+        }
+    }
+
+    pub(crate) const fn with_default(value: &'static CStr) -> Self {
+        Self {
+            inner: StringGuc::with_default(value),
         }
     }
 }
