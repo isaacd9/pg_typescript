@@ -1,40 +1,38 @@
 # pg_typescript
 [![CI](https://github.com/isaacd9/pg_typescript/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacd9/pg_typescript/actions/workflows/ci.yml)
 
-This is a postgres extension, built with `pgrx` in Rust that allows users to
-run TypeScript functions in PostgreSQL via Deno/V8.
+A PostgreSQL extension that lets you write functions in TypeScript, powered by
+Deno's APIs and the v8 runtime. This borrows some ideas from
+[plv8](https://github.com/plv8/plv8), but aims to support TypeScript directly,
+as well as a larger set of features, including access to common Node.js APIs.
 
-This project borrows some ideas from [plv8](https://github.com/plv8/plv8), aim
-to support TypeScript, as well as a larger set of features, including access to
-common Node.js APIs. This project leverages the Deno permissions model to
-sandbox function execution, and only allow the features that a user or
-administrator has explicitly granted. Both regular and `async` functions are
-supported, and types in PostgreSQL are mapped to TypeScript types.
+- Full TypeScript with type annotations and `async`/`await`.
+- npm packages can be imported and then are cached in PostgreSQL at `CREATE FUNCTION` time.
+- Sandboxed execution, but targeting full Node.js compatibility with [Deno's permission model](https://docs.deno.com/runtime/fundamentals/security/).
+- Aims to support the full PostgreSQL type system, including composite types.
+  Types like `RECORD`, `JSONB` are mapped automatically between PostgreSQL and
+  JavaScript.
+- Provides an API for calling back into PostgreSQL from TypeScript (`_pg.execute()`).
 
-Imports are resolved via Deno's module resolution mechanism. Function bodies use
-bare specifiers declared in a Deno-style import map, and those specifiers map
-to `http(s)` URLs such as esm.sh or a GitHub raw URL. When a function is
-created, those imports are cached inside a PostgreSQL table, and subsequent
-calls to the function will use the cached modules rather than resolving them
-again.
+```sql
+CREATE FUNCTION slugify(title text) RETURNS text
+LANGUAGE typescript
+SET "typescript.import_map" = '{"imports":{"lodash":"https://esm.sh/lodash@4"}}'
+AS $$
+  return lodash.kebabCase(title);
+$$;
 
-## FAQ
-### What is this?
-A PostgreSQL extension that allows running TypeScript functions in PostgreSQL via Deno/V8.
+SELECT slugify('Hello World');  -- 'hello-world'
+```
 
-### Why?
-Why not? (More seriously, this is useful for re-using existing TypeScript code in PostgreSQL without rewriting it, and integrating with existing TypeScript tooling and libraries. Beyond that, this enables complex program execution directly in PostgreSQL, which is useful for deploying software close to your data for low-latency access.)
+## Status
 
-### Should I use this in production?
-Probably not. This is still alpha quality software right now that has not been
-thoroughly tested in production PostgreSQL environments. But give it a go and let me know how it works!
-
-## Project Status
-This is **alpha** quality software that you probably shouldn't use in production yet. That
-said, the integration tests are comprehensive and the basic functionality works
-end to end and appears to have attractive performance.
-
-Eventually, releases will be tagged and published on GitHub releases.
+This is **alpha quality** software. Think carefully before using it in
+production. The integration tests are comprehensive and in profiling the
+performance appears competitive. Eventually, releases will be tagged and
+published on GitHub releases. [let me
+know](https://github.com/isaacd9/pg_typescript/issues) how it works for you
+please!
 
 ## Run
 
