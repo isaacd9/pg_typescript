@@ -147,21 +147,21 @@ SELECT ts_perm_stmt_fails_with(
 
 SET typescript.max_allow_import = 'esm.sh';
 SELECT ts_perm_stmt_fails_with($sql$
-  CREATE OR REPLACE FUNCTION ts_perm_import_requires_allow(name text) RETURNS text
+  CREATE OR REPLACE FUNCTION ts_perm_import_deny_explicit(name text) RETURNS text
   LANGUAGE typescript
+  SET typescript.allow_import = 'none'
   SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
   AS $fn$
     return lodash.capitalize(name);
   $fn$;
-$sql$, 'typescript.allow_import') AS import_map_create_rejects_without_allow_import;
- import_map_create_rejects_without_allow_import 
-------------------------------------------------
+$sql$, 'typescript.allow_import') AS import_map_create_rejects_explicit_deny;
+ import_map_create_rejects_explicit_deny
+-----------------------------------------
  t
 (1 row)
 
 CREATE OR REPLACE FUNCTION ts_perm_import_allowed(name text) RETURNS text
 LANGUAGE typescript
-SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
 AS $$
   return lodash.capitalize(name);

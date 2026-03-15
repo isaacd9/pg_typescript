@@ -1,6 +1,5 @@
 CREATE OR REPLACE FUNCTION ts_drop_recreate_same_name(name text) RETURNS text
 LANGUAGE typescript
-SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
 AS $$
   return "v1:" + lodash.capitalize(name);
@@ -40,7 +39,6 @@ SELECT NOT EXISTS (
 
 CREATE OR REPLACE FUNCTION ts_drop_recreate_same_name(name text) RETURNS text
 LANGUAGE typescript
-SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
 AS $$
   return "v2:" + lodash.capitalize(name);

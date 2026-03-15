@@ -52,7 +52,6 @@ CREATE OR REPLACE FUNCTION public.ts_project_note_summary(
   tags jsonb
 ) RETURNS public.stream_note_summary
 LANGUAGE typescript
-SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}'
 AS $$
   interface TopToken {

@@ -48,8 +48,11 @@ pub(crate) static ALLOW_RUN_GUC: PermissionParser = PermissionParser::new();
 pub(crate) static ALLOW_FFI_GUC: PermissionParser = PermissionParser::new();
 /// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_SYS_GUC: PermissionParser = PermissionParser::new();
-/// Default: unset (`None`), treated as deny.
-pub(crate) static ALLOW_IMPORT_GUC: PermissionParser = PermissionParser::new();
+/// Default: `*` (allow all). Import URLs are already declared in
+/// `typescript.import_map`, so the import permission is redundant most of the
+/// time; defaulting to allow avoids a second SET on every function that uses
+/// imports.
+pub(crate) static ALLOW_IMPORT_GUC: PermissionParser = PermissionParser::with_default(c"*");
 /// Request access to `_pg.execute()` from a function or DO block.
 /// Default: unset (`None`), treated as deny.
 pub(crate) static ALLOW_PG_EXECUTE_GUC: BoolGucParser = BoolGucParser::new();

@@ -5,7 +5,6 @@ CREATE EXTENSION IF NOT EXISTS pg_typescript;
 CREATE OR REPLACE FUNCTION public.ts_generate_fun_payload()
 RETURNS jsonb
 LANGUAGE typescript
-SET typescript.allow_import = 'esm.sh'
 SET typescript.import_map = '{"imports":{"faker":"https://esm.sh/@faker-js/faker@9.9.0"}}'
 AS $$
   interface Stats {

@@ -20,7 +20,6 @@ CREATE EXTENSION IF NOT EXISTS pg_typescript;
 
 CREATE FUNCTION slugify(title text) RETURNS text
 LANGUAGE typescript
-SET "typescript.allow_import" = 'esm.sh'
 SET "typescript.import_map" = '{"imports":{"lodash":"https://esm.sh/lodash@4"}}'
 AS $$
   return lodash.kebabCase(title);
@@ -190,7 +189,7 @@ for examples of imports.
 | `typescript.allow_run` | Userset | Unset; treated as deny | Deno subprocess permission. |
 | `typescript.allow_ffi` | Userset | Unset; treated as deny | Deno FFI permission. |
 | `typescript.allow_sys` | Userset | Unset; treated as deny | Deno system-information permission. |
-| `typescript.allow_import` | Userset | Unset; treated as deny | Deno import permission for remote module loading. |
+| `typescript.allow_import` | Userset | `*` (allow all) | Deno import permission for remote module loading. Defaults to allow because import URLs are already declared in `typescript.import_map`. |
 | `typescript.allow_pg_execute` | Userset | Unset; treated as off | Access to `_pg.execute()`. |
 | `typescript.max_allow_read` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_read`. |
 | `typescript.max_allow_write` | Superuser (`Suset`) | `*` (uncapped) | Maximum allowed `typescript.allow_write`. |
