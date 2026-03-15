@@ -5,6 +5,76 @@ use serde_json::Value;
 use std::convert::TryFrom;
 
 // ---------------------------------------------------------------------------
+// PG-version compat helpers
+//
+// PG18 reorganised TupleDescData (compact_attrs) and added C-shim accessor
+// functions that pgrx exposes.  PG17 and earlier have `attrs` directly in the
+// struct and lack those shims, so we provide our own inline equivalents.
+// ---------------------------------------------------------------------------
+
+// PG13–17: TupleDescData has `attrs` array directly.
+// PG18+:   TupleDescData uses `compact_attrs`; pgrx provides a C-shim accessor.
+// The same pattern applies to HeapTupleHeader field accessors.
+
+/// Get a pointer to the i-th `FormData_pg_attribute` from a `TupleDesc`.
+#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+#[inline]
+unsafe fn tupdesc_get_attr(
+    tupdesc: pg_sys::TupleDesc,
+    i: usize,
+) -> *const pg_sys::FormData_pg_attribute {
+    (*tupdesc).attrs.as_ptr().add(i)
+}
+
+#[cfg(feature = "pg18")]
+#[inline]
+unsafe fn tupdesc_get_attr(
+    tupdesc: pg_sys::TupleDesc,
+    i: usize,
+) -> *const pg_sys::FormData_pg_attribute {
+    pg_sys::TupleDescAttr(tupdesc, i as i32)
+}
+
+/// Extract the type OID from a `HeapTupleHeader`.
+#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+#[inline]
+unsafe fn heap_tuple_header_get_type_id(td: pg_sys::HeapTupleHeader) -> pg_sys::Oid {
+    (*td).t_choice.t_datum.datum_typeid
+}
+
+#[cfg(feature = "pg18")]
+#[inline]
+unsafe fn heap_tuple_header_get_type_id(td: pg_sys::HeapTupleHeader) -> pg_sys::Oid {
+    pg_sys::HeapTupleHeaderGetTypeId(td)
+}
+
+/// Extract the type modifier from a `HeapTupleHeader`.
+#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+#[inline]
+unsafe fn heap_tuple_header_get_typmod(td: pg_sys::HeapTupleHeader) -> pg_sys::int32 {
+    (*td).t_choice.t_datum.datum_typmod
+}
+
+#[cfg(feature = "pg18")]
+#[inline]
+unsafe fn heap_tuple_header_get_typmod(td: pg_sys::HeapTupleHeader) -> pg_sys::int32 {
+    pg_sys::HeapTupleHeaderGetTypMod(td)
+}
+
+/// Get the datum length from a `HeapTupleHeader`.
+#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+#[inline]
+unsafe fn heap_tuple_header_get_datum_length(td: pg_sys::HeapTupleHeader) -> pg_sys::uint32 {
+    (*td).t_choice.t_datum.datum_len_ as pg_sys::uint32
+}
+
+#[cfg(feature = "pg18")]
+#[inline]
+unsafe fn heap_tuple_header_get_datum_length(td: pg_sys::HeapTupleHeader) -> pg_sys::uint32 {
+    pg_sys::HeapTupleHeaderGetDatumLength(td)
+}
+
+// ---------------------------------------------------------------------------
 // Serialize: direct Datum → V8 value (no JSON intermediary)
 // ---------------------------------------------------------------------------
 
@@ -470,7 +540,7 @@ unsafe fn build_heap_tuple_from_tupdesc(
     let mut nulls = vec![true; natts];
 
     for i in 0..natts {
-        let attr = &*pg_sys::TupleDescAttr(tupdesc, i as i32);
+        let attr = &*tupdesc_get_attr(tupdesc, i);
         if attr.attisdropped {
             continue;
         }
@@ -501,14 +571,14 @@ unsafe fn serialize_composite<S: serde::Serializer>(
     // field inside another tuple).  Detoast first to get a proper pointer.
     let td = pg_sys::pg_detoast_datum(datum.cast_mut_ptr::<pg_sys::varlena>())
         as pg_sys::HeapTupleHeader;
-    let typid = pg_sys::HeapTupleHeaderGetTypeId(td);
-    let typmod = pg_sys::HeapTupleHeaderGetTypMod(td);
+    let typid = heap_tuple_header_get_type_id(td);
+    let typmod = heap_tuple_header_get_typmod(td);
     let tupdesc = pg_sys::lookup_rowtype_tupdesc(typid, typmod);
     let natts = (*tupdesc).natts as usize;
 
     // Build a stack HeapTupleData so we can call heap_deform_tuple.
     let mut tuple_data: pg_sys::HeapTupleData = std::mem::zeroed();
-    tuple_data.t_len = pg_sys::HeapTupleHeaderGetDatumLength(td);
+    tuple_data.t_len = heap_tuple_header_get_datum_length(td);
     tuple_data.t_data = td;
 
     let mut values = vec![pg_sys::Datum::from(0usize); natts];
@@ -522,7 +592,7 @@ unsafe fn serialize_composite<S: serde::Serializer>(
 
     let mut map = s.serialize_map(Some(natts))?;
     for i in 0..natts {
-        let attr = &*pg_sys::TupleDescAttr(tupdesc, i as i32);
+        let attr = &*tupdesc_get_attr(tupdesc, i);
         if attr.attisdropped {
             continue;
         }

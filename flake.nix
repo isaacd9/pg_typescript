@@ -131,6 +131,24 @@
               shellHook = ''
                 if [ "$(uname -s)" = "Darwin" ]; then
                   export RUSTY_V8_MIRROR="https://github.com/denoland/rusty_v8/releases/download"
+                  # Help `cargo pgrx init` find Nix-provided headers (readline, icu, etc.)
+                  # when it builds PostgreSQL from source.
+                  export CPPFLAGS="
+                    -I${pkgs.readline.dev}/include
+                    -I${pkgs.icu.dev}/include
+                    -I${pkgs.zlib.dev}/include
+                    -I${pkgs.libxml2.dev}/include
+                    -I${pkgs.libxslt.dev}/include
+                    -I${pkgs.openssl.dev}/include
+                    $CPPFLAGS"
+                  export LDFLAGS="
+                    -L${pkgs.readline}/lib
+                    -L${pkgs.icu}/lib
+                    -L${pkgs.zlib}/lib
+                    -L${pkgs.libxml2}/lib
+                    -L${pkgs.libxslt}/lib
+                    -L${pkgs.openssl.out}/lib
+                    $LDFLAGS"
                 fi
 
                 if [ "$(uname -s)" = "Linux" ]; then
