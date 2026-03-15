@@ -36,20 +36,31 @@ please!
 
 ## Run
 
-With Postgres 18:
+Supports PostgreSQL 16, 17, and 18.
+
+### From source
+
 ```bash
-cargo pgrx run pg18
+cargo pgrx run pg18  # or pg17, pg16
 ```
 
-```sql
-CREATE EXTENSION pg_typescript;
+<details>
+<summary>Pre-built Linux packages</summary>
 
-CREATE FUNCTION add(a int, b int) RETURNS int LANGUAGE typescript AS $$
-  return a + b;
-$$;
+The [CI workflow](https://github.com/isaacd9/pg_typescript/actions/workflows/ci.yml)
+builds and uploads packages for Linux x86_64 and aarch64 on every push. Download
+the artifact for your PG version and architecture, then extract into your
+PostgreSQL installation:
 
-SELECT add(1, 2);
+```bash
+tar -xzf package-pg18-x86_64.tar.gz
+cp -r pg_typescript-*/lib/postgresql/* $(pg_config --pkglibdir)/
+cp -r pg_typescript-*/share/postgresql/extension/* $(pg_config --sharedir)/extension/
 ```
+
+Then in psql: `CREATE EXTENSION pg_typescript;`
+
+</details>
 
 ## Test
 
@@ -84,6 +95,7 @@ enforced either on the function call level or by a Superuser with a "maximum"
 set. These are set on the Deno runtime on each execution.
 
 ## Calling into PostgreSQL
+
 The TypeScript runtime is provided with a `_pg` global variable that a module can
 use to call into PostgreSQL. This provides a function, `execute`, that can be
 used to execute a PostgreSQL query and return the results mapped back into a JavaScript
@@ -93,7 +105,51 @@ The types for this can be found in `packages/types`. Execution can be enabled
 for a function or `DO` block via `typescript.allow_pg_execute`, subject to the
 superuser cap `typescript.max_allow_pg_execute`.
 
-## GUC Configuration
+
+```sql
+CREATE FUNCTION active_user_emails() RETURNS jsonb
+LANGUAGE typescript
+SET "typescript.allow_pg_execute" = 'on'
+AS $$
+  const result = await _pg.execute(
+    "SELECT email FROM users WHERE active = $1", [true]
+  );
+  return result.rows.map(r => r.email);
+$$;
+```
+
+The types for `_pg.execute()` can be found in `packages/types`.
+
+## Permissions
+
+By default all capabilities (network, filesystem, env, etc.) are **denied**.
+Permissions are granted via GUCs attached with `SET`:
+
+```sql
+-- Allow network access to a specific host
+CREATE FUNCTION call_api(url text) RETURNS jsonb
+LANGUAGE typescript
+SET "typescript.allow_net" = 'api.example.com'
+AS $$
+  const res = await fetch(url);
+  return await res.json();
+$$;
+
+-- Allow calling back into PostgreSQL
+CREATE FUNCTION count_users() RETURNS int
+LANGUAGE typescript
+SET "typescript.allow_pg_execute" = 'on'
+AS $$
+  const result = await _pg.execute('SELECT count(*) as n FROM users');
+  return result.rows[0].n;
+$$;
+```
+
+Superusers can set `max_*` GUCs to cap what any function may request. The types
+for `_pg.execute()` can be found in `packages/types`.
+
+<details>
+<summary>Full GUC reference</summary>
 
 `Userset` GUCs can be applied with `SET` / `SET LOCAL` for a session or
 transaction, or attached to a function with `CREATE FUNCTION ... SET`. The
@@ -112,24 +168,26 @@ for examples of imports.
 | --- | --- | --- | --- |
 | `typescript.import_map` | Userset | Unset; treated as no import map | Import map JSON used for function imports and `DO` blocks, for example `{"imports":{"lodash":"https://esm.sh/lodash@4.17.23"}}`. |
 | `typescript.max_imports` | Superuser (`Suset`) | Unset; treated as allow all | Cap on which `http(s)` URL prefixes may appear in `typescript.import_map`. |
-| `typescript.allow_read` | Userset | Unset; treated as deny | Requested Deno read permission for the current function or `DO` block. |
-| `typescript.allow_write` | Userset | Unset; treated as deny | Requested Deno write permission for the current function or `DO` block. |
-| `typescript.allow_net` | Userset | Unset; treated as deny | Requested Deno network permission for the current function or `DO` block. |
-| `typescript.allow_env` | Userset | Unset; treated as deny | Requested Deno environment-variable permission for the current function or `DO` block. |
-| `typescript.allow_run` | Userset | Unset; treated as deny | Requested Deno subprocess permission for the current function or `DO` block. |
-| `typescript.allow_ffi` | Userset | Unset; treated as deny | Requested Deno FFI permission for the current function or `DO` block. |
-| `typescript.allow_sys` | Userset | Unset; treated as deny | Requested Deno system-information permission for the current function or `DO` block. |
-| `typescript.allow_import` | Userset | Unset; treated as deny | Requested Deno import permission for remote module loading. |
-| `typescript.allow_pg_execute` | Userset | Unset; treated as off | Requested access to `_pg.execute()` for the current function or `DO` block. |
-| `typescript.max_allow_read` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_read` request. |
-| `typescript.max_allow_write` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_write` request. |
-| `typescript.max_allow_net` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_net` request. |
-| `typescript.max_allow_env` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_env` request. |
-| `typescript.max_allow_run` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_run` request. |
-| `typescript.max_allow_ffi` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_ffi` request. |
-| `typescript.max_allow_sys` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_sys` request. |
-| `typescript.max_allow_import` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_import` request. |
-| `typescript.max_allow_pg_execute` | Superuser (`Suset`) | Unset; treated as off | Maximum allowed `_pg.execute()` request. |
+| `typescript.allow_read` | Userset | Unset; treated as deny | Deno read permission. |
+| `typescript.allow_write` | Userset | Unset; treated as deny | Deno write permission. |
+| `typescript.allow_net` | Userset | Unset; treated as deny | Deno network permission. |
+| `typescript.allow_env` | Userset | Unset; treated as deny | Deno environment-variable permission. |
+| `typescript.allow_run` | Userset | Unset; treated as deny | Deno subprocess permission. |
+| `typescript.allow_ffi` | Userset | Unset; treated as deny | Deno FFI permission. |
+| `typescript.allow_sys` | Userset | Unset; treated as deny | Deno system-information permission. |
+| `typescript.allow_import` | Userset | Unset; treated as deny | Deno import permission for remote module loading. |
+| `typescript.allow_pg_execute` | Userset | Unset; treated as off | Access to `_pg.execute()`. |
+| `typescript.max_allow_read` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_read`. |
+| `typescript.max_allow_write` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_write`. |
+| `typescript.max_allow_net` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_net`. |
+| `typescript.max_allow_env` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_env`. |
+| `typescript.max_allow_run` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_run`. |
+| `typescript.max_allow_ffi` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_ffi`. |
+| `typescript.max_allow_sys` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_sys`. |
+| `typescript.max_allow_import` | Superuser (`Suset`) | Unset; treated as deny | Maximum allowed `typescript.allow_import`. |
+| `typescript.max_allow_pg_execute` | Superuser (`Suset`) | Unset; treated as off | Maximum allowed `_pg.execute()`. |
+
+</details>
 
 ## Build
 
