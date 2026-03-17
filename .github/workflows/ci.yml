@@ -209,7 +209,8 @@ jobs:
             - name: Stamp package version (pg${{ matrix.pg }})
               working-directory: pg_deno
               run: |
-                  version="v0.0.1-${GITHUB_SHA}"
+                  base_version="$(cat VERSION)"
+                  version="${base_version}+${GITHUB_SHA}"
                   sed -i "s/^default_version = .*/default_version = '${version}'/" pg_typescript.control
 
             - name: Package (pg${{ matrix.pg }})

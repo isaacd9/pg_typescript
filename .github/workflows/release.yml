@@ -1,0 +1,101 @@
+name: Release
+
+on:
+    workflow_dispatch:
+        inputs:
+            commit_sha:
+                description: "Commit SHA to release (default: latest on master)"
+                required: false
+                type: string
+            version_override:
+                description: "Override version (default: VERSION file + SHA build metadata)"
+                required: false
+                type: string
+            prerelease:
+                description: "Mark as pre-release"
+                required: false
+                type: boolean
+                default: false
+
+permissions:
+    contents: write
+
+jobs:
+    release:
+        runs-on: ubuntu-24.04
+        steps:
+            - name: Resolve commit SHA
+              id: resolve
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  if [ -n "${{ inputs.commit_sha }}" ]; then
+                    sha="${{ inputs.commit_sha }}"
+                  else
+                    sha="$(gh api repos/${{ github.repository }}/commits/master --jq '.sha')"
+                  fi
+                  echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+                  echo "Resolved SHA: ${sha}"
+
+            - name: Checkout
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ steps.resolve.outputs.sha }}
+
+            - name: Determine version
+              id: version
+              run: |
+                  base_version="$(cat VERSION)"
+                  if [ -n "${{ inputs.version_override }}" ]; then
+                    version="${{ inputs.version_override }}"
+                  else
+                    version="${base_version}+${{ steps.resolve.outputs.sha }}"
+                  fi
+                  echo "version=${version}" >> "$GITHUB_OUTPUT"
+                  echo "Version: ${version}"
+
+            - name: Find CI workflow run for commit
+              id: find_run
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  run_id="$(gh api \
+                    "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ steps.resolve.outputs.sha }}&status=success&per_page=1" \
+                    --jq '.workflow_runs[0].id')"
+
+                  if [ -z "$run_id" ] || [ "$run_id" = "null" ]; then
+                    echo "No successful CI run found for commit ${{ steps.resolve.outputs.sha }}" >&2
+                    exit 1
+                  fi
+
+                  echo "run_id=${run_id}" >> "$GITHUB_OUTPUT"
+                  echo "CI run: ${run_id}"
+
+            - name: Download all package artifacts
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh run download "${{ steps.find_run.outputs.run_id }}" \
+                    --repo "${{ github.repository }}" \
+                    --pattern "package-*" \
+                    --dir artifacts
+
+            - name: Collect release assets
+              id: assets
+              run: |
+                  set -euo pipefail
+                  mkdir -p release
+                  find artifacts -name '*.tar.gz' -exec cp {} release/ \;
+                  ls -la release/
+
+            - name: Create GitHub release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  gh release create "v${{ steps.version.outputs.version }}" \
+                    --repo "${{ github.repository }}" \
+                    --target "${{ steps.resolve.outputs.sha }}" \
+                    --title "v${{ steps.version.outputs.version }}" \
+                    --notes "" \
+                    ${{ inputs.prerelease && '--prerelease' || '' }} \
+                    release/*
