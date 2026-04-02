@@ -2,6 +2,8 @@
 -- 1) dynamic runtime imports are rejected
 -- 2) file:// probing of fn_* internals is rejected
 -- 3) declared static import-map bindings still work
+-- 4) multiple import declaration forms inside the function body are rejected at CREATE FUNCTION time
+-- 5) CommonJS require() fails when the function body executes
 CREATE OR REPLACE FUNCTION ts_assert_raises(stmt text) RETURNS bool
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -9,6 +11,16 @@ BEGIN
   RETURN false;
 EXCEPTION WHEN others THEN
   RETURN true;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION ts_capture_error(stmt text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+  EXECUTE stmt;
+  RETURN NULL;
+EXCEPTION WHEN others THEN
+  RETURN SQLERRM;
 END;
 $$;
 
@@ -39,6 +51,97 @@ AS $$
   return lodash.capitalize(name);
 $$;
 
+SELECT variant, ts_capture_error(stmt) AS err
+FROM (
+  VALUES
+    (
+      'namespace',
+      $sql$
+        CREATE OR REPLACE FUNCTION ts_import_decl_in_body() RETURNS text
+        LANGUAGE typescript
+        SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23","zod":"https://esm.sh/zod@3"}}'
+        AS $fn$
+          import * as lodash from "lodash";
+          return lodash.capitalize("hello");
+        $fn$;
+      $sql$
+    ),
+    (
+      'default',
+      $sql$
+        CREATE OR REPLACE FUNCTION ts_import_decl_in_body() RETURNS text
+        LANGUAGE typescript
+        SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23","zod":"https://esm.sh/zod@3"}}'
+        AS $fn$
+          import lodash from "lodash";
+          return lodash.capitalize("hello");
+        $fn$;
+      $sql$
+    ),
+    (
+      'named',
+      $sql$
+        CREATE OR REPLACE FUNCTION ts_import_decl_in_body() RETURNS text
+        LANGUAGE typescript
+        SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23","zod":"https://esm.sh/zod@3"}}'
+        AS $fn$
+          import { capitalize } from "lodash";
+          return capitalize("hello");
+        $fn$;
+      $sql$
+    ),
+    (
+      'default_named',
+      $sql$
+        CREATE OR REPLACE FUNCTION ts_import_decl_in_body() RETURNS text
+        LANGUAGE typescript
+        SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23","zod":"https://esm.sh/zod@3"}}'
+        AS $fn$
+          import lodash, { capitalize } from "lodash";
+          return capitalize(lodash.lowerCase("hello world"));
+        $fn$;
+      $sql$
+    ),
+    (
+      'side_effect',
+      $sql$
+        CREATE OR REPLACE FUNCTION ts_import_decl_in_body() RETURNS text
+        LANGUAGE typescript
+        SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23","zod":"https://esm.sh/zod@3"}}'
+        AS $fn$
+          import "lodash";
+          return "hello";
+        $fn$;
+      $sql$
+    ),
+    (
+      'type_only',
+      $sql$
+        CREATE OR REPLACE FUNCTION ts_import_decl_in_body() RETURNS text
+        LANGUAGE typescript
+        SET typescript.import_map = '{"imports":{"lodash":"https://esm.sh/lodash@4.17.23","zod":"https://esm.sh/zod@3"}}'
+        AS $fn$
+          import type { ZodString } from "zod";
+          const _x: ZodString | null = null;
+          return _x === null ? "hello" : "no";
+        $fn$;
+      $sql$
+    )
+) AS cases(variant, stmt)
+ORDER BY variant;
+
+CREATE OR REPLACE FUNCTION ts_require_probe() RETURNS text
+LANGUAGE typescript AS $$
+  const lodash = require("lodash");
+  return lodash.capitalize("hello");
+$$;
+
+SELECT regexp_replace(
+  ts_capture_error('SELECT ts_require_probe();'),
+  E'file:///pg_typescript/fn_[0-9a-f]+\\.ts',
+  'file:///pg_typescript/input.ts'
+) AS require_call_error;
+
 SELECT test, ok
 FROM (
   VALUES
@@ -60,4 +163,3 @@ FROM (
     )
 ) AS checks(test, ok)
 ORDER BY test;
-
