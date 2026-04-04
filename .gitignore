@@ -4,7 +4,7 @@
 *.pdb
 
 # Cargo
-Cargo.lock
+# Keep Cargo.lock tracked so CI does not float transitive dependencies.
 
 # macOS
 .DS_Store
